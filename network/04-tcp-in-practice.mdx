@@ -1,0 +1,294 @@
+---
+title: TCP の状態遷移とチューニング
+description: ss の出力から接続の状態を読み解き、TIME_WAIT や CLOSE_WAIT の滞留が何を意味するかを判断できるようにします。
+order: 4
+minutes: 19
+tags: ["TCP", "TIME_WAIT", "CLOSE_WAIT", "backlog", "keepalive"]
+objectives:
+  - 接続確立と切断の手順、および主要な状態の意味を説明できる
+  - CLOSE_WAIT と TIME_WAIT の滞留から原因を切り分けられる
+  - SYN キューと accept キューの違いを理解し、適切に調整できる
+references:
+  - label: "RFC 9293 — Transmission Control Protocol"
+    url: "https://www.rfc-editor.org/rfc/rfc9293.html"
+  - label: "tcp(7) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man7/tcp.7.html"
+  - label: "ss(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/ss.8.html"
+---
+
+## 接続確立とキューが 2 つある話
+
+3 ウェイハンドシェイクは教科書どおりですが、**カーネルの内部にはキューが 2 つある**という点が実務では重要です。
+
+<Figure name="tcp-queues" caption="接続確立にはキューが 2 つある。溢れたときの兆候と対処はそれぞれ違う" />
+
+---
+
+<h2 className="slide-cont">接続確立とキューが 2 つある話（続き）</h2>
+
+| キュー | 上限を決めるもの | 溢れたときのカウンタ |
+| --- | --- | --- |
+| **SYN キュー**（半開き） | `net.ipv4.tcp_max_syn_backlog` | `TcpExtTCPReqQFullDrop` |
+| **accept キュー**（確立済み） | `min(listen() の backlog, net.core.somaxconn)` | `TcpExtListenOverflows` |
+
+```bash
+# 現在の待ち行列。LISTEN 行の Recv-Q が「accept 待ちの数」、Send-Q が「上限」
+ss -ltn
+```
+
+```text
+State   Recv-Q  Send-Q  Local Address:Port
+LISTEN  0       4096    0.0.0.0:80
+LISTEN  511     511     0.0.0.0:8080     ← 上限に張り付いている
+```
+
+```bash
+# 溢れの実績を確認
+nstat -az | grep -E 'ListenOverflows|ListenDrops|TCPReqQFullDrop'
+```
+
+---
+
+<h2 className="slide-cont">接続確立とキューが 2 つある話（続き）</h2>
+
+<Callout type="field">
+
+`ListenOverflows` が増えている場合、**ネットワークではなくアプリケーションの処理能力**が問題です（ミドルウェアコースのレッスン 1 でも同じ論点を扱いました）。
+
+`somaxconn` を増やすのは応急処置にしかなりません。キューを伸ばせば接続は受け付けられますが、処理が追いつかない以上、**待ち時間が伸びてタイムアウトになるだけ**という結果もよくあります。
+
+まずアプリのスレッド数、ワーカー数、下流（DB など）の応答時間を確認してください。
+
+</Callout>
+
+### SYN フラッド対策
+
+SYN だけ送って ACK を返さない攻撃に対しては、SYN クッキーが有効です。
+
+```bash
+sysctl net.ipv4.tcp_syncookies    # 1 = SYN キューが溢れたときのみ発動（既定・推奨）
+```
+
+SYN キューを使わず、シーケンス番号自体に情報を埋め込んで状態を持たない方式です。**既定の `1` のままにしておくのが適切**で、無効化する理由は通常ありません。
+
+---
+
+## 切断と、2 つの「滞留」
+
+<Figure name="tcp-teardown" caption="TIME_WAIT は能動側に、CLOSE_WAIT は受動側に出る" />
+
+ここで発生する 2 つの滞留は、**意味がまったく違います**。
+
+---
+
+### CLOSE_WAIT の滞留 = アプリケーションのバグ
+
+`CLOSE_WAIT` は「相手から FIN を受け取ったが、**自分はまだ `close()` していない**」状態です。
+
+```bash
+# 状態別の集計
+ss -tan | awk 'NR>1 {print $1}' | sort | uniq -c | sort -rn
+```
+
+```text
+  8421 CLOSE-WAIT     ← 異常
+   312 ESTAB
+    45 TIME-WAIT
+```
+
+**カーネルはこの状態から自動で抜けません。** アプリが `close()` を呼ぶまで永久に残り、ファイル記述子を消費し続けます。最終的に `Too many open files` に至ります。
+
+```bash
+# どのプロセスが溜め込んでいるか
+ss -tanp state close-wait | head
+```
+
+---
+
+<h2 className="slide-cont">切断と、2 つの「滞留」（続き）</h2>
+
+<Callout type="pitfall">
+
+`CLOSE_WAIT` が増え続けるのは、**ほぼ確実にアプリケーション側のリソースリーク**です。例外処理の経路でソケットを閉じ忘れている、コネクションプールが破棄されたコネクションを回収していない、といった原因が典型です。
+
+カーネルパラメータで解決できる問題ではありません。`ss -tanp` でプロセスを特定し、コード側を修正する必要があります。
+
+</Callout>
+
+### TIME_WAIT の滞留 = 多くの場合は正常
+
+`TIME_WAIT` は**先に接続を閉じた側**に現れ、Linux では固定 60 秒で消えます。
+
+この待機には理由があります。
+
+1. 遅れて届いた古いパケットが、同じポート番号の**新しい接続に混入するのを防ぐ**
+2. 最後の ACK が失われた場合に、相手の FIN 再送へ応答できるようにする
+
+```bash
+ss -tan state time-wait | wc -l
+```
+
+秒間 1,000 接続を処理するサーバーなら、定常的に約 60,000 個の `TIME_WAIT` が存在します。**これは正常です。**
+
+問題になるのは、クライアント側として大量の接続を張る場合です。エフェメラルポート（既定約 28,000 個）を使い切り、`Cannot assign requested address` が出ます。
+
+```bash
+sysctl net.ipv4.ip_local_port_range
+```
+
+---
+
+<h2 className="slide-cont">切断と、2 つの「滞留」（続き）</h2>
+
+| 対処 | 内容 | 評価 |
+| --- | --- | --- |
+| **接続の再利用（keepalive）** | そもそも新規接続を減らす | **最善。根本対処** |
+| `ip_local_port_range` 拡大 | 使えるポートを増やす | 有効。副作用なし |
+| `tcp_tw_reuse=1` | 発信側で TIME_WAIT のポートを再利用 | 条件付きで有効 |
+| ~~`tcp_tw_recycle`~~ | — | **Linux 4.12 で削除済み**。NAT 環境で通信断を引き起こした |
+
+<Callout type="warning">
+
+ネット上には今も `net.ipv4.tcp_tw_recycle=1` を勧める古い記事が残っていますが、**このパラメータは Linux 4.12 で削除されました**。NAT 配下の複数クライアントからの接続を誤って破棄する問題があったためです。
+
+現行カーネルでは設定しても存在しないか、無視されます。見かけたら情報が古いと判断してください。
+
+</Callout>
+
+---
+
+## 再送と輻輳制御
+
+### 再送
+
+パケットが失われると、TCP は再送します。検知方法は 2 通りです。
+
+- **RTO（再送タイムアウト）**: 一定時間 ACK が来ない。**遅い**（初回は数百ミリ秒〜秒単位）
+- **Fast Retransmit**: 重複 ACK を 3 回受けた時点で即再送。**速い**
+
+```bash
+# 再送の統計
+nstat -az | grep -iE 'retrans|lost|sack'
+
+# 個別の接続の状態
+ss -tin dst 203.0.113.10
+```
+
+```text
+cubic wscale:7,7 rto:212 rtt:11.5/2.1 mss:1448
+cwnd:10 ssthresh:7 bytes_sent:1048576 retrans:0/24 rcv_space:14480
+```
+
+| 項目 | 見方 |
+| --- | --- |
+| `rtt:11.5/2.1` | 平均 RTT 11.5ms、ばらつき 2.1ms。ばらつきが大きいと経路が不安定 |
+| `retrans:0/24` | 現在 0 個再送中 / 累計 24 回。**増え続けるならロスが発生している** |
+| `cwnd:10` | 輻輳ウィンドウ。小さいままなら伸びていない |
+| `ssthresh` | スロースタート閾値。ロス検知でここまで落とされる |
+
+### 輻輳制御
+
+送信側は、ネットワークの状況を推測しながら送信量を調整します。
+
+---
+
+<h2 className="slide-cont">再送と輻輳制御（続き）</h2>
+
+```text
+スロースタート     : ACK ごとに cwnd を倍増させ、素早く帯域を探る
+輻輳回避           : ssthresh に達したら緩やかに増やす
+ロス検知           : cwnd を減らす（アルゴリズムにより減らし方が違う）
+```
+
+```bash
+sysctl net.ipv4.tcp_congestion_control       # 既定は cubic
+sysctl net.ipv4.tcp_available_congestion_control
+```
+
+| アルゴリズム | 輻輳の判断材料 | 向き |
+| --- | --- | --- |
+| **CUBIC** | パケットロス | 既定。一般的な有線経路 |
+| **BBR** | 帯域と RTT の実測 | ロスの多い長距離経路、無線経路 |
+
+BBR はロスを輻輳と見なさないため、**軽微なロスがある長距離経路で CUBIC より大きく改善する**ことがあります。一方、経路によっては公平性の問題や逆効果もあるため、必ず実測で比較してください。
+
+<Callout type="tip">
+
+レッスン 1 で扱った帯域遅延積と合わせて考えます。**ウィンドウが小さくて伸びない**のか、**ロスで cwnd が削られている**のか、`ss -tin` の `cwnd` と `retrans` の両方を見れば区別できます。
+
+- `cwnd` が小さく `retrans` が 0 → バッファ上限に達している。`tcp_rmem`/`tcp_wmem` を確認
+- `cwnd` が上下し `retrans` が増える → 経路でロスが発生。物理層や輻輳を調査
+
+</Callout>
+
+---
+
+## keepalive: 死んだ接続をいつ捨てるか
+
+TCP には接続を確認する仕組みがありますが、**既定値が実務には長すぎます**。
+
+```bash
+sysctl net.ipv4.tcp_keepalive_time      # 7200 秒 = 2時間 アイドル後に最初の探索
+sysctl net.ipv4.tcp_keepalive_intvl     # 75 秒 間隔で再試行
+sysctl net.ipv4.tcp_keepalive_probes    # 9 回失敗で切断
+```
+
+既定では、相手が突然消えてから切断を検知するまで **2 時間 + 約 11 分**かかります。しかも、**アプリケーションが `SO_KEEPALIVE` を有効にしていなければそもそも動きません**。
+
+```bash
+# システム全体を短くする例（DB コネクションプールを持つサーバーなど）
+sudo sysctl -w net.ipv4.tcp_keepalive_time=600
+sudo sysctl -w net.ipv4.tcp_keepalive_intvl=30
+sudo sysctl -w net.ipv4.tcp_keepalive_probes=3
+# → 10分 + 1分30秒 で切断を検知
+```
+
+<Callout type="field">
+
+**NAT やファイアウォールのセッションタイムアウト**との関係が重要です。中継機器が 30 分でセッションを破棄するのに、TCP keepalive が 2 時間間隔だと、両端は接続が生きていると思っているのに通信が通らない「ゾンビ接続」ができます。
+
+症状は「しばらく放置した後の最初のリクエストだけ必ず失敗する」です。**keepalive 間隔を中継機器のタイムアウトより短く**設定すれば解決します。
+
+アプリケーション層の keepalive（HTTP の keep-alive、DB ドライバの検証クエリ）を使う方法もあり、こちらのほうが制御しやすいことが多いです。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 接続確立には **SYN キュー**と **accept キュー**の 2 つがあり、上限も溢れのカウンタも別
+- **`CLOSE_WAIT` の滞留はアプリのバグ**。カーネル設定では直らない
+- **`TIME_WAIT` は 60 秒で消える正常な状態**。問題になるのは発信側のポート枯渇
+- `tcp_tw_recycle` は Linux 4.12 で削除済み。勧める記事は古い
+- `ss -tin` の `cwnd` と `retrans` で、帯域不足かロスかを区別できる
+- keepalive の既定は 2 時間。**中継機器のタイムアウトより短く**する
+
+<Quiz
+  id="q1"
+  question="ss -tan の集計で CLOSE-WAIT が 8000 件以上あり、時間とともに増え続けています。適切な対処はどれですか。"
+  options={[
+    "net.ipv4.tcp_fin_timeout を短くする",
+    "アプリケーションがソケットを close() していない箇所を特定して修正する",
+    "somaxconn を増やす",
+    "tcp_tw_reuse を有効にする"
+  ]}
+  answer={1}
+  explanation="CLOSE_WAIT は「相手の FIN を受け取ったが自分はまだ close() していない」状態で、カーネルは自動的に解消しません。アプリケーションが close() を呼ぶまで永久に残り、ファイル記述子を消費し続けます。典型的にはエラー処理経路でのクローズ漏れやコネクションプールの回収漏れです。ss -tanp でプロセスを特定してコードを直す以外に解決策はありません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Web サーバーで TIME-WAIT が常時 55,000 件ほど存在します。サービスは正常に動作しています。どう評価すべきですか。"
+  options={[
+    "異常。直ちに tcp_tw_recycle を有効化する",
+    "高い接続レートに対する正常な状態。TIME_WAIT は 60 秒で消えるため、秒間接続数 × 60 に相当する",
+    "メモリリークが起きている",
+    "accept キューが溢れている"
+  ]}
+  answer={1}
+  explanation="TIME_WAIT は先に接続を閉じた側に現れ、Linux では 60 秒で解消されます。秒間約 900 接続を処理していれば 55,000 件前後が定常的に存在するのは計算どおりで、正常です。問題になるのはクライアントとして大量の発信を行いエフェメラルポートが枯渇する場合で、その際も第一の対処は keepalive による接続再利用です。なお tcp_tw_recycle は Linux 4.12 で削除されています。"
+/>

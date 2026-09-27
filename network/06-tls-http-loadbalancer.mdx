@@ -1,0 +1,299 @@
+---
+title: TLS・HTTP とロードバランサ
+description: 証明書チェーンの落とし穴、HTTP の世代ごとの違い、L4/L7 での送信元 IP の扱いを押さえます。
+order: 6
+minutes: 19
+tags: ["TLS", "certificate", "SNI", "HTTP/2", "HTTP/3", "loadbalancer"]
+objectives:
+  - 「ブラウザでは見えるが curl では失敗する」証明書の問題を診断できる
+  - HTTP/1.1・2・3 の違いと、ボトルネックの所在を説明できる
+  - L4 と L7 のロードバランサで送信元 IP がどう扱われるかを説明できる
+references:
+  - label: "RFC 8446 — TLS 1.3"
+    url: "https://www.rfc-editor.org/rfc/rfc8446.html"
+  - label: "RFC 9110 — HTTP Semantics"
+    url: "https://www.rfc-editor.org/rfc/rfc9110.html"
+  - label: "PROXY protocol specification (HAProxy)"
+    url: "https://www.haproxy.org/download/2.8/doc/proxy-protocol.txt"
+---
+
+## TLS ハンドシェイクのコスト
+
+暗号化された接続を始めるには、TCP の 3 ウェイハンドシェイクに**加えて** TLS の折衝が必要です。
+
+<Figure name="tls-handshake-rtt" caption="遠いクライアントほど TLS 1.3 の効きが大きい" />
+
+RTT 30ms の経路なら、TLS 1.2 で 90ms、TLS 1.3 で 60ms。**接続を張り直すたびにこれを払います。**
+
+TLS 1.3 にはセッション再開時の **0-RTT** もありますが、リプレイ攻撃のリスクがあるため、副作用のない冪等なリクエストに限って使うべき機能です。
+
+<Callout type="field">
+
+レッスン 4 の「keepalive で接続を再利用する」がここでも効きます。TLS のハンドシェイクは CPU も消費する（鍵交換の公開鍵演算）ので、**接続の使い回しは帯域とレイテンシと CPU の 3 つを同時に節約します**。
+
+</Callout>
+
+---
+
+## 証明書チェーン: 最も多い TLS の障害
+
+「ブラウザでは正常なのに、`curl` や Java アプリからは失敗する」— TLS で最も頻出する障害です。
+
+原因はほぼ**中間証明書の配信漏れ**です。
+
+```text
+ルート CA 証明書        ← クライアントが最初から持っている
+    │ 署名
+中間 CA 証明書          ← サーバーが送らなければならない
+    │ 署名
+サーバー証明書          ← サーバーが送る
+```
+
+サーバーは**サーバー証明書と中間証明書の両方**を送る必要があります。中間証明書を送り忘れると、クライアントはルートまで辿れず検証に失敗します。
+
+**ブラウザだけ成功する理由**は、多くのブラウザが証明書に書かれた URL（AIA、Authority Information Access）から中間証明書を自動で取得しに行くためです。`curl`、Java、Go の標準ライブラリなどはこれを行いません。
+
+```bash
+# 実際に送られてくる証明書チェーンを見る
+openssl s_client -connect api.example.com:443 -servername api.example.com </dev/null
+```
+
+```text
+Certificate chain
+ 0 s:CN = api.example.com
+   i:C = US, O = Let's Encrypt, CN = R11         ← 発行者
+ 1 s:C = US, O = Let's Encrypt, CN = R11          ← 中間証明書が送られている（正常）
+   i:C = US, O = Internet Security Research Group, CN = ISRG Root X1
+
+Verify return code: 0 (ok)
+```
+
+`Certificate chain` に `0` しかない場合、**中間証明書が送られていません**。
+
+---
+
+<h2 className="slide-cont">証明書チェーン: 最も多い TLS の障害（続き）</h2>
+
+<Callout type="pitfall">
+
+nginx では、サーバー証明書と中間証明書を**1 つのファイルに連結**して指定します（`fullchain.pem`）。
+
+```nginx
+ssl_certificate      /etc/ssl/certs/fullchain.pem;   # サーバー証明書 + 中間証明書
+ssl_certificate_key  /etc/ssl/private/privkey.pem;
+```
+
+`cert.pem`（サーバー証明書のみ）を指定してしまうのが典型的なミスです。Let's Encrypt が `fullchain.pem` と `cert.pem` の両方を出力するため、取り違えが起きます。
+
+</Callout>
+
+```bash
+# 有効期限だけ確認
+echo | openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null \
+  | openssl x509 -noout -dates -subject
+
+# SAN（この証明書が有効なホスト名）を確認
+echo | openssl s_client -connect api.example.com:443 -servername api.example.com 2>/dev/null \
+  | openssl x509 -noout -ext subjectAltName
+```
+
+### SNI
+
+1 つの IP アドレスで複数のドメインを提供する場合、サーバーは「どの証明書を返すか」を知る必要があります。**SNI**（Server Name Indication）は、TLS ハンドシェイクの最初の平文部分でホスト名を伝える拡張です。
+
+```bash
+# -servername を付けないと、既定のサーバーの証明書が返る
+openssl s_client -connect 203.0.113.10:443 -servername api.example.com
+```
+
+---
+
+<h2 className="slide-cont">証明書チェーン: 最も多い TLS の障害（続き）</h2>
+
+<Callout type="note">
+
+IP アドレス直指定で証明書エラーになるのは、SNI が送られないためです。調査時に `-servername` を忘れると「証明書が違う」という誤った結論になります。`curl` なら `--resolve` を使うと確実です。
+
+```bash
+curl -v --resolve api.example.com:443:203.0.113.10 https://api.example.com/
+```
+
+特定のサーバーだけを狙って検証したいときに有効です。
+
+</Callout>
+
+---
+
+## HTTP の世代と、ボトルネックの移動
+
+| | HTTP/1.1 | HTTP/2 | HTTP/3 |
+| --- | --- | --- | --- |
+| トランスポート | TCP | TCP | **QUIC (UDP)** |
+| 多重化 | なし（接続を複数張る） | **あり**（1 接続で並行） | あり |
+| ヘッダ圧縮 | なし | HPACK | QPACK |
+| ヘッドオブラインブロッキング | HTTP 層で発生 | **TCP 層で発生** | 解消 |
+
+### HTTP/2 で残った問題
+
+HTTP/2 は 1 本の TCP 接続で複数のリクエストを並行処理します。しかし**TCP は順序保証を行う**ため、パケットが 1 つ失われると、**無関係なストリームまで待たされます**。
+
+```text
+1本の TCP 接続の中
+  ストリームA のパケット ✓
+  ストリームB のパケット ✗ ロス
+  ストリームC のパケット ✓  ← 届いているのに、B の再送を待たされる
+```
+
+HTTP/1.1 で複数接続を張っていた頃は、片方の接続のロスが他に影響しませんでした。**ロスの多い経路では HTTP/2 のほうが遅くなることがあります。**
+
+HTTP/3 は QUIC（UDP 上に独自に実装した信頼性層）を使い、**ストリームごとに独立して順序を保証する**ことでこれを解決しています。
+
+<Callout type="field">
+
+社内 API やデータセンター内通信のようにロスがほぼない経路では、HTTP/2 の多重化は素直に効きます。一方、モバイル回線や海外との通信のようにロスがある経路では、HTTP/3 の効果が出ます。
+
+**どこで使うかによって最適解が違う**ので、「新しいから速い」ではなく経路の性質で判断してください。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">HTTP の世代と、ボトルネックの移動（続き）</h2>
+
+```bash
+# ネゴシエートされたプロトコルを確認
+curl -sI --http2 https://api.example.com/ | head -1
+curl -sI --http3 https://api.example.com/ | head -1
+
+# ALPN（どのプロトコルで合意したか）
+openssl s_client -connect api.example.com:443 -servername api.example.com -alpn h2 </dev/null 2>/dev/null | grep ALPN
+```
+
+---
+
+## L4 と L7 のロードバランサ
+
+| | **L4（トランスポート層）** | **L7（アプリケーション層）** |
+| --- | --- | --- |
+| 判断材料 | IP アドレスとポート | URL、ヘッダ、Cookie |
+| TLS | そのまま通す（終端しない） | **終端する**ことが多い |
+| 処理コスト | 低い | 高い |
+| できること | 単純な振り分け | パスベースのルーティング、リトライ、ヘッダ書き換え |
+| 例 | LVS/IPVS、NLB | nginx、HAProxy、ALB、Envoy |
+
+### 送信元 IP が失われる問題
+
+L7 ロードバランサは**自分でバックエンドに接続し直す**ため、バックエンドから見た送信元 IP は**ロードバランサの IP** になります。
+
+```text
+クライアント(203.0.113.5) ──► LB(10.0.0.5) ──► バックエンド
+                                          バックエンドのログには 10.0.0.5 が記録される
+```
+
+これではアクセス元の記録も、IP ベースの制限もできません。解決方法は 2 つあります。
+
+**① X-Forwarded-For（HTTP のみ）**
+
+```nginx
+# LB 側
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Real-IP       $remote_addr;
+
+# バックエンド側: 信頼する LB を明示し、そこからの値だけ採用する
+set_real_ip_from 10.0.0.0/24;
+real_ip_header   X-Forwarded-For;
+```
+
+---
+
+<h2 className="slide-cont">L4 と L7 のロードバランサ（続き）</h2>
+
+<Callout type="warning">
+
+**`X-Forwarded-For` はクライアントが自由に詐称できるヘッダです。** `set_real_ip_from` で信頼する送信元を限定せずに採用すると、IP ベースのアクセス制限もレート制限もログも、すべて偽装できてしまいます。
+
+「LB からの接続に限り、このヘッダを信頼する」という設定を必ず入れてください。
+
+</Callout>
+
+**② PROXY protocol（HTTP 以外でも使える）**
+
+接続確立直後に、元の送信元情報を 1 行のヘッダとして送る方式です。TCP 上の任意のプロトコル（TLS 終端前、DB、SMTP など）で使えます。
+
+```nginx
+# nginx で受ける側
+server {
+    listen 443 ssl proxy_protocol;
+    set_real_ip_from 10.0.0.0/24;
+    real_ip_header   proxy_protocol;
+}
+```
+
+<Callout type="pitfall">
+
+PROXY protocol は**送る側と受ける側の設定が完全に一致している必要があります**。
+
+- 受け側だけ有効 → 通常の接続が「不正なヘッダ」として全部拒否される
+- 送り側だけ有効 → バックエンドがヘッダ行をリクエストの一部と誤認して壊れる
+
+どちらも「全接続が失敗する」形で現れます。切り替え時は必ず両側を同時に変更してください。
+
+</Callout>
+
+### ヘルスチェック
+
+ロードバランサは定期的にバックエンドの生存を確認します。ここで見落とされがちな点があります。
+
+---
+
+<h2 className="slide-cont">L4 と L7 のロードバランサ（続き）</h2>
+
+- **TCP のポート疎通だけでは不十分**。プロセスは生きているが DB に繋がらず全リクエストが 500 を返す、という状態を検出できない
+- **チェック先を「依存先まで確認する」エンドポイントにすると、依存先の一時障害で全台が同時に外れる**
+
+```text
+/healthz       : プロセスが応答できるか（軽い。LB のチェック用）
+/readyz        : 依存先も含めて処理可能か（重い。投入判断用）
+```
+
+この 2 つを分けるのが定石です。**LB のヘルスチェックに重い依存先チェックを使うと、DB の瞬断で全バックエンドが一斉に切り離され、障害が拡大します。**
+
+---
+
+## まとめ
+
+- TLS 1.3 はハンドシェイクが 1 RTT。接続の再利用は帯域・レイテンシ・CPU をまとめて節約する
+- **「ブラウザは OK、curl は NG」は中間証明書の配信漏れ**。`openssl s_client` でチェーンを確認する
+- nginx には `fullchain.pem` を指定する。`cert.pem` は間違い
+- HTTP/2 は TCP 層のヘッドオブラインブロッキングが残る。ロスの多い経路では HTTP/3 が有利
+- L7 LB では送信元 IP が失われる。`X-Forwarded-For` か PROXY protocol で渡す
+- **`X-Forwarded-For` は詐称可能**。`set_real_ip_from` で信頼元を限定する
+- ヘルスチェックは軽いもの（`/healthz`）を使う。依存先チェックを使うと障害が全台に波及する
+
+<Quiz
+  id="q1"
+  question="ブラウザからは問題なく表示されるサイトに、curl でアクセスすると「certificate verify failed」になります。最も可能性が高い原因はどれですか。"
+  options={[
+    "証明書の有効期限が切れている",
+    "サーバーが中間証明書を送信しておらず、AIA から自動取得するブラウザだけが検証に成功している",
+    "SNI が設定されていない",
+    "TLS のバージョンが古い"
+  ]}
+  answer={1}
+  explanation="多くのブラウザは証明書の AIA 拡張に記載された URL から中間証明書を自動取得して検証を補完しますが、curl や Java、Go の標準ライブラリはこれを行いません。そのためサーバー側が中間証明書を送っていないと、ブラウザだけ成功するという食い違いが生じます。openssl s_client でチェーンに複数の証明書が含まれているかを確認し、nginx なら fullchain.pem を指定します。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="L7 ロードバランサ配下のバックエンドで、IP ベースのアクセス制限を X-Forwarded-For ヘッダに基づいて実装します。安全に運用するために必須の設定はどれですか。"
+  options={[
+    "ヘッダ名を X-Real-IP に変更する",
+    "信頼するプロキシの送信元レンジを明示し（set_real_ip_from 等）、そこからの接続でのみヘッダを採用する",
+    "TLS を終端せずに L4 で転送する",
+    "ヘッダをすべて小文字に正規化する"
+  ]}
+  answer={1}
+  explanation="X-Forwarded-For は単なる HTTP ヘッダであり、クライアントが任意の値を付けて送信できます。信頼する送信元を限定せずに採用すると、アクセス制限・レート制限・監査ログのすべてを偽装できてしまいます。set_real_ip_from のような設定で「このネットワークからの接続に限りヘッダを信頼する」と明示することが必須です。"
+/>

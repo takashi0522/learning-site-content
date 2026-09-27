@@ -1,0 +1,268 @@
+---
+title: RoCE ファブリックを設計する
+description: ここまでの要素を 1 つの設計にまとめます。決める順番、設定を揃える範囲、そして InfiniBand とどちらを選ぶかの判断軸。
+order: 6
+minutes: 20
+tags: ["QoS 設計", "MTU", "設計チェックリスト", "InfiniBand", "運用体制"]
+objectives:
+  - RoCE ファブリックの設計項目を順番に決められる
+  - 経路全体で揃えるべき設定を列挙できる
+  - InfiniBand と RoCE を、性能ではなく運用体制から判断できる
+references:
+  - label: "NVIDIA Cumulus Linux 5.9 — RoCE (DSCP と優先度、ECN を有効にする TC)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Quality-of-Service/RDMA-over-Converged-Ethernet-RoCE/"
+  - label: "NVIDIA Cumulus Linux 5.9 — Quality of Service (trust と既定の優先度)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Quality-of-Service/"
+  - label: "NVIDIA WinOF — Ethernet Registry Keys (RoCE MTU と経路全体)"
+    url: "https://networking-docs.nvidia.com/winofdocumentation/55053000/Ethernet+Registry+Keys"
+  - label: "NVIDIA Cumulus — ESF Generic Config Guide (既定 MTU 9216B)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/guides/esf-generic-config-guide/"
+  - label: "ping(8)"
+    url: "https://man7.org/linux/man-pages/man8/ping.8.html"
+  - label: "Linux — include/rdma/ib_addr.h (iboe_get_mtu: RoCE MTU の決まり方)"
+    url: "https://github.com/torvalds/linux/blob/master/include/rdma/ib_addr.h"
+  - label: "Linux — drivers/infiniband/hw/mlx5/main.c (active_mtu)"
+    url: "https://github.com/torvalds/linux/blob/master/drivers/infiniband/hw/mlx5/main.c"
+  - label: "Linux — drivers/infiniband/sw/rxe/rxe_net.c (rxe は DF を立てる)"
+    url: "https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_net.c"
+  - label: "NVIDIA WinOF-2 — Ethernet Network (PFC は経路上の全機器で有効に)"
+    url: "https://networking-docs.nvidia.com/winof2driverum/26.7.50000/ethernet-network"
+  - label: "IBTA — InfiniBand Architecture Specification (配布は会員向け)"
+    url: "https://www.infinibandta.org/ibta-specification/"
+  - label: "NVIDIA MLNX_OFED — OpenSM (Subnet Manager)"
+    url: "https://networking-docs.nvidia.com/mlnxofedswum/590560125/opensm"
+  - label: "Linux kernel — mlx5 counters (pause の意味)"
+    url: "https://docs.kernel.org/networking/device_drivers/ethernet/mellanox/mlx5/counters.html"
+  - label: "NVIDIA DGX SuperPOD (B300) — Network Fabrics (レールと SU)"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-b300/latest/network-fabrics.html"
+  - label: "NVIDIA Cumulus Linux 5.9 — Switch Port Attributes (MTU と DF ビット)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Interface-Configuration-and-Management/Switch-Port-Attributes/"
+  - label: "Meta Engineering — RoCE networks for distributed AI training at scale"
+    url: "https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/"
+  - label: "NVIDIA Technical Blog — Turbocharging AI Workloads with Spectrum-X"
+    url: "https://developer.nvidia.com/blog/turbocharging-ai-workloads-with-nvidia-spectrum-x-networking-platform/"
+  - label: "NVIDIA HGX AI Factory — Networking Physical Topologies"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory/latest/networking-physical-topologies.html"
+  - label: "NVIDIA nccl-tests (GitHub)"
+    url: "https://github.com/NVIDIA/nccl-tests"
+---
+
+## 決める順番
+
+RoCE ファブリックの設計は、**上から順に決めると後戻りしません。**
+
+```text
+① トポロジ    ノンブロッキング、レール最適化、段数
+② QoS         どの優先度を lossless にするか、CNP をどこに置くか
+③ バッファ    ECN の閾値、PFC の閾値、headroom
+④ 負荷分散    ECMP のままか、適応ルーティングを使うか
+⑤ 検証        実測して、設計どおりかを確かめる
+```
+
+**①が決まらないと②以降は決まりません。** 経路が何ホップあるかで、揃えるべき機器の範囲が決まるためです。
+
+①は GPU 基盤の導入コース レッスン 2 と、ファシリティコース レッスン 6 で扱いました。**このレッスンでは②以降をまとめます。**
+
+---
+
+## ② QoS — 数字の一式
+
+レッスン 3 で扱った設定を、設計書に書く形でまとめます。NVIDIA Cumulus Linux 5.9 の RoCE 構成例に沿った値です。
+
+| トラフィック | DSCP | 優先度 / TC | PFC | ECN | 扱い |
+| --- | --- | --- | --- | --- | --- |
+| **RoCE データ** | 26 | 3 | **有効** | **有効** | lossless |
+| **CNP** | 48 | 6 | 無効 | 無効 | **最優先** |
+| その他 | 0 | 0 | 無効 | 有効 | ベストエフォート |
+
+この構成例では、ECN を TC 3 だけでなく TC 0 でも有効にしています。ここでの値は Cumulus Linux 5.9 の構成例のうち、ポート単位の表示（`nv show interface <port> qos roce status`）のものです。同じページの全体の対応表（`nv show qos roce`）では、DSCP 24〜31 を優先度 3 に、48〜55 を優先度 6 にまとめて対応させています。
+
+**この表は「経路上のすべての機器で同じであること」が要件です。** 1 台でも違えば、そこで壊れます。
+
+```bash
+# NIC 側。trust の状態と、どの優先度が lossless かを見る
+mlnx_qos -i eth2
+
+# 優先度ごとの送受信バイト数。3 番に乗っているかを確認する
+ethtool -S eth2 | grep -E 'prio3|prio6'
+```
+
+---
+
+## ③ MTU — 全経路で揃える
+
+見落とされやすい項目です。
+
+Cumulus Linux 5.9 の既定 MTU は 9216 バイトで、NVIDIA はストレージ向けファブリックの多くがジャンボ MTU を使うためと説明しています。また RoCE の MTU を大きくすると性能が上がる一方、NVIDIA は**スイッチを含む経路全体がその MTU に対応している必要がある**としています（RoCE のパケットは、インターフェースの MTU とは別の RoCE MTU を使います）。
+
+Cumulus Linux 5.9 は、MTU を超えるパケットのうち**分割できない（DF ビットの立った）ものを落とします。** 経路上のどこか 1 台が小さい MTU のままだと、そういうパケットはそこで落ちます。
+
+Linux の mlx5 ドライバは、RoCE MTU を「インターフェースの MTU からヘッダーを引いた値に収まる、256〜4096 のうち最大のもの」にします。インターフェースが 9000 なら RoCE MTU は 4096 です。
+
+```text
+NIC（インターフェース 9000 → RoCE MTU 4096）→ リーフ 9216 → スパイン 1500 → …
+                                                         ↑ 4096 バイトのペイロードが収まらない
+```
+
+収まらないパケットがどうなるかは、上に書いた Cumulus Linux 5.9 の動作のとおりです。L3 の出口インターフェースで、既定では DF ビットが立ったものを落とします（DF の有無にかかわらず落とす設定もあります）。RoCEv2 を定めた IBTA の仕様は会員向けで、DF の扱いはここでは確かめていません。Linux のソフトウェア実装（rxe）は DF を立てて送っています。
+
+<Callout type="pitfall">
+
+**MTU 不一致は、静かに壊れます。**
+
+小さいパケットは通るので、疎通確認は成功します。`ping` も通ります。**大きな転送を始めた瞬間だけ失敗する**ので、構築時のチェックをすり抜けます。
+
+```bash
+# 分割禁止で大きなパケットを飛ばして、経路全体を確認する
+ping -M do -s 8972 <相手の IP>
+```
+
+**この確認を、全ノードペアではなく「経路の種類ごと」に行ってください。** DGX SuperPOD の B300 世代の RA（Spectrum-4 Ethernet 版）では、同じ SU（スケーラブルユニット）の同じレールなら 1 ホップで届き、ノードやレールをまたぐとスパイン層を通ります。**レール内とレールをまたぐ経路**で、通る機器が変わります。
+
+</Callout>
+
+---
+
+## ④ 揃えるべき範囲
+
+ここまで「経路上のすべてで」という言葉が何度も出てきました。整理します。
+
+| 項目 | 揃える範囲 | 外れたときの症状 |
+| --- | --- | --- |
+| PFC の優先度 | **全リンク** | その箇所だけ廃棄が出る |
+| trust（DSCP / PCP） | **全機器** | 意図と違う優先度に分類される（タグ無しなどでは既定の優先度。既定を lossless にしていなければ lossless から外れる） |
+| ECN の閾値 | 全スイッチ | 一部だけ PFC が先に出る |
+| MTU | **全機器** | 大きな転送だけ失敗する |
+| 適応ルーティング | スイッチと NIC の両端 | 順序崩れが NIC で吸収されない（NVIDIA は Spectrum-4 と BlueField-3 の組み合わせで説明） |
+
+<Callout type="field">
+
+**この表は、そのまま構成管理の対象です。**
+
+手で設定して回ると、必ずどこかが漏れます。しかも漏れた箇所は静かに壊れるので、**漏れたことに気づけません。**
+
+運用オペレーションコース レッスン 6 で扱った「設定変更を確実に残す」の話が、ここでは性能に直結します。**スイッチの設定をテンプレート化し、差分が出たら検出できる状態**にしてから運用へ渡してください。
+
+</Callout>
+
+---
+
+## ⑤ 検証 — 設計どおりかを確かめる
+
+**設定したことと、効いていることは別です。**
+
+```bash
+# 1. 廃棄が出ていないか（ここが増えるなら、どこかで落ちている）
+ethtool -S eth2 | grep -iE 'discard|drop'
+
+# 2. PAUSE が常時出ていないか（出ているなら ECN の効き方や、NIC 自身が受けきれていないことを疑う）
+ethtool -S eth2 | grep -i pause
+
+# 3. 経路が散っているか（リンクごとの分散を見る。合計ではない）
+#    偏っていれば ECMP の衝突を疑う
+```
+
+そのうえで、**実際の集合通信で測ります。**
+
+```bash
+# ノード間の All-Reduce。busbw を理論値と突き合わせる
+mpirun -np 16 -H node1:8,node2:8 \
+  ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 1
+```
+
+**手順の詳細は GPU 基盤の導入コース レッスン 5 にあります。** ここで見るべきは、そのコースに書いた項目に加えて **「遅いペアがないか」** です。レッスン 1 で扱ったとおり、集合通信は最悪のリンクで決まります。
+
+---
+
+## 症状から当たりをつける
+
+実測で期待値が出なかったときの、切り分けの入口です。
+
+| 症状 | 疑う場所 | レッスン |
+| --- | --- | --- |
+| 廃棄カウンタが増える | PFC の設定漏れ、trust 不一致、headroom 不足 | 2 |
+| PAUSE が出続ける | ECN の閾値、DCQCN、NIC 自身が受けきれていない | 2・3 |
+| busbw が理論値を大きく下回る | 経路の偏り（ECMP の衝突） | 4 |
+| 大きな転送だけ失敗 | MTU 不一致 | 6 |
+| 特定ペアだけ遅い | ケーブル・光モジュールの不良 | — |
+
+**最後の 1 行だけは、設定ではなく物理です。** ファシリティコース レッスン 5 で扱った挿し直しや清掃で直ることもあります。
+
+---
+
+## InfiniBand と、どちらを選ぶか
+
+このコースは Ethernet で組む側から書いてきましたが、最後に判断軸をまとめます。
+
+| | InfiniBand | RoCE（Ethernet） |
+| --- | --- | --- |
+| ロスレス | **プロトコルに内蔵** | **自分で作る**（レッスン 2・3） |
+| 経路 | Subnet Manager が管理 | ECMP + 適応ルーティング（レッスン 4） |
+| 設定の量 | 少ない | **多い。しかも全機器で揃える** |
+| 必要な知見 | IB 専用 | 既存の Ethernet 運用 + AI 向けの追加 |
+| 機器の選択肢 | 限られる | **広い** |
+
+---
+
+<h2 className="slide-cont">InfiniBand と、どちらを選ぶか（続き）</h2>
+
+<Callout type="field">
+
+**「どちらが速いか」では決まりません。**
+
+このコースで見てきたとおり、**RoCE は正しく設定すれば速く、設定を詰めきれないと静かに遅くなります。** 差が出るのは技術そのものではなく、**詰めきれる体制があるかどうか**です。
+
+判断の材料は、だいたいこの 3 つに集約されます。
+
+- **経路上の全機器を一貫して管理できる仕組みがあるか**（テンプレート化、差分検出）
+- **性能が出ないときに、ネットワークを疑って測れる人がいるか**
+- **InfiniBand 専用の運用**（Subnet Manager の運用、`ibdiagnet`、ファームウェア管理）**を抱えられるか**
+
+**前の 2 つが弱いなら、機器が安くても RoCE は高くつきます。** 逆に Ethernet の運用基盤が強い組織なら、RoCE のほうが結果として安定します。
+
+</Callout>
+
+---
+
+## このコースのまとめ
+
+- 分散学習のトラフィックは**少数・巨大・同期**。統計多重が効かない
+- RoCE は既定で **go-back-N**。1 回のロスで、帯域 × 往復時間ぶんのデータを送り直す
+- **PFC** は落とさないための最後の砦。**常時出ているのは異常**
+- **ECN と DCQCN** で手前の段階で輻輳を消す。**閾値の順序が設計の要**
+- **CNP を優先する**のは、通知の期限を逃さず、収束を速めるため
+- **ECMP はフローを固定する**。本数が少ない AI では偏りが残る
+- 対策は **レール最適化・エントロピー・適応ルーティング**の 3 段構え
+- パケット単位で散らすには、**NIC が順序崩れを吸収できること**が前提
+- PFC / ECN / DCQCN は各社が共通に備える土台（使うかは別。Meta は 400G の導入で DCQCN を外したと 2024 年に報告）。**製品の差は負荷分散と可観測性に出る**
+- 設定は**経路上の全機器で揃える**。漏れた箇所は静かに壊れる
+
+---
+
+<Quiz
+  id="q1"
+  question="RoCE ファブリックを構築し、疎通確認として全ノード間で ping が通ることを確認しました。しかし分散学習を流すと特定の経路で通信が失敗します。小さいパケットは問題ありません。最も疑わしい原因はどれですか。"
+  options={[
+    "GPU のドライバの不整合",
+    "経路上のどこかの機器で MTU が揃っておらず、大きなパケットだけが落ちている",
+    "PFC が有効になっていない",
+    "Subnet Manager が停止している"
+  ]}
+  answer={1}
+  explanation="MTU の不一致は小さいパケットを通してしまうため、ping による疎通確認をすり抜けます。大きな転送を始めた瞬間だけ失敗するので構築時のチェックで見落とされがちです。分割禁止のオプションを付けて大きなパケットを飛ばすと経路全体の MTU を確認できます。PFC の設定漏れなら廃棄カウンタが増える形で現れ、Subnet Manager は InfiniBand の仕組みなので RoCE では関係しません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="計算ファブリックを InfiniBand にするか RoCE にするかを検討しています。判断の軸として最も適切なものはどれですか。"
+  options={[
+    "理論上のレイテンシが小さいほうを選ぶ",
+    "経路上の全機器の設定を一貫して管理でき、性能が出ないときにネットワークを疑って測れる体制があるかで決める",
+    "機器の価格が安いほうを選ぶ",
+    "GPU のベンダーと同じベンダーで揃える"
+  ]}
+  answer={1}
+  explanation="RoCE には何らかのフロー制御が要り、NVIDIA は PFC を通常かつ最適な方法としたうえで、PFC を使うなら経路上のすべての端点とスイッチで有効にする必要があるとしています（WinOF-2）。MTU も、スイッチを含む経路全体が対応している必要があります。設定の漏れは、廃棄や PAUSE のカウンタ、集合通信の実測で見つけることになります。したがって判断軸は理論性能や価格ではなく、設定を一貫して管理する仕組みと、性能が出ないときにネットワーク側を測って切り分けられる体制があるかどうかになります。InfiniBand を選ぶ場合は、Subnet Manager の運用など専用の運用を抱えられるかが条件です。"
+/>

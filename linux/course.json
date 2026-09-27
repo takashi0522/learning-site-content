@@ -1,0 +1,9 @@
+{
+  "title": "Linux / OS 基礎",
+  "subtitle": "Operating System",
+  "description": "カーネルとユーザー空間の境界から始めて、プロセス・メモリ・ファイルシステム・systemd・namespace までを一本の筋で理解します。障害時に「どのレイヤの問題か」を切り分けられる状態を目指します。",
+  "order": 1,
+  "accent": "linux",
+  "level": "基礎 → 実務",
+  "status": "ready"
+}

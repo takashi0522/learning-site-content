@@ -1,0 +1,240 @@
+---
+title: 経路が偏る — ECMP と適応ルーティング
+description: フロー単位のハッシュがなぜ AI では機能しないのか、そして適応ルーティングとパケットスプレーが何を変えるのかを扱います。
+order: 4
+minutes: 22
+tags: ["ECMP", "エレファントフロー", "適応ルーティング", "フローレット", "パケットスプレー"]
+objectives:
+  - ECMP がフロー単位で経路を固定する仕組みと、その前提を説明できる
+  - AI のトラフィックでハッシュ衝突が致命的になる理由を説明できる
+  - 適応ルーティングとパケットスプレーの違い、および順序崩れの扱いを説明できる
+references:
+  - label: "FlowTracer: Uncovering Network Path Usage Imbalance in AI Training Clusters (arXiv)"
+    url: "https://arxiv.org/abs/2410.17078"
+  - label: "RFC 2992 — Analysis of an Equal-Cost Multi-Path Algorithm"
+    url: "https://www.rfc-editor.org/rfc/rfc2992"
+  - label: "NVIDIA Spectrum-X Ethernet Platform"
+    url: "https://www.nvidia.com/en-us/networking/spectrumx/"
+  - label: "Meta Engineering — RoCE networks for distributed AI training at scale"
+    url: "https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/"
+  - label: "NVIDIA NCCL — Environment Variables (NCCL_IB_QPS_PER_CONNECTION)"
+    url: "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html"
+  - label: "NVIDIA DOCA — RDMA over Converged Ethernet (送信元ポートとエントロピー)"
+    url: "https://networking-docs.nvidia.com/doca/sdk/RDMA-over-Converged-Ethernet"
+  - label: "Juniper — Dynamic Load Balancing (フローレットとパケット単位)"
+    url: "https://www.juniper.net/documentation/us/en/software/junos/interfaces-ethernet-switches/topics/topic-map/dynamic-load-balancing.html"
+  - label: "FlowDyn (arXiv 1910.03324)"
+    url: "https://arxiv.org/abs/1910.03324"
+  - label: "NVIDIA Technical Blog — Turbocharging AI Workloads with Spectrum-X"
+    url: "https://developer.nvidia.com/blog/turbocharging-ai-workloads-with-nvidia-spectrum-x-networking-platform/"
+  - label: "NVIDIA Technical Blog — Doubling all2all Performance with NCCL 2.12 (レール最適化)"
+    url: "https://developer.nvidia.com/blog/doubling-all2all-performance-with-nvidia-collective-communication-library-2-12/"
+  - label: "NVIDIA DOCA — Enhanced Connection Establishment (既定は go-back-N)"
+    url: "https://networking-docs.nvidia.com/doca/archive/3-5-0/enhanced-connection-establishment"
+  - label: "NVIDIA Cumulus Linux 5.5 — Equal Cost Multipath Load Sharing (ハッシュに使う値)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-55/Layer-3/Routing/Equal-Cost-Multipath-Load-Sharing-Hardware-ECMP/"
+  - label: "Linux kernel ABI — sysfs-class-net-statistics"
+    url: "https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-class-net-statistics"
+  - label: "Revisiting Network Support for RDMA (IRN, SIGCOMM 2018)"
+    url: "https://arxiv.org/abs/1806.08159"
+  - label: "nccl-tests — PERFORMANCE.md (busbw の意味)"
+    url: "https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md"
+---
+
+## ECMP は「賭け」をしている
+
+ネットワークコース レッスン 3 で扱ったとおり、同じコストの経路が複数あるとき、ルータは **ECMP** でトラフィックを分散します。
+
+やっていることは単純です。
+
+```text
+パケットの 5 つの値（送信元 IP / 宛先 IP / プロトコル / 送信元ポート / 宛先ポート）
+  → ハッシュ関数に入れる
+  → 出た値で、使う経路を決める
+```
+
+**同じフローのパケットは必ず同じ値になるので、同じ経路を通ります。** 順序が入れ替わらないので、TCP にとって都合がよい仕組みです。
+
+**そして、次ホップの候補が変わらない限り、同じフローは同じ経路を通り続けます。** リンク障害などで候補が増減すれば割り当てが変わりうるものの、それ以外では固定です。ここが問題になります。
+
+---
+
+## フローが少ないと、偏りが残る
+
+RFC 2992 は、ハッシュの出力が一様に散るなら、**フローの本数**も経路に一様に分かれると書いています。ただし揃うのは本数で、1 本ごとの太さまで揃うわけではありません。
+
+```text
+業務通信 : フローの本数も種類も多い
+```
+
+レッスン 1 で見たとおり、分散学習はこの条件を満たしません。
+
+```text
+分散学習 : フローの本数も種類もずっと少ない
+         ミリ秒単位でオンとオフを繰り返し、バーストでは 1 本で NIC の回線速度に達しうる
+```
+
+Meta は「従来のデータセンターの負荷に比べて、AI ではフローの本数も種類もずっと少ない」と書き、AI の学習で ECMP の性能が出なかった理由を**フローのエントロピーの低さ**に求めています。
+
+<Figure name="ecmp-vs-adaptive" caption="フローが少ないと、ハッシュの衝突がそのまま経路の偏りになりうる" />
+
+---
+
+## 衝突すると、そのまま半分になる
+
+図の左が、実際に起きることです。
+
+```text
+400Gbps のフローが 2 本、同じ 400Gbps のアップリンクにハッシュされた
+
+→ 2 本で 400Gbps を分け合う
+→ 1 本あたり 200Gbps。速度は半分
+→ 隣の 3 本のアップリンクは、その間ずっと空いている
+```
+
+**足りないのは帯域ではありません。** ファブリック全体としてはノンブロッキングで組んであり、空きリンクは目の前にあります。**選び方の問題です。**
+
+AI クラスタの経路の使われ方を測った FlowTracer の論文は、**ハッシュの衝突がしばしば経路の偏りを生み、性能のボトルネックになる**と書いています。
+
+<Callout type="pitfall">
+
+**ハッシュは確率的に振り分けます。**
+
+衝突するかどうかはフローの組み合わせしだいなので、**同じジョブでも組み合わせが変われば結果が変わりえます。** Meta も、ハッシュが確率的であることを弱点として挙げています。
+
+アプリケーションの問題に見えても、**ネットワーク側を疑う視点**を持っておいてください。
+
+</Callout>
+
+---
+
+## エントロピーを増やす、という対症療法
+
+対症療法の 1 つが、**ハッシュの入力をばらけさせる**方法です。
+
+```text
+同じノード間の通信なら、5-tuple のうち 4 つは同じ
+  送信元 IP   … 同じ
+  宛先 IP     … 同じ
+  プロトコル  … 同じ（UDP）
+  宛先ポート  … 同じ（RoCEv2 は 4791 固定）
+  送信元ポート … ここだけ変えられる
+```
+
+**RoCEv2 では、この送信元ポートを ECMP の手がかりに使えます。** NVIDIA の資料は、送信元ポートを「ECMP を助けるフローの ID として使える」としています。
+
+NCCL は `NCCL_IB_QPS_PER_CONNECTION` を設定すると、1 つの接続を複数のキューペアに分けられます（NCCL 2.32 のドキュメントでは**既定は 1**）。NVIDIA はこれを「多段のファブリックで経路のエントロピーを得るため」と説明しています。
+
+**しかし、これは確率を改善するだけです。** Meta も、キューペアを増やして ECMP の性能を改善したうえで、ハッシュが確率的であることは弱点として残ったと書いています。**振る回数（フローの本数）を増やしても、サイコロであることは変わりません。**
+
+---
+
+## 経路を選び直す — 適応ルーティング
+
+本質的な解決は、**経路を固定しない**ことです。
+
+| 方式 | 単位 | 順序 |
+| --- | --- | --- |
+| **ECMP** | フロー | 保たれる |
+| **フローレット** | 通信の切れ目ごと | ほぼ保たれる |
+| **パケットスプレー** | **パケット 1 個ごと** | **崩れうる** |
+
+**フローレット**は、フローの中の「一瞬の隙間」を見つけて、そこで経路を切り替える方法です。隙間が十分に長ければ、先に送ったパケットは追い越されないので順序が保たれます（隙間が短すぎると崩れうる）。
+
+**パケットスプレー**は、1 パケットごとに空いている経路へ送ります。**細かく散らせる代わりに、到着順が崩れることがあります。**
+
+---
+
+<h2 className="slide-cont">経路を選び直す — 適応ルーティング（続き）</h2>
+
+<Callout type="warning" title="順序崩れは RDMA の弱点そのもの">
+
+レッスン 1 で扱ったとおり、**RoCE は既定で go-back-N で再送します。** IRN の論文（SIGCOMM 2018）によれば、go-back-N で動く NIC は、順序が崩れたパケットが届くとそれを捨てて再送を求めます。素朴にパケットを散らすと、**偏りを直した代わりに再送で遅くなりえます。**
+
+だから、パケットスプレーを使うには**受信側の NIC が順序崩れを吸収できる必要があります。**
+
+**これが、スイッチと NIC を組で考える理由です。** スイッチ側でパケット単位の振り分けを有効にできても、NIC が順序崩れを吸収できなければ、再送を招いて遅くなりえます。NVIDIA も Spectrum-X の適応ルーティングを、Spectrum-4 のスイッチと BlueField-3 SuperNIC を含む end-to-end の機能だと説明しています。
+
+</Callout>
+
+**適応ルーティング**は、スイッチが各出口のキューの深さを見て、空いている経路を選ぶ仕組みです。フローレット単位で切り替えるものと、パケット単位で散らすものがあり、**製品や設定によってどちらを使うかが違います。** レッスン 5 で扱います。
+
+---
+
+## レール最適化との関係
+
+ここで、GPU 基盤の導入コース レッスン 2 で扱ったレール最適化が効いてきます。
+
+```text
+同じ GPU 番号どうしの通信（レール内）
+  → リーフ 1 台の中で折り返す
+  → そもそもスパインへ上がらないので、ECMP の出番がない
+
+違う GPU 番号との通信（レールをまたぐ）
+  → スパインを経由する
+  → ここで経路選択の問題が出る
+```
+
+**レール最適化は、ECMP の偏りに晒される通信量そのものを減らしています。** NCCL は既定で、同じ ring / tree には同じ NIC を使おうとします（`NCCL_CROSS_NIC`。性能が上がるなら別の NIC も使う）。NVIDIA は、レール最適化の配線が all-reduce の性能を引き出し、フロー間の干渉を抑えると説明しています（all2all は工夫しないとレールをまたぐ）。
+
+<Callout type="field">
+
+**つまり、対策は 3 段構えになります。**
+
+1. **レール最適化**で、スパインへ上がる通信を減らす（配線の設計）
+2. **エントロピー**を増やして、上がった通信の衝突確率を下げる（NIC と NCCL の設定）
+3. **適応ルーティング**で、それでも起きる偏りを動的に直す（機器の機能）
+
+**どれか 1 つではありません。** 1 が効いていないと 3 の負荷が上がり、3 が無いと 1 の効果を超えた通信で詰まります。
+
+</Callout>
+
+---
+
+## 偏っているかを見る
+
+設定しただけで安心せず、**実際に散っているかを確認します。**
+
+```bash
+# 考え方: 送信バイト数を、ジョブを流している間に 10 秒あけて 2 回読み、差を比べる
+# （ポート名 swp は Cumulus Linux のもの）
+for p in swp1 swp2 swp3 swp4; do echo -n "$p "; cat /sys/class/net/$p/statistics/tx_bytes; done
+sleep 10
+for p in swp1 swp2 swp3 swp4; do echo -n "$p "; cat /sys/class/net/$p/statistics/tx_bytes; done
+```
+
+Linux の `tx_bytes` は送信したバイト数を示す値で、正確な意味はドライバしだいです。**スイッチでは、ASIC が転送した分がこの値に含まれるかを、使うスイッチ OS の文書で確かめてください。** 含まれないなら、その OS が示すポート統計の取り方に置き換えます。
+
+**見るのは合計ではなく、リンクごとの分散です。** 合計が出ていても、内訳が偏っていれば遅いリンクに引きずられます。
+
+**nccl-tests の busbw が理論値を大きく下回る**なら、経路の偏りも疑ってください。Meta は、ジョブ配置が断片化してアップリンクに偏りと輻輳が生じ、学習性能が最大 30% 超落ちた例を報告しています。GPU 基盤の導入コース レッスン 5 の受け入れ検証で、ノードペアを総当たりで測ることを勧めたのは、この偏りを見つけるためでもあります。
+
+---
+
+<Quiz
+  id="q1"
+  question="AI の学習で、ECMP の性能が出にくいのはなぜですか。"
+  options={[
+    "ECMP は RoCEv2 のパケットを扱えないため",
+    "フローの本数も種類も少なく（エントロピーが低く）、ハッシュの偏りが数で均されにくいため",
+    "ECMP はパケットごとに経路を変えるので、到着順が崩れるため",
+    "スパインの台数が偶数でないと ECMP が動かないため"
+  ]}
+  answer={1}
+  explanation="ECMP はパケットのヘッダをハッシュして経路を決め、次ホップの候補が変わらない限り同じフローは同じ経路を通ります。Meta は AI の学習について、従来の負荷に比べてフローの本数も種類もずっと少ないと書き、ECMP の性能が出なかった理由をフローのエントロピーの低さに求めています。選択肢 3 番目はパケットスプレーの説明で、ECMP ではありません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="ECMP の偏りを解消するため、スイッチでパケット単位のスプレーを有効にしようと考えています。事前に確認すべき最も重要な点はどれですか。"
+  options={[
+    "スイッチのファームウェアが最新か",
+    "受信側の NIC が順序崩れを吸収できるか。go-back-N で動く NIC では順序崩れが再送を招くため、対応していないと再送で遅くなりうる",
+    "ケーブルの長さが揃っているか",
+    "スパインの台数が偶数か"
+  ]}
+  answer={1}
+  explanation="パケット単位で経路を散らすと到着順が崩れることがあります。go-back-N で動く NIC は、順序が崩れたパケットを捨てて再送を求めます。偏りを直した代わりに再送で遅くなるという結果になりかねません。そのためスプレーを使う構成では、受信側で順序崩れを吸収できる NIC が前提になります。スイッチと NIC をセットで選ぶ必要があるのはこの理由で、ファームウェアやケーブル長、スパイン台数は主要因ではありません。"
+/>

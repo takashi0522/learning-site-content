@@ -1,0 +1,273 @@
+---
+title: ソフトウェアスタックを積む順番
+description: ドライバ、Fabric Manager、DOCA/MOFED、コンテナランタイム、NGC。どれを先に入れ、何を確かめてから次へ進むかを整理します。
+order: 4
+minutes: 20
+tags: ["NVIDIA ドライバ", "Fabric Manager", "DOCA", "Container Toolkit", "NGC"]
+objectives:
+  - GPU ノードのソフトウェアスタックを正しい順序で積める
+  - Fabric Manager が必要になる条件を説明できる
+  - 各段階で「次へ進んでよい」と判断する確認コマンドを打てる
+references:
+  - label: "NVIDIA Driver Documentation"
+    url: "https://docs.nvidia.com/datacenter/tesla/index.html"
+  - label: "NVIDIA Fabric Manager User Guide"
+    url: "https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html"
+  - label: "NVIDIA Container Toolkit Documentation"
+    url: "https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/"
+  - label: "NVIDIA DOCA Documentation"
+    url: "https://networking-docs.nvidia.com/doca/sdk"
+  - label: "NVIDIA DOCA — MLNX_OFED to DOCA-OFED Transition Guide"
+    url: "https://networking-docs.nvidia.com/doca/archive/3-4-0/mlnx_ofed-to-doca-ofed-transition-guide"
+  - label: "NVIDIA Driver Installation Guide — FAQ (DKMS の再ビルド)"
+    url: "https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/frequently-asked-questions.html"
+  - label: "nvidia-smi (topo の凡例、CUDA Version)"
+    url: "https://docs.nvidia.com/deploy/nvidia-smi/index.html"
+  - label: "NVIDIA/yum-packaging-fabric-manager (ドライバと版を揃える)"
+    url: "https://github.com/NVIDIA/yum-packaging-fabric-manager"
+  - label: "apt-mark(8) (hold)"
+    url: "https://manpages.debian.org/trixie/apt/apt-mark.8.en.html"
+  - label: "DNF versionlock plugin"
+    url: "https://dnf-plugins-core.readthedocs.io/en/latest/versionlock.html"
+  - label: "rdma-core — ibstat.c (出力の書式)"
+    url: "https://github.com/linux-rdma/rdma-core/blob/master/infiniband-diags/ibstat.c"
+  - label: "TensorFlow Release 25.02 (TensorFlow コンテナの最終リリース)"
+    url: "https://docs.nvidia.com/deeplearning/frameworks/tensorflow-release-notes/rel-25-02.html"
+---
+
+## 積む順番が決まっている理由
+
+GPU ノードのソフトウェアは、下から順に積みます。**途中を飛ばすと、次の段階のエラーが本当の原因を隠します。**
+
+```text
+① OS とカーネル
+② NVIDIA ドライバ（nvidia.ko）
+③ Fabric Manager      ← NVSwitch 搭載機のみ
+④ ネットワークドライバ（DOCA / MOFED）
+⑤ コンテナランタイム + Container Toolkit
+⑥ コンテナイメージ（NGC）
+```
+
+GPU コース レッスン 1 で見たソフトウェアスタックの階層が、そのまま導入の順番になります。
+
+<Callout type="field">
+
+**1 段積むごとに確認する。** まとめて入れて最後に動かすと、どこが悪いのか分からなくなります。
+
+このレッスンでは各段階の「ここまで来たら次へ進んでよい」という確認コマンドを挙げていきます。導入手順書を書くときは、この確認をそのまま手順に入れてください。
+
+</Callout>
+
+---
+
+## ① OS とカーネル
+
+ドライバはカーネルモジュールなので、**カーネルのバージョンに縛られます。**
+
+```bash
+uname -r                    # 動いているカーネル
+cat /etc/os-release         # ディストリビューションと版
+```
+
+<Callout type="warning" title="カーネルを自動更新にしたまま始めない">
+
+Linux コース レッスン 5 で扱ったとおり、カーネル更新は再起動するまで効きません。裏を返すと、**再起動した瞬間にドライバが読めなくなる**ことがあります。
+
+DKMS でビルドし直す構成なら追従するはずですが、NVIDIA のインストールガイドは、新しいカーネルを入れたときに DKMS の再ビルドが失敗することがあると書いています。「気づかないうちにカーネルが変わっていた」状態は避けたいところです。**検証が終わるまではカーネルを固定してください。**
+
+```bash
+# RHEL 系
+sudo dnf versionlock add kernel
+# Debian 系
+sudo apt-mark hold linux-image-generic
+```
+
+固定したことは必ず記録に残します。運用オペレーションコース レッスン 5 で触れたとおり、**固定したままにしておくと、そのパッケージのセキュリティ更新も止まります。** 解除し忘れないためです。
+
+</Callout>
+
+---
+
+## ② NVIDIA ドライバ
+
+<Callout type="note" title="ドライバと CUDA Toolkit は別物">
+
+GPU コース レッスン 1 で扱った話です。**ホストに入れるのはドライバだけ**で、CUDA Toolkit はコンテナ側に持たせるのが基本です。
+
+`nvidia-smi` が表示する「CUDA Version」は、**そのドライバが対応できる CUDA の最大バージョン**で、インストール済みの Toolkit の版と一致するとは限りません。ここを取り違えると、入っていないはずの Toolkit があると誤解します。
+
+</Callout>
+
+確認は 2 段階で行います。
+
+```bash
+# カーネルモジュールが読めているか
+lsmod | grep nvidia
+
+# GPU が見えているか。枚数まで数える
+nvidia-smi --query-gpu=index,name,serial,driver_version --format=csv
+```
+
+```text
+index, name, serial, driver_version
+0, NVIDIA H100 80GB HBM3, 1234567890123, 550.90.07
+1, NVIDIA H100 80GB HBM3, 1234567890124, 550.90.07
+...
+```
+
+**期待した枚数が出ているかを必ず数えてください。** 8 枚積んだはずが 7 枚しか見えない、というのはこの段階で見つかります。後の段階まで進んでから気づくと、切り分けが面倒になります。
+
+---
+
+## ③ Fabric Manager（NVSwitch 搭載機のみ）
+
+DGX のように **NVSwitch を積んだ機種**では、GPU 同士を NVLink で繋ぐために Fabric Manager が必要です。
+
+```bash
+sudo systemctl enable --now nvidia-fabricmanager
+systemctl status nvidia-fabricmanager
+```
+
+```bash
+# NVLink が張れているか
+nvidia-smi nvlink --status | head
+nvidia-smi topo -m
+```
+
+`nvidia-smi topo -m` の凡例では、`NV#` は NVLink を通る接続、`SYS` や `NODE` は PCIe を通る接続です。NVSwitch 搭載機では、GPU 間が `NV#` になっていることを確かめます。
+
+DGX H100 / HGX H100 以降のうち、ALI による NVLink トレーニングに対応する機種では、各 GPU が NVLink のファブリックへ登録できたかを、Fabric Manager User Guide が挙げている方法で見ます。
+
+```bash
+nvidia-smi -q -i 0 | grep -i -A 2 Fabric
+# State : Completed かつ Status : Success なら、GPU の登録が成功している
+```
+
+<Callout type="pitfall">
+
+**Fabric Manager のバージョンはドライバと一致している必要があります。**
+
+ドライバだけ更新して Fabric Manager を置き去りにすると、Fabric Manager は起動時にドライバとの互換性を確かめ、合わなければ処理を中止します。この状態で学習を起動すると、**CUDA の初期化が `cudaErrorSystemNotReady` で失敗します**（Fabric Manager User Guide）。
+
+`nvidia-smi` で GPU の一覧が出ることだけを見ていると、この失敗の原因にたどり着くまで遠回りします。**ドライバと Fabric Manager は版を揃えて更新し、H100 以降の ALI 対応機なら Fabric の State と Status も確認してください。**
+
+</Callout>
+
+---
+
+## ④ ネットワークドライバ（DOCA / MOFED）
+
+ConnectX / BlueField の NIC を RDMA で使うためのドライバとユーティリティです。**DOCA** に統合されています（単体の MLNX_OFED の最終リリースは 2024 年 10 月）。ただ、既存環境では MOFED の名前で運用されていることもあります。
+
+```bash
+# NIC が見えているか
+ibstat
+ibv_devinfo
+
+# ポートがリンクアップしているか（State: Active が正常）
+ibstat | grep -E 'CA |State|Rate'
+```
+
+```text
+CA 'mlx5_0'
+        CA type: MT4129
+                State: Active
+                Rate: 400
+```
+
+AI 基盤コース レッスン 2 で扱った `ibstat` の読み方が、そのままここで使えます。**`State: Active` と、期待した `Rate` が出ているか**を全ポートで確認します。
+
+<Callout type="field">
+
+**GPUDirect RDMA が効いているかは、この段階では分かりません。**
+
+NIC が GPU の VRAM へ直接 DMA できているかは、実際に NCCL を動かしてログを見るまで確定しません（レッスン 5）。ここで確認できるのは「NIC が生きていて、期待した速度でリンクしている」ところまでです。
+
+</Callout>
+
+---
+
+## ⑤ コンテナランタイムと Container Toolkit
+
+GPU コース レッスン 2 で扱った構成です。**ホストにあるのはドライバだけ、CUDA はコンテナ側**という分担を、実現しているのが Container Toolkit です。
+
+<Figure name="gpu-container-stack" caption="ホストに置くのはドライバだけ。CUDA はコンテナ側にある" />
+
+```bash
+# ランタイムが GPU を渡せるか
+sudo docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+```
+
+コンテナの中で `nvidia-smi` が全 GPU を表示すれば、ここまでの ②〜⑤ が繋がっています。
+
+---
+
+<h2 className="slide-cont">⑤ コンテナランタイムと Container Toolkit（続き）</h2>
+
+<Callout type="note" title="Kubernetes を使う場合">
+
+Kubernetes 上で動かすなら、この先に device plugin と GPU Operator が入ります。AI 基盤コース レッスン 5 で扱った内容です。
+
+**ただし、まず素の Docker で GPU が見えることを確認してから Kubernetes へ進んでください。** device plugin のトラブルなのか、その下のドライバのトラブルなのかを切り分けるためです。
+
+</Callout>
+
+---
+
+## ⑥ コンテナイメージ（NGC）
+
+NVIDIA が検証済みのイメージを **NGC** で配布しています。PyTorch や NeMo などが、対応する CUDA / cuDNN / NCCL とセットで固められています（TensorFlow のコンテナは 25.02 で新規リリースを終えています）。
+
+<Callout type="tip">
+
+**最初の検証には NGC のイメージを使ってください。**
+
+自前でビルドしたイメージだと、性能が出ないときに「環境の作り方が悪いのか、ハードウェアの問題か」が切り分けられません。NGC のイメージで期待値が出ることを確認してから、自前のイメージへ移すのが安全な順序です。
+
+</Callout>
+
+---
+
+## 各段階の合格条件
+
+導入手順書に入れる形でまとめます。
+
+| 段階 | 確認コマンド | 合格条件 |
+| --- | --- | --- |
+| ② ドライバ | `nvidia-smi --query-gpu=index,name --format=csv` | **期待した枚数**が出る |
+| ③ Fabric Manager | `nvidia-smi -q` / `nvidia-smi topo -m` | （H100 以降の ALI 対応機）Fabric の State が `Completed`・Status が `Success`、GPU 間が `NV#` |
+| ④ NIC | `ibstat` | 全ポートが `State: Active` で期待した `Rate` |
+| ⑤ コンテナ | `docker run --gpus all ... nvidia-smi` | コンテナ内で全 GPU が見える |
+| ⑥ NGC | NGC イメージで簡単な学習が回る | エラーなく完走する |
+
+**ここまでは「動くこと」の確認で、「速いこと」の確認はしていません。** それは次のレッスンで扱います。
+
+---
+
+<Quiz
+  id="q1"
+  question="NVSwitch を積んだ DGX H100 ノードで、ドライバだけを新しい版に更新しました。nvidia-smi では 8 枚すべての GPU が表示されますが、学習ジョブを起動すると CUDA の初期化が cudaErrorSystemNotReady で失敗します。最初に疑うべきものはどれですか。"
+  options={[
+    "GPU の故障。nvidia-smi では検出できない不良がある",
+    "Fabric Manager がドライバと版が合わずに起動していない可能性。nvidia-smi -q の Fabric の State が Completed、Status が Success になっているか確認する",
+    "CUDA Toolkit のバージョンが古い",
+    "電源容量の不足"
+  ]}
+  answer={1}
+  explanation="NVSwitch 搭載機では、Fabric Manager が NVSwitch を設定して GPU 間の NVLink のファブリックを作ります。Fabric Manager User Guide によれば、Fabric Manager は起動時に読み込まれているドライバの版との互換性を確かめ、合わなければ処理を中止します。そして Fabric Manager が初期化を終えていない、または失敗した状態でアプリケーションを起動すると、CUDA の初期化が cudaErrorSystemNotReady で失敗します。DGX H100 以降の ALI 対応機では、ガイドは GPU の登録状態を nvidia-smi -q の Fabric の項目で確認する方法を挙げています（登録に成功すると State が Completed、Status が Success）。ドライバと Fabric Manager は版を揃えて更新してください。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="GPU ノードの構築で、カーネルの自動更新を有効にしたまま作業を進めるとどのような問題が起きますか。"
+  options={[
+    "特に問題はない。ドライバはカーネルに依存しない",
+    "NVIDIA ドライバはカーネルモジュールなので、カーネルが更新されて再起動すると読み込めなくなることがある",
+    "CUDA Toolkit が消える",
+    "GPU のファームウェアが初期化される"
+  ]}
+  answer={1}
+  explanation="nvidia.ko はカーネルモジュールで、カーネルのバージョンに紐づいてビルドされます。DKMS を使っていれば更新時に再ビルドされるはずですが、失敗することもあり、それでも「気づかないうちにカーネルが変わっていた」状態は切り分けを難しくします。構築と検証が終わるまではカーネルを versionlock や apt-mark hold で固定し、固定した事実を記録に残してください。固定したまま解除を忘れると、セキュリティ更新まで止まります。"
+/>

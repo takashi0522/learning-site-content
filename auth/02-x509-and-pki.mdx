@@ -1,0 +1,323 @@
+---
+title: X.509 証明書と PKI
+description: 証明書の中身と信頼の連鎖を読み解き、openssl で自分で検証できるようにします。
+order: 2
+minutes: 18
+tags: ["X.509", "PKI", "CSR", "SAN", "OCSP", "openssl"]
+objectives:
+  - 証明書の主要フィールドを読み、用途を判断できる
+  - 信頼の連鎖がどこで成立するかを説明できる
+  - 失効の仕組みとその限界を理解できる
+references:
+  - label: "RFC 5280 — X.509 Public Key Infrastructure Certificate"
+    url: "https://www.rfc-editor.org/rfc/rfc5280.html"
+  - label: "RFC 6960 — Online Certificate Status Protocol (OCSP)"
+    url: "https://www.rfc-editor.org/rfc/rfc6960.html"
+  - label: "OpenSSL Documentation"
+    url: "https://docs.openssl.org/master/"
+---
+
+## 証明書は「署名された身分証」
+
+証明書が解いている問題は 1 つです。
+
+> **この公開鍵は、本当にこのサーバー（人）のものか。**
+
+公開鍵そのものは誰でも作れるので、**第三者（CA）が「この鍵はこの相手のものだ」と署名する**ことで信頼を作ります。
+
+```text
+証明書 = 公開鍵 + 識別情報（誰のものか） + CA による署名
+```
+
+ネットワークコース レッスン 6 で扱った TLS ハンドシェイクは、この証明書を使って「相手が本物か」を確認し、鍵交換を行っています。
+
+---
+
+## 中身を読む
+
+```bash
+# サーバーから取得して中身を見る
+openssl s_client -connect api.example.com:443 -servername api.example.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -text
+
+# ファイルから
+openssl x509 -in server.crt -noout -text
+```
+
+主要なフィールドです。
+
+```text
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number: 04:f2:...              ← 失効リストで参照される
+        Signature Algorithm: sha256WithRSAEncryption
+        Issuer: C=US, O=Let's Encrypt, CN=R11  ← 誰が署名したか
+        Validity
+            Not Before: Sep 19 00:00:00 2026 GMT
+            Not After : Dec 18 23:59:59 2026 GMT   ← 有効期限
+        Subject: CN=api.example.com            ← 誰のものか
+        Subject Public Key Info:
+            Public-Key: (2048 bit)
+        X509v3 extensions:
+            X509v3 Subject Alternative Name:
+                DNS:api.example.com, DNS:www.example.com   ← 実際の照合はここ
+            X509v3 Basic Constraints: critical
+                CA:FALSE                       ← CA ではない（末端の証明書）
+            X509v3 Key Usage: critical
+                Digital Signature, Key Encipherment
+            X509v3 Extended Key Usage:
+                TLS Web Server Authentication  ← サーバー用途
+            Authority Information Access:
+                CA Issuers - URI:http://r11.i.lencr.org/  ← 中間証明書の取得先
+                OCSP - URI:http://r11.o.lencr.org
+```
+
+---
+
+<h2 className="slide-cont">中身を読む（続き）</h2>
+
+<Callout type="pitfall" title="ホスト名の照合は SAN であって CN ではない">
+
+かつては `Subject` の `CN`（Common Name）にホスト名を書いていましたが、**現在のクライアントは SAN（Subject Alternative Name）だけを見ます**。Chrome は 2017 年（v58）から CN を無視しています。
+
+```bash
+# SAN だけを確認する
+openssl x509 -in server.crt -noout -ext subjectAltName
+```
+
+**CN にホスト名を書いただけの証明書は、現在のブラウザでは「名前が一致しない」エラーになります。** 自己認証局で証明書を発行するとき（レッスン 3）、SAN の指定を忘れるのが最も多い失敗です。
+
+また、**SAN には接続に使うすべての名前を入れる**必要があります。`api.example.com` と `api`（内部の短い名前）、IP アドレスで繋ぐなら `IP:10.0.0.10` も必要です。
+
+</Callout>
+
+### 用途を制限する拡張
+
+| 拡張 | 役割 |
+| --- | --- |
+| **Basic Constraints** | `CA:TRUE` なら他の証明書に署名できる。**末端は必ず `CA:FALSE`** |
+| **Key Usage** | 鍵の用途（署名、鍵交換、証明書署名など） |
+| **Extended Key Usage** | より具体的な用途（サーバー認証 / **クライアント認証** / コード署名） |
+
+<Callout type="note">
+
+**mTLS（レッスン 6）では `Extended Key Usage` が効いてきます。** クライアント証明書には `TLS Web Client Authentication` が必要で、サーバー用途だけの証明書ではクライアント認証に使えません。
+
+自己認証局で発行するときに、**用途に応じて EKU を指定する**必要があります。両方付ければどちらにも使えますが、用途を絞るほうが安全です。
+
+</Callout>
+
+---
+
+## 信頼の連鎖
+
+証明書は**鎖**になっています。
+
+```text
+[ルート CA 証明書]  ← 自己署名。信頼の起点
+        │ 署名
+[中間 CA 証明書]
+        │ 署名
+[サーバー証明書]   ← 実際に使うもの
+```
+
+検証は末端から上へ遡り、**ルートがクライアントのトラストストアに入っていれば成立**します。
+
+<Callout type="field">
+
+**ルート証明書が「信頼できる」理由は、暗号的な根拠ではありません。** ルートは自己署名（自分で自分に署名）なので、数学的には何も証明していません。
+
+信頼の根拠は、**「そのルート証明書がクライアントのトラストストアに入っている」という一点だけ**です。
+
+- 公開 CA → OS やブラウザにあらかじめ組み込まれている
+- **自己認証局 → 自分で配布して入れる必要がある**（レッスン 3 の中心課題）
+
+ここを理解しておくと、「オレオレ証明書」が何を欠いているのかが明確になります。暗号強度の問題ではなく、**トラストストアに入っていないこと**が問題なのです。
+
+</Callout>
+
+```bash
+# 検証をコマンドで実行する
+openssl verify -CAfile ca-chain.crt server.crt
+# server.crt: OK
+
+# チェーンを確認する（ネットワークコース レッスン 6 の中間証明書漏れの確認）
+openssl s_client -connect api.example.com:443 -servername api.example.com </dev/null 2>/dev/null \
+  | grep -E 's:|i:'
+```
+
+---
+
+<h2 className="slide-cont">信頼の連鎖（続き）</h2>
+
+```text
+ 0 s:CN = api.example.com
+   i:C = US, O = Let's Encrypt, CN = R11
+ 1 s:C = US, O = Let's Encrypt, CN = R11       ← 中間証明書が送られている
+   i:C = US, O = ISRG, CN = ISRG Root X1
+```
+
+**`0` しかなければ中間証明書が配信されていません。** ブラウザは AIA から自動取得するため気づきにくく、`curl` や Java から繋いだときだけ失敗します。
+
+---
+
+## 鍵と CSR
+
+証明書を得る流れです。
+
+```bash
+# ① 秘密鍵を作る（これは絶対に外に出さない）
+openssl genrsa -out server.key 2048
+# または楕円曲線（短く速い。現在はこちらを推奨）
+openssl ecparam -genkey -name prime256v1 -out server.key
+chmod 600 server.key
+
+# ② CSR（署名要求）を作る。SAN を必ず指定する
+openssl req -new -key server.key -out server.csr \
+  -subj "/CN=api.example.com" \
+  -addext "subjectAltName=DNS:api.example.com,DNS:api,IP:10.0.0.10"
+
+# ③ CSR の中身を確認する（送る前に必ず）
+openssl req -in server.csr -noout -text | grep -A2 'Subject Alternative Name'
+
+# ④ CA に署名してもらう → 証明書が返ってくる
+```
+
+<Callout type="warning" title="CSR に秘密鍵は含まれない">
+
+**CSR には公開鍵しか入っていません。** 秘密鍵は自分の手元から一歩も出ません。CA は CSR の内容に署名するだけで、秘密鍵を知る必要がないのです。
+
+したがって、**「CA に秘密鍵を送ってください」と言われたら、その運用は誤っています**。
+
+逆に、**秘密鍵を失うと証明書は使えなくなります**。証明書だけバックアップして鍵を取り忘れる、というのはよくある事故です。
+
+```bash
+# 秘密鍵と証明書が対応しているかを確認する（モジュラスの一致を見る）
+openssl x509 -in server.crt -noout -modulus | openssl sha256
+openssl rsa  -in server.key -noout -modulus | openssl sha256
+# 同じハッシュになれば対応している
+```
+
+証明書を入れ替えたのに繋がらない場合、この確認で鍵と証明書の組み合わせ違いがすぐ分かります。
+
+</Callout>
+
+---
+
+## 失効
+
+有効期限前に証明書を無効にする必要が生じることがあります（秘密鍵の漏洩、サーバーの廃止など）。
+
+| 方式 | 仕組み | 問題 |
+| --- | --- | --- |
+| **CRL** | 失効した証明書のリストを配布 | リストが肥大化する。更新が遅い |
+| **OCSP** | 1 件ずつ CA に問い合わせる | **CA に依存する。プライバシー懸念** |
+| **OCSP Stapling** | サーバーが OCSP 応答を取得して TLS ハンドシェイク時に同梱 | **現在の推奨** |
+
+```bash
+# OCSP Stapling が有効かを確認する
+openssl s_client -connect api.example.com:443 -servername api.example.com -status </dev/null 2>/dev/null \
+  | grep -A5 'OCSP Response Status'
+```
+
+<Callout type="pitfall" title="失効は実際にはあまり機能しない">
+
+**クライアントの多くは、失効確認に失敗したときに「失効していない」とみなして接続を続けます**（soft-fail）。
+
+```text
+OCSP サーバーに到達できない
+  → 厳格に拒否すると、CA の障害で全サービスが止まる
+  → だから多くのクライアントは通してしまう
+  → 攻撃者は OCSP をブロックするだけで失効を無効化できる
+```
+
+この構造的な弱さから、**業界の方向性は「失効させる」から「短命にする」へ移っています。**
+
+```text
+有効期限 1 年 + 失効の仕組み   →  失効が効かないと 1 年間有効
+有効期限 90 日 / 24 時間       →  漏洩しても被害の窓が短い
+```
+
+レッスン 3 で扱う自己認証局でも、**失効の仕組みを完璧に作るより、証明書を短命にして自動更新する**ほうが現実的で安全です。
+
+</Callout>
+
+---
+
+## 有効期限の管理
+
+<Callout type="field">
+
+**証明書の期限切れは、今もサービス停止の主要原因です。** しかも「ある日突然、全部止まる」という形で現れます。
+
+監視は必須です。ミドルウェアコース レッスン 5 で触れたとおり、Prometheus の Blackbox Exporter で取得できます。
+
+```promql
+# 14日を切ったら通知
+(probe_ssl_earliest_cert_expiry - time()) / 86400 < 14
+```
+
+```bash
+# コマンドで一括確認する
+for h in api.example.com www.example.com; do
+  printf "%-28s " "$h"
+  echo | openssl s_client -connect "$h:443" -servername "$h" 2>/dev/null \
+    | openssl x509 -noout -enddate
+done
+```
+
+```bash
+# ローカルのファイルを走査する（内部サーバーの証明書）
+find /etc -name '*.crt' -o -name '*.pem' 2>/dev/null | while read -r f; do
+  end=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null) && printf "%-50s %s\n" "$f" "$end"
+done
+```
+
+**監視していない証明書が 1 枚でもあれば、いつか必ず止まります。** 次のレッスンでは、これを自動更新で根本的に解決する方法を扱います。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 証明書は「**この公開鍵はこの相手のもの**」という CA の署名
+- **ホスト名の照合は SAN**。CN は使われない。SAN の指定漏れが最多の失敗
+- `Basic Constraints` / `Key Usage` / `EKU` が用途を制限する。**mTLS にはクライアント認証の EKU が必要**
+- **ルートが信頼される根拠はトラストストアに入っていること**だけ
+- 中間証明書の配信漏れは、**ブラウザでは成功し curl で失敗する**
+- **CSR に秘密鍵は含まれない**。鍵を送れという運用は誤り
+- 鍵と証明書の対応はモジュラスのハッシュで確認できる
+- **失効（CRL / OCSP）は soft-fail のため実効性が低い**。短命化が業界の方向
+- **有効期限の監視は必須**。1 枚でも漏れるといつか止まる
+
+---
+
+<Quiz
+  id="q1"
+  question="自己認証局で発行した証明書を nginx に設定したところ、ブラウザが「この証明書はこのサイトには無効です」というホスト名の不一致エラーを出します。CSR には -subj /CN=api.example.com を指定していました。原因はどれですか。"
+  options={[
+    "CN の書式が誤っている",
+    "現在のブラウザはホスト名の照合に SAN（Subject Alternative Name）だけを使うため、SAN が指定されていない証明書は名前が一致しないと判定される",
+    "鍵長が不足している",
+    "中間証明書が配信されていない"
+  ]}
+  answer={1}
+  explanation="RFC 6125 以降の運用として、また Chrome は 2017 年の v58 以降、ホスト名の照合に Subject Alternative Name のみを使用し、Subject の CN は無視します。CN にホスト名を書いても SAN がなければ不一致と判定されます。CSR 作成時に -addext subjectAltName=DNS:api.example.com,... のように、接続に使うすべての名前（短縮名や IP を含む）を SAN に列挙する必要があります。自己認証局での発行で最も多い失敗です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="秘密鍵が漏洩したため証明書を失効させ、CRL と OCSP を設定しました。しかしセキュリティ上、これだけでは不十分とされる理由はどれですか。"
+  options={[
+    "CRL と OCSP は暗号的に安全ではないため",
+    "多くのクライアントは失効確認に失敗した場合に接続を継続する（soft-fail）ため、攻撃者が OCSP への到達を妨害するだけで失効を無効化できる",
+    "失効した証明書は自動的に再発行されるため",
+    "CRL は CA しか参照できないため"
+  ]}
+  answer={1}
+  explanation="失効確認を厳格に必須とすると CA の障害がサービス全断につながるため、多くのクライアントは確認できなかった場合に「失効していない」とみなして接続を続けます。この soft-fail の性質により、攻撃者は OCSP レスポンダへの通信を妨害するだけで失効を無効化できます。この構造的な弱さから、業界の方向性は証明書の有効期間を短くして自動更新する方式へ移っており、プライベート CA でも同じ考え方が有効です。"
+/>

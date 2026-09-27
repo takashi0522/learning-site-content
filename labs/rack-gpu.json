@@ -1,0 +1,218 @@
+{
+  "id": "rack-gpu",
+  "title": "GPU ラックに電源を引く",
+  "subtitle": "1 台 10kW の機械を、どう給電するか",
+  "goal": "GPU ラックが「U が足りない」のではなく「電気が足りない」で詰まること、そして冗長を取るか台数を取るかが給電容量で決まることを、給電を変えながら確かめる。",
+  "minutes": 15,
+  "status": "ready",
+  "mode": "build",
+  "accent": "gpu",
+  "rack": {
+    "units": 42,
+    "feeds": [
+      { "id": "A", "label": "系統 A", "volts": 200, "amps": 60, "phase": 3, "derate": 0.8 },
+      { "id": "B", "label": "系統 B", "volts": 200, "amps": 60, "phase": 3, "derate": 0.8 }
+    ],
+    "catalog": [
+      {
+        "id": "gpu8",
+        "label": "GPU ノード（8 GPU）",
+        "u": 8,
+        "watts": 10000,
+        "kind": "gpu",
+        "mount": "rack",
+        "note": "8 GPU 搭載。これ 1 台で 10kW。普通のラック 2 本分の電気を 8U で使う"
+      },
+      {
+        "id": "srv1u",
+        "label": "1U サーバー",
+        "u": 1,
+        "watts": 400,
+        "kind": "server",
+        "mount": "rack",
+        "note": "ジョブ投入やストレージ用の汎用サーバー"
+      },
+      {
+        "id": "tor",
+        "label": "ToR スイッチ",
+        "u": 1,
+        "watts": 150,
+        "kind": "switch",
+        "mount": "rack",
+        "note": "ラック上部に置く。冗長のため 2 台"
+      },
+      {
+        "id": "pduv",
+        "label": "縦型 PDU（0U）",
+        "u": 0,
+        "watts": 0,
+        "kind": "pdu",
+        "mount": "side",
+        "outlets": 24,
+        "note": "ラック側面に縦に付ける。U を消費せず、全高に届く。24 口"
+      },
+      {
+        "id": "blank10",
+        "label": "ブランクパネル 10U",
+        "u": 10,
+        "watts": 0,
+        "kind": "blank",
+        "mount": "rack",
+        "note": "まとめて塞ぐとき用"
+      },
+      {
+        "id": "blank5",
+        "label": "ブランクパネル 5U",
+        "u": 5,
+        "watts": 0,
+        "kind": "blank",
+        "mount": "rack",
+        "note": "端数を埋めるとき用"
+      },
+      {
+        "id": "blank1",
+        "label": "ブランクパネル 1U",
+        "u": 1,
+        "watts": 0,
+        "kind": "blank",
+        "mount": "rack",
+        "note": "1U ずつ塞ぐ"
+      }
+    ],
+    "missions": [
+      {
+        "id": "m1",
+        "title": "三相にすると何が変わるか",
+        "brief": "前のラボでは単相 200V 30A、つまり 1 系統 4.8kW でした。GPU ノードは 1 台で 10kW なので、あの給電では 1 台も載りません。このラックは三相 200V 60A で引いてあります。まず GPU ノードを 1 台と ToR を 2 台置いて、片系統が止まっても落ちない状態にしてください。",
+        "requirements": [
+          "GPU ノードを 1 台",
+          "ToR スイッチを 2 台",
+          "片系統が止まってもラックが落ちないこと"
+        ],
+        "available": ["gpu8", "tor"],
+        "checks": [
+          {
+            "id": "gpu",
+            "kind": "count",
+            "target": "gpu",
+            "min": 1,
+            "label": "GPU ノードが 1 台",
+            "hint": "まだ置かれていません。"
+          },
+          {
+            "id": "tor",
+            "kind": "count",
+            "target": "switch",
+            "min": 2,
+            "label": "ToR スイッチが 2 台",
+            "hint": "スイッチが 1 台だと、そこが落ちたときにラック全体が孤立します。"
+          },
+          {
+            "id": "redundancy",
+            "kind": "redundancy",
+            "label": "片系統が止まっても、残りの系統で支えられる",
+            "hint": "片方が止まると、残った系統が全負荷を引き受けます。合計が 1 系統の上限を超えていると、そちらのブレーカも落ちます。",
+            "insight": "三相は線間電圧なので容量に √3 が掛かります。同じ 200V でも 60A で 20.8kVA、使えるのは 16.6kW。ここで初めて 10kW の機械が 1 台載ります。"
+          }
+        ],
+        "afterword": "使ったのは 10U。まだ 32U 空いています。それでも次の 1 台は載りません。GPU ラックで先に尽きるのは、U ではなく電気です。"
+      },
+      {
+        "id": "m2",
+        "title": "2 台載せたい",
+        "brief": "GPU ノードをもう 1 台足したい、と言われました。同じ給電のままで 2 台にしてみてください。ただし、この要件には「片系統が止まっても落ちない」が入っていません。何を諦めることになるのか、検証結果を見てから考えてください。",
+        "requirements": [
+          "GPU ノードを 2 台",
+          "ToR スイッチを 2 台",
+          "通常時（A と B で分担している状態）はブレーカ内に収まること"
+        ],
+        "available": ["gpu8", "tor"],
+        "preset": ["tor", "tor", "gpu8"],
+        "checks": [
+          {
+            "id": "gpu",
+            "kind": "count",
+            "target": "gpu",
+            "min": 2,
+            "label": "GPU ノードが 2 台",
+            "hint": "まだ 2 台になっていません。"
+          },
+          {
+            "id": "tor",
+            "kind": "count",
+            "target": "switch",
+            "min": 2,
+            "label": "ToR スイッチが 2 台",
+            "hint": "ToR が足りません。"
+          },
+          {
+            "id": "breaker",
+            "kind": "breaker",
+            "label": "通常時、各系統がブレーカ定格の 80% 以内",
+            "hint": "通常時ですら超えています。この給電では 2 台は動かせません。",
+            "insight": "通常時は A と B で分担するので収まります。ただし片系統が落ちた瞬間、残りに 20.3kW がかかって落ちます。つまりこの構成は冗長ではありません。"
+          }
+        ],
+        "afterword": "通りましたが、冗長性を捨てています。実務ではここで「1 台に留める」か「給電を増やす」かを決めます。次のお題で後者を試します。"
+      },
+      {
+        "id": "m3",
+        "title": "給電を増やして取り戻す",
+        "brief": "給電を三相 200V 100A に増やした、という想定です。この容量なら GPU ノード 2 台でも冗長を保てるはずです。2 台構成のまま、片系統停止に耐えられることを確かめてください。あわせて、電源の口を用意して空き U を塞ぎます。",
+        "requirements": [
+          "GPU ノードを 2 台、ToR を 2 台",
+          "片系統が止まってもラックが落ちないこと",
+          "すべての機器に電源の口があること",
+          "空いた U をすべて塞ぐこと"
+        ],
+        "feeds": [
+          { "id": "A", "label": "系統 A", "volts": 200, "amps": 100, "phase": 3, "derate": 0.8 },
+          { "id": "B", "label": "系統 B", "volts": 200, "amps": 100, "phase": 3, "derate": 0.8 }
+        ],
+        "preset": ["tor", "tor", "gpu8", "gpu8"],
+        "checks": [
+          {
+            "id": "gpu",
+            "kind": "count",
+            "target": "gpu",
+            "min": 2,
+            "label": "GPU ノードが 2 台",
+            "hint": "2 台必要です。"
+          },
+          {
+            "id": "redundancy",
+            "kind": "redundancy",
+            "label": "片系統が止まっても、残りの系統で支えられる",
+            "hint": "まだ合計が 1 系統の上限を超えています。",
+            "insight": "100A なら 1 系統 27.7kW。20.3kW の全負荷を片側だけで受けられます。"
+          },
+          {
+            "id": "outlets",
+            "kind": "outlets",
+            "label": "電源の口数が足りている",
+            "hint": "PDU が足りません。縦型 PDU は U を消費せず全高に届くので、GPU ラックでは扱いやすい選択です。"
+          },
+          {
+            "id": "blanks",
+            "kind": "blanks",
+            "label": "空き U がすべて塞がっている",
+            "hint": "空きスロットが残っています。10kW 級のラックでは、前面に回り込む熱気の影響がより大きく出ます。"
+          }
+        ],
+        "afterword": "42U のうち埋まったのは 18U ぶんの機器と、残りはブランクパネル。GPU ラックはこうなります。"
+      }
+    ]
+  },
+  "summary": [
+    "GPU ラックで先に尽きるのは U ではなく電気。42U のうち機器で埋まるのは 20U 前後",
+    "三相は線間電圧なので容量に √3 が掛かる。200V 60A で 20.8kVA、使えるのは 16.6kW",
+    "10kW の機械は、単相 200V 30A（4.8kW）では 1 台も載らない",
+    "同じ給電で台数を増やすと、通常時は通っても片系統停止に耐えられなくなる",
+    "冗長を保ったまま台数を増やす方法は、給電容量を上げること以外にない"
+  ],
+  "next": [
+    { "label": "GPU コース レッスン 2 — GPU サーバーの運用", "href": "/courses/gpu/gpu-server-operations/" },
+    { "label": "ファシリティコース レッスン 1 — ラックと電源", "href": "/courses/facility/rack-and-power/" },
+    { "label": "AI 基盤コース レッスン 1 — AI 基盤の全体像", "href": "/courses/ai/ai-platform-overview/" }
+  ]
+}

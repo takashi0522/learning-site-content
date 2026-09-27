@@ -1,0 +1,233 @@
+---
+title: ネットワークを 4 系統で設計する
+description: 計算・ストレージ・外部接続・帯域外管理をなぜ分けるのか、そしてレール最適化が何を短くしているのかを整理します。
+order: 2
+minutes: 20
+tags: ["ibnet", "ipminet", "レール最適化", "ノンブロッキング", "RoCE"]
+objectives:
+  - GPU クラスタに必要な 4 系統のネットワークとその役割を説明できる
+  - 計算ファブリックをノンブロッキングで組む理由を説明できる
+  - レール最適化がどの通信を短くしているかを説明できる
+references:
+  - label: "NVIDIA DGX BasePOD — Architecture (ネットワーク 4 系統の定義)"
+    url: "https://docs.nvidia.com/dgx-basepod/deployment-guides/dgx-basepod-a100/latest/architecture.html"
+  - label: "NVIDIA NVL72 AI Factory — Network Logical Architecture"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/nvl72-ai-factory/latest/network-logical-architecture.html"
+  - label: "NVIDIA HGX AI Factory — Networking Physical Topologies"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory/latest/networking-physical-topologies.html"
+  - label: "NVIDIA DGX BasePOD (A100) — Switch Configurations (速度とボンド)"
+    url: "https://docs.nvidia.com/dgx-basepod/deployment-guides/dgx-basepod-a100/latest/switch-configurations.html"
+  - label: "Arista — Cloud Networking: Scaling Out Data Center Networks (3:1 の設計例)"
+    url: "https://www.arista.com/assets/data/pdf/Whitepapers/Cloud_Networking__Scaling_Out_Data_Center_Networks.pdf"
+  - label: "NVIDIA Technical Blog — Doubling all2all Performance with NCCL 2.12 (レール最適化)"
+    url: "https://developer.nvidia.com/blog/doubling-all2all-performance-with-nvidia-collective-communication-library-2-12/"
+  - label: "PyTorch — Distributed Data Parallel (全プロセスが allreduce に参加する)"
+    url: "https://docs.pytorch.org/docs/2.14/notes/ddp.html"
+  - label: "NVIDIA MLNX_OFED — InfiniBand Fabric Utilities (ibdiagnet)"
+    url: "https://networking-docs.nvidia.com/mlnxofedswum/23070512/infiniband+fabric+utilities"
+  - label: "NVIDIA MLNX-OS — Subnet Manager"
+    url: "https://networking-docs.nvidia.com/mlnxosum/3112006/subnet+manager"
+  - label: "NVIDIA Cumulus Linux 5.9 — RoCE (ECN と PFC)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Quality-of-Service/RDMA-over-Converged-Ethernet-RoCE/"
+---
+
+## 1 系統ではなく 4 系統
+
+一般的なサーバーなら、業務用と管理用の 2 本もあれば足ります。GPU クラスタはそうなりません。
+
+DGX BasePOD の A100 世代の構成を例に取ると、ネットワークは 4 つの系統に分かれます。
+
+| 名前 | 何が流れるか | 実装（A100 世代の例） |
+| --- | --- | --- |
+| **ibnet** | 計算ファブリック（全 DGX の計算用 HCA を結ぶ） | InfiniBand HDR 200Gbps（ConnectX-6 / Quantum QM8700） |
+| **internalnet** | ストレージと帯域内管理 | 100GbE の 2 本をボンド（SN4600）。VLAN 122（ネイティブ） |
+| **externalnet** | 社内など外部との接続 | internalnet と同じボンドの上に VLAN 121（タグ付き） |
+| **ipminet** | BMC を繋ぐ帯域外管理 | 1GbE（SN2201）。VLAN 111 |
+
+**系統は論理的な分け方です。** この構成でも internalnet と externalnet は、DGX から見ると同じボンドの上に VLAN で乗っています。
+
+**速度が 200Gbps から 1Gbps まで 200 倍開いていることに注目してください。**
+
+---
+
+<h2 className="slide-cont">1 系統ではなく 4 系統（続き）</h2>
+
+分ける理由は速度差ではありません。**要求される性質が違うから**です。
+
+- **ibnet** … PyTorch の DDP によるデータ並列の学習では、全プロセスが勾配の allreduce に毎回参加する。遅延も帯域も妥協しにくい
+- **internalnet** … 波がある。学習データの読み出しとチェックポイント書き込みで性質が違う（AI 基盤コース レッスン 4）
+- **externalnet** … 外部と繋がる以上、セキュリティ境界になる
+- **ipminet** … 他が全部死んでいるときに使う
+
+<Callout type="field">
+
+**まとめようとすると、一番厳しい要求に全部を合わせることになります。**
+
+BMC のために 200Gbps は要りませんし、逆に集合通信を 1Gbps の線に相乗りさせることもできません。分けたほうが、それぞれを適正なコストで作れます。
+
+これは RA が書いていることではなく筆者の見立てですが、**系統が分かれていれば、系統ごとに別のベンダーを検討する余地はある**と考えられます（計算ファブリックは NVIDIA の Quantum や Spectrum、Ethernet 側は別のベンダー、など）。実際に組めるかは、各製品の資料で確かめてください。
+
+</Callout>
+
+---
+
+## 計算ファブリックはノンブロッキング
+
+ファシリティコース レッスン 6 で、オーバーサブスクリプション（下りと上りの帯域の比）を扱いました。Arista のデータセンター設計のホワイトペーパーは、10G や 25G のサーバーを収容するリーフ・スパインの設計例の多くを 3:1 で示していて、比率は長期に必要なポート数とあわせて設計者が決める値として扱っています。同じ資料は「現代のデータセンターでは 3:1 から始めるのがよい目安」とも書いています（2016 年の資料）。**計算ファブリックは、そこが違います。**
+
+HGX AI Factory の RA（HGX B300 世代の版）では、計算ファブリックを「full non-blocking fat tree」と明記しています。つまり 1:1 です。
+
+理由は通信のパターンにあります。
+
+```text
+一般的なサーバー : クライアント → サーバー（North-South が中心）
+                  全台が同時に上位へ全力を出すことはまれ
+
+データ並列の学習 : 1 イテレーションごとに、全プロセスが勾配の allreduce に参加する
+                   （PyTorch の DDP の説明）
+```
+
+細らせた分は、そのまま学習時間に乗ります。GPU コース レッスン 3 で見たとおり、集合通信の所要時間は「データ量 ÷ 帯域」でほぼ決まるためです。
+
+<Callout type="note" title="ノンブロッキングは高い。それでも安いことがある">
+
+1:1 で組むとスイッチとケーブルの本数が増え、コストは上がります。
+
+それでも選ぶのは、**GPU のほうがはるかに高いから**です。ネットワークをケチって GPU が通信待ちで遊ぶと、より高価な資産の稼働率が落ちます。どちらが安いかという計算になります。
+
+</Callout>
+
+---
+
+## レール最適化
+
+計算ファブリックの配線には、一般的なリーフ・スパインには無い決まりがあります。
+
+各 GPU には専用の NIC が付いています。GB300 世代の NVL72 の RA では、コンピュートトレイあたり 4 枚の ConnectX-8 SuperNIC を載せ、800Gb のポートを 400Gb のリンク 2 本に分けて、**各 GPU が 2 つのプレーンそれぞれに 400Gb の専用の接続を持つ**構成です。NIC のポート数は、同じページの中に「dual-port 800 Gb/s」と「single-port（トレイあたり合計 3200 Gb/s）」の 2 通りの書き方があり、一致していません。この NIC をどのリーフに繋ぐかが問題です。
+
+<Figure name="rail-optimized" caption="全ノードの同じ GPU 番号を同じリーフに集める。これが 1 本のレール" />
+
+GB300 世代の NVL72 の RA には「各リーフは、全トレイにわたって同じ GPU 位置に配線される」と書かれています。**GPU 1 の NIC は全ノードでリーフ 1 へ、GPU 2 は全ノードでリーフ 2 へ**という配線です。この「GPU 番号ごとの束」を 1 本の**レール**と呼びます。
+
+---
+
+<h2 className="slide-cont">レール最適化（続き）</h2>
+
+効き目は経路の長さに出ます。
+
+```text
+同じ GPU 番号どうしの通信（レール内）
+  ノード1 GPU1 → リーフ1 → ノード2 GPU1        スパインを通らない
+
+違う GPU 番号との通信（レールをまたぐ）
+  ノード1 GPU1 → リーフ1 → スパイン → リーフ2 → ノード2 GPU2
+```
+
+NVIDIA は NCCL 2.12 のブログで、レール最適化の配線は **all-reduce の性能を最大化しながら、フロー間の干渉を抑えるのに役立つ**と説明しています。レールをまたぐ通信は、リーフ → スパイン → リーフの 3 段のスイッチを通ります。
+
+<Callout type="pitfall">
+
+**ノードごとにまとめて配線すると、この短絡が全部消えます。**
+
+「ノード 1 の 4 本は全部リーフ 1 へ」という素直な配線をすると、同じ GPU 番号どうしの通信が毎回スパインまで上がります。しかも、そのリーフが落ちるとノードが丸ごと孤立します。
+
+配線図を受け取ったら、**GPU 番号とリーフ番号の対応**を必ず確認してください。ここが崩れていると、性能が出ない理由が最後まで分かりません。
+
+</Callout>
+
+<Callout type="note" title="デュアルプレーン">
+
+GB300 世代の NVL72 の RA では、各 GPU が 2 つのプレーンそれぞれに 400Gb/s のリンクを持ちます。RA は、プレーン 2 はプレーン 1 を鏡写しにした構成で冗長性をもたらし、デュアルプレーンのファブリックは高可用性・耐障害性・負荷分散を与えると説明しています。
+
+レール最適化とデュアルプレーンは別の話です。**レールは「どのリーフに繋ぐか」、プレーンは「ファブリックを何面持つか」**です。
+
+</Callout>
+
+---
+
+## InfiniBand か Ethernet か
+
+計算ファブリックの実装には 2 つの選択肢があります。
+
+| | InfiniBand | Ethernet（RoCE） |
+| --- | --- | --- |
+| ロスレス | プロトコルに内蔵（クレジットベース） | PFC / ECN の設定が必要 |
+| 運用 | Subnet Manager が経路を管理 | 既存の Ethernet 運用と同じ道具が使える |
+| 機器 | Quantum など専用 | Spectrum のほか、他社製も候補になりうる（筆者の見立て） |
+| 向き | 大規模学習、レイテンシ最優先 | 既存資産・運用体制を活かしたい場合 |
+
+AI 基盤コース レッスン 2 で見たとおり、InfiniBand は**クレジットベースのフロー制御**でそもそも溢れさせません。Ethernet で同じことをするには PFC と ECN を正しく設定する必要があり、**この設定を詰めきれないと、ロスレスのつもりでパケットが落ちます。**
+
+<Callout type="field">
+
+**選択は技術的な優劣だけでは決まりません。**
+
+InfiniBand は専用の運用知識が要ります。Subnet Manager の運用、`ibdiagnet` での診断、ファームウェアの管理。社内に Ethernet の運用体制しかない場合、RoCE を選んで既存の道具を使うほうが、結果として安定することがあります。
+
+逆に、規模が大きく性能を詰めたい場合は InfiniBand が素直です。**どちらが正しいかではなく、自分たちが運用できるのはどちらかで決めてください。**
+
+</Callout>
+
+---
+
+## 帯域外管理は必ず独立させる
+
+4 系統のうち、**削ってはいけないのが ipminet** です。
+
+---
+
+<h2 className="slide-cont">帯域外管理は必ず独立させる（続き）</h2>
+
+BMC に用があるのは、次のような場面です。
+
+- OS が固まって ssh が通らない
+- 本番ネットワークが落ちた
+- 遠隔から電源を落として入れ直したい
+
+**その経路が本番ネットワークと運命を共にしていたら、いちばん必要なときに届きません。**
+
+BasePOD で ipminet に SN2201 のような安価な 1G スイッチを使うのは、手を抜いているからではなく、**そこに速度が要らないから**です。必要なのは速度ではなく独立性です。
+
+---
+
+<h2 className="slide-cont">帯域外管理は必ず独立させる（続き）</h2>
+
+<Callout type="warning">
+
+「VLAN で分ければよい」は、この用途では不十分です。
+
+VLAN で論理的に分けても、**物理のスイッチと配線が同じなら、そこが壊れたときに一緒に落ちます。** 帯域外管理は物理的に別のスイッチで組んでください。
+
+ハードウェアコース レッスン 6 で扱った BMC / Redfish が、実際に効いてくるのがこの系統です。
+
+</Callout>
+
+---
+
+<Quiz
+  id="q1"
+  question="GPU クラスタの計算ファブリックについて、コスト削減のためオーバーサブスクリプション比を 3:1 にしてはどうかと提案されました。技術的な評価として最も適切なものはどれですか。"
+  options={[
+    "問題ない。3:1 の設計例はデータセンターのホワイトペーパーにも載っている",
+    "PyTorch の DDP によるデータ並列の学習では毎イテレーション全プロセスが allreduce に参加するので、細らせると通信待ちが学習時間に乗りうる。HGX B300 世代の RA も計算ファブリックは 1:1 で組んでいる",
+    "3:1 にすると NCCL が動作しなくなる",
+    "オーバーサブスクリプション比はノード内の NVLink にのみ影響する"
+  ]}
+  answer={1}
+  explanation="3:1 はリーフ・スパインの設計例としてはよく示されますが、それはサーバー向けの設計例です。データ並列の学習では、毎イテレーション全プロセスが勾配の allreduce に参加します（PyTorch の DDP の説明）。HGX AI Factory の RA（HGX B300 世代の版）は計算ファブリックを full non-blocking fat tree と明記しています。NCCL は動作しますが遅くなりうるうえ、GPU が通信待ちで遊ぶことがありえます。NVLink はノード内の接続なのでこの比とは無関係です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="配線業者から受け取った計算ファブリックの結線図を確認しています。「ノード 1 の GPU 1〜4 の NIC はすべてリーフ 1 へ、ノード 2 の GPU 1〜4 はすべてリーフ 2 へ」と書かれていました。どう判断すべきですか。"
+  options={[
+    "問題ない。ノード単位でまとまっているほうが管理しやすい",
+    "レール最適化になっていない。全ノードの GPU 1 を同じリーフに集める配線でないと、同じ GPU 番号どうしの通信が毎回スパインを経由する",
+    "リーフの台数が足りないので増設が必要",
+    "GPU 番号とリーフ番号は無関係なので、どちらでもよい"
+  ]}
+  answer={1}
+  explanation="レール最適化では、全ノードにわたって同じ GPU 位置の NIC を同じリーフに集めます。ノード単位でまとめると、レール内で済むはずの同じ GPU 番号どうしの通信が毎回リーフからスパインへ上がることになり、ホップとレイテンシが増えてスパインの帯域も消費します。加えて、そのリーフが落ちるとノードが丸ごと孤立します。結線図を受け取ったら GPU 番号とリーフ番号の対応を必ず確認してください。"
+/>

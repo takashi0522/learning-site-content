@@ -1,0 +1,354 @@
+---
+title: ユーザー・権限・SSH の運用
+description: アカウントと sudo の設計、公開鍵運用、そして「誰が何をしたか」を残す設定をまとめます。
+order: 3
+minutes: 17
+tags: ["useradd", "sudo", "SSH", "PAM", "audit"]
+objectives:
+  - サービス用アカウントと人間用アカウントを適切に使い分けられる
+  - sudoers を安全に編集し、権限を必要最小限に絞れる
+  - SSH の鍵運用と、作業ログを残す設定を組み立てられる
+references:
+  - label: "sudoers(5) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man5/sudoers.5.html"
+  - label: "sshd_config(5) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man5/sshd_config.5.html"
+  - label: "useradd(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/useradd.8.html"
+---
+
+## アカウントの種類を分ける
+
+サーバー上のアカウントは、性質で 2 つに分かれます。**混ぜると監査もトラブルシュートも破綻します。**
+
+| | 人間用アカウント | サービス用アカウント |
+| --- | --- | --- |
+| ログイン | する | **させない** |
+| シェル | `/bin/bash` | `/usr/sbin/nologin` |
+| パスワード | 設定する（または鍵のみ） | **設定しない（ロック）** |
+| UID | 1000 以上 | 1000 未満（システム用）が慣例 |
+| 目的 | 作業と監査 | プロセスの権限分離 |
+
+```bash
+# サービス用アカウント（ログイン不可、ホームなし）
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin myapp
+
+# 人間用アカウント
+sudo useradd -m -s /bin/bash -G wheel tanaka
+sudo passwd tanaka
+```
+
+---
+
+<h2 className="slide-cont">アカウントの種類を分ける（続き）</h2>
+
+<Callout type="field">
+
+**サービスを root で動かさない**のは基本ですが、専用アカウントを作らず既存の一般ユーザーで動かすのも避けてください。そのユーザーの権限がそのままサービスの権限になり、侵害時の影響範囲が広がります。
+
+systemd では unit で指定します（Linux コース レッスン 5 の drop-in で後から追加もできます）。
+
+```ini
+[Service]
+User=myapp
+Group=myapp
+# さらに権限を削る
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/myapp
+```
+
+`systemd-analyze security myapp.service` を実行すると、その unit の露出度をスコアで評価してくれます。既存サービスを一度かけてみると、削れる項目が見つかります。
+
+</Callout>
+
+### 確認コマンド
+
+---
+
+<h2 className="slide-cont">アカウントの種類を分ける（続き）</h2>
+
+```bash
+# ログインできるアカウントの一覧（シェルが nologin/false 以外）
+awk -F: '$7 !~ /(nologin|false)$/ {print $1, $3, $7}' /etc/passwd
+
+# パスワードが設定されているか（! や * はロック済み）
+sudo awk -F: '$2 !~ /^[!*]/ {print $1}' /etc/shadow
+
+# あるユーザーの所属グループ
+id tanaka
+groups tanaka
+
+# 最終ログイン
+lastlog | grep -v 'Never logged in'
+last -a | head
+```
+
+---
+
+## sudo: 必ず visudo で編集する
+
+```bash
+# 構文チェック付きで編集する。これ以外の方法で編集しない
+sudo visudo
+
+# 個別ファイルを編集する場合も visudo 経由で
+sudo visudo -f /etc/sudoers.d/ops-team
+
+# 既存ファイルの構文チェックだけ
+sudo visudo -c
+```
+
+<Callout type="warning" title="sudoers を直接編集してはいけない">
+
+`/etc/sudoers` を `vi` で直接編集して構文を壊すと、**sudo が一切使えなくなります**。root のパスワードが設定されていない環境（Ubuntu の既定など）では、シングルユーザーモードやレスキューメディアからの復旧が必要になります。
+
+`visudo` は保存時に構文をチェックし、エラーがあれば再編集を促します。**例外なく `visudo` を使ってください。**
+
+なお `/etc/sudoers.d/` 配下に置くファイルは、**ファイル名にドット（`.`）やチルダ（`~`）を含むと読み込まれません**。`ops-team.conf` は無視されます。拡張子を付けない命名にしてください。
+
+</Callout>
+
+---
+
+### 権限を絞る書き方
+
+```text
+# /etc/sudoers.d/ops-team
+
+# 何でもできる（既存の wheel/sudo グループ相当）
+%wheel      ALL=(ALL:ALL) ALL
+
+# パスワードなし（自動化用。慎重に）
+deploy      ALL=(ALL) NOPASSWD: /bin/systemctl restart myapp.service
+
+# 特定コマンドのみ許可
+%developers ALL=(ALL) /usr/bin/journalctl, /bin/systemctl status *
+
+# 特定ユーザーへの切り替えのみ
+%dba        ALL=(postgres) ALL
+```
+
+---
+
+<h2 className="slide-cont">sudo: 必ず visudo で編集する（続き）</h2>
+
+```bash
+# 自分に何が許可されているかを確認する
+sudo -l
+
+# 他ユーザーの権限を確認（root で）
+sudo -l -U tanaka
+```
+
+<Callout type="pitfall" title="コマンド制限は簡単に迂回される">
+
+特定コマンドだけを許可したつもりでも、そのコマンドが**任意のコマンドを実行できる機能を持っていれば意味がありません**。
+
+```text
+# これは実質 root 全権と同じ
+alice ALL=(ALL) NOPASSWD: /usr/bin/vim      # vim から :!sh でシェルが取れる
+bob   ALL=(ALL) NOPASSWD: /usr/bin/find     # find -exec で任意コマンドが実行できる
+carol ALL=(ALL) NOPASSWD: /bin/systemctl    # 任意の unit を作って実行できる
+```
+
+エディタ、`find`、`awk`、`tar`、`systemctl`、パッケージマネージャなどはすべてこの性質を持ちます。**「このコマンドだけ」で安全になるとは限りません。**
+
+ワイルドカードも同様に危険です。
+
+```text
+# /etc/ 配下を意図したが、../ で任意のファイルが編集できる
+dave ALL=(ALL) /bin/cp * /etc/
+```
+
+制限が本当に成立しているかは、**そのコマンドで何ができるか**から考えてください。
+
+</Callout>
+
+---
+
+## SSH の運用
+
+### 鍵の扱い
+
+```bash
+# 鍵を作る（ed25519 が推奨。短くて速く、強度も十分）
+ssh-keygen -t ed25519 -C "tanaka@workstation-2026"
+
+# 公開鍵を配る
+ssh-copy-id -i ~/.ssh/id_ed25519.pub tanaka@server
+
+# 手動で置く場合、パーミッションが厳密に必要
+install -d -m 700 ~/.ssh
+install -m 600 /dev/null ~/.ssh/authorized_keys
+```
+
+<Callout type="pitfall">
+
+**鍵で入れないときの原因は、9 割がパーミッションです。** sshd は権限が緩いと黙って鍵を無視します（セキュリティのため）。
+
+```text
+~/            → 書き込み権限がグループ/その他にないこと（755 以下）
+~/.ssh/       → 700
+~/.ssh/authorized_keys → 600
+所有者        → 本人（root 所有になっていないか）
+```
+
+原因の特定には、サーバー側のログを見るのが確実です。
+
+```bash
+sudo journalctl -u sshd -e
+# "Authentication refused: bad ownership or modes for directory /home/tanaka/.ssh"
+```
+
+クライアント側からは `ssh -vvv` で、どの鍵を提示して何が起きたかが追えます。
+
+</Callout>
+
+### sshd_config の要点
+
+---
+
+<h2 className="slide-cont">SSH の運用（続き）</h2>
+
+```bash
+sudo vi /etc/ssh/sshd_config.d/99-hardening.conf   # 新しめの環境は .d 配下が読まれる
+```
+
+```text
+# root の直接ログインを禁止（作業者を特定できるようにする）
+PermitRootLogin no
+
+# パスワード認証を無効にし、鍵のみにする
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+
+# 接続元を絞る（可能なら）
+AllowGroups ops-team
+
+# アイドル切断
+ClientAliveInterval 300
+ClientAliveCountMax 2
+```
+
+```bash
+# 構文チェック（必須。間違えると sshd が起動しない）
+sudo sshd -t
+
+# 反映
+sudo systemctl reload sshd
+```
+
+---
+
+<h2 className="slide-cont">SSH の運用（続き）</h2>
+
+<Callout type="warning" title="SSH 設定変更で締め出されないために">
+
+**設定を反映する前に、別のターミナルで接続を張ったままにしておいてください。** 設定を誤って `reload` すると、新規接続ができなくなります。既存のセッションは維持されるので、そこから復旧できます。
+
+手順としては次のとおりです。
+
+1. 現在のセッションはそのまま残す
+2. `sudo sshd -t` で構文チェック
+3. `sudo systemctl reload sshd`
+4. **別ターミナルから新規接続を試す**
+5. 成功を確認してから、元のセッションを閉じる
+
+リモートのサーバーで `systemctl restart sshd` を打つ前に、この順序を習慣にしてください。
+
+</Callout>
+
+---
+
+## 誰が何をしたかを残す
+
+### sudo のログ
+
+`sudo` の実行は既定でログに残ります。
+
+```bash
+# 実行されたコマンドの履歴
+journalctl -t sudo --since "today" --no-pager
+grep sudo /var/log/auth.log        # Debian 系
+grep sudo /var/log/secure          # RHEL 系
+```
+
+```text
+tanaka : TTY=pts/1 ; PWD=/home/tanaka ; USER=root ; COMMAND=/bin/systemctl restart nginx
+```
+
+### ログイン記録
+
+```bash
+last -a | head -20          # ログイン成功の履歴
+lastb | head -20            # ログイン失敗（root 権限が必要）
+journalctl -u sshd -g 'Accepted|Failed' --since "today"
+```
+
+### 監査ログ (auditd)
+
+より厳密に追跡する場合は `auditd` を使います。
+
+```bash
+# 特定ファイルへの変更を記録する
+sudo auditctl -w /etc/sudoers -p wa -k sudoers-change
+sudo auditctl -w /etc/ssh/sshd_config -p wa -k sshd-config
+
+# 記録を検索
+sudo ausearch -k sudoers-change -i
+```
+
+---
+
+<h2 className="slide-cont">誰が何をしたかを残す（続き）</h2>
+
+<Callout type="field">
+
+監査要件がある環境では、`auditd` のルールを恒久化（`/etc/audit/rules.d/`）し、ログを外部に転送するところまでが要件になります。前のレッスンで触れたとおり、**侵害されたサーバー上のログは、そのサーバー上では信用できません**。
+
+要件がない場合でも、`/etc/sudoers` と `/etc/ssh/sshd_config` の変更監視だけは入れておくと、後から「いつ誰が変えたか」を追えます。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 人間用アカウントとサービス用アカウントを分ける。サービス用は `nologin` + パスワードなし
+- systemd の `User=` と保護オプションで、サービスの権限を最小化する
+- **sudoers の編集は例外なく `visudo`**。`/etc/sudoers.d/` のファイル名にドットを入れない
+- **コマンド単位の制限は迂回されうる**。エディタ・`find`・`systemctl` などは実質全権
+- 鍵で入れない原因の大半はパーミッション。`journalctl -u sshd` に理由が出る
+- **SSH 設定を反映する前に、既存セッションを残したまま別ターミナルで検証する**
+- `sudo` とログインの記録は既定で残る。変更監視は `auditd` で補強する
+
+<Quiz
+  id="q1"
+  question="開発者グループに「ログ調査だけできれば良い」として、sudoers に「%developers ALL=(ALL) NOPASSWD: /usr/bin/vim /var/log/*」を設定しました。この設定の問題点はどれですか。"
+  options={[
+    "ワイルドカードは sudoers で使用できない",
+    "vim は :!sh などで任意のコマンドを実行できるため、実質的に root の全権限を与えたことになる",
+    "NOPASSWD を付けると sudo のログが残らない",
+    "/usr/bin/vim は絶対パスで指定してはいけない"
+  ]}
+  answer={1}
+  explanation="vim をはじめ、find・awk・tar・systemctl・パッケージマネージャなどは内部から任意のコマンドを実行できます。これらを sudo で許可することは、対象ファイルを限定しても root 全権を渡すのと同じです。ログ閲覧が目的なら journalctl や less（これも要注意）ではなく、ログファイルの読み取り権限をグループで与えるなど、sudo を使わない設計を検討すべきです。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="公開鍵を authorized_keys に登録したのに、鍵認証でログインできずパスワードを求められます。まず確認すべきものはどれですか。"
+  options={[
+    "鍵の種類（ed25519 が使えない環境かどうか）",
+    "ホームディレクトリ、~/.ssh、authorized_keys のパーミッションと所有者",
+    "クライアント側の ssh_config",
+    "サーバーのファイアウォール設定"
+  ]}
+  answer={1}
+  explanation="sshd は、ホームディレクトリや ~/.ssh、authorized_keys に本人以外の書き込み権限があると、セキュリティ上の理由でその鍵を無視します。エラーも返さず単に次の認証方式にフォールバックするため、パスワードを求められる形で現れます。~/.ssh は 700、authorized_keys は 600、所有者は本人である必要があります。サーバー側の journalctl -u sshd に「bad ownership or modes」として理由が記録されます。"
+/>

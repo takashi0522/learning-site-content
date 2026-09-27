@@ -1,0 +1,237 @@
+---
+title: ロスレスを作る — PFC
+description: Ethernet でパケットを落とさないための仕組みと、その副作用。headroom、巻き添え、デッドロックまでを扱います。
+order: 2
+minutes: 22
+tags: ["PFC", "802.1Qbb", "優先度クラス", "headroom", "デッドロック"]
+objectives:
+  - PFC が何を止めているのかを、リンク単位・優先度単位で説明できる
+  - headroom が必要な理由と、ケーブル長で変わる理由を説明できる
+  - PFC が常時発生している状態を「異常」と判断できる
+references:
+  - label: "IEEE 802.1Qbb — Priority-based Flow Control"
+    url: "https://1.ieee802.org/dcb/802-1qbb/"
+  - label: "Congestion Control for Large-Scale RDMA Deployments (SIGCOMM 2015)"
+    url: "https://conferences.sigcomm.org/sigcomm/2015/pdf/papers/p523.pdf"
+  - label: "RDMA over Commodity Ethernet at Scale (SIGCOMM 2016)"
+    url: "https://www.microsoft.com/en-us/research/wp-content/uploads/2016/11/rdma_sigcomm2016.pdf"
+  - label: "NVIDIA Cumulus Linux 5.9 — RoCE (DSCP と優先度 3)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Quality-of-Service/RDMA-over-Converged-Ethernet-RoCE/"
+  - label: "NVIDIA Cumulus Linux — Quality of Service (headroom とケーブル長)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux/Layer-1-and-Switch-Ports/Quality-of-Service/"
+  - label: "SONiC — Buffers Configuration Update design (速度とケーブル長ごとの設定)"
+    url: "https://github.com/sonic-net/SONiC/wiki/Buffers-Configuration-Update-design"
+  - label: "SONiC — swss-schema (xoff の定義)"
+    url: "https://github.com/sonic-net/sonic-swss/blob/master/doc/swss-schema.md"
+  - label: "NVIDIA DOCA — Ethernet QoS (mlnx_qos)"
+    url: "https://networking-docs.nvidia.com/doca/sdk/ethernet-qos"
+  - label: "Cisco — Data Center Networking Blueprint for AI/ML"
+    url: "https://www.cisco.com/c/en/us/td/docs/dcn/whitepapers/cvd-for-data-center-networking-blueprint-for-ai.html"
+  - label: "NVIDIA WinOF-2 — Ethernet Network (PFC は経路上の全機器で有効に)"
+    url: "https://networking-docs.nvidia.com/winof2driverum/26.7.50000/ethernet-network"
+  - label: "Linux kernel — mlx5 ethtool counters"
+    url: "https://docs.kernel.org/networking/device_drivers/ethernet/mellanox/mlx5/counters.html"
+---
+
+## Ethernet は捨てるのが正常な動作
+
+ネットワークコース レッスン 1 で扱ったとおり、スイッチは受け取ったフレームをいったんバッファに入れ、出口のリンクへ送り出します。**入ってくる量が出ていく量を超え続けたら、バッファは溢れます。**
+
+そのとき Ethernet が取る動作は、**捨てる**です。これは故障ではなく、仕様どおりの正常な動作です。上位層（TCP）が再送で埋めるという分担になっています。
+
+前のレッスンで見たとおり、RDMA はこの分担に乗れません。**だから「溢れる前に止める」仕組みを足します。** それが **PFC**（Priority-based Flow Control、IEEE 802.1Qbb）です。
+
+```text
+バッファが一定量まで溜まった
+  → 上流の機器へ「この優先度の送信を止めろ」というフレームを送る
+  → 上流が送信を止める
+  → 溢れないので、捨てずに済む
+```
+
+---
+
+## 止まるのは「リンク 1 本の、1 つの優先度」
+
+PFC を理解するうえで、押さえるべき点が 2 つあります。
+
+**① 止まるのは 1 ホップぶんだけ。** PAUSE は送信元までは届きません。隣の機器に届くだけです。その機器のバッファが溜まれば、さらにその上流へ PAUSE を出します。**1 ホップずつ、玉突きで遡っていきます。**
+
+**② 止まるのは優先度クラス単位。** Ethernet には 8 つの優先度クラスがあり、PFC はそのうち指定したクラスだけを止めます。RoCE の構成例では、NVIDIA も Cisco も**優先度 3** を使っています（NVIDIA Cumulus Linux 5.9 の構成例では、DSCP 24〜31 をまとめて優先度 3 に対応させ、RoCE の行には DSCP 26 と表示されます）。
+
+<Figure name="pfc-pause" caption="PAUSE は 1 ホップずつ上流へ伝わる。同じ優先度クラスは巻き添えで止まる" />
+
+---
+
+## 巻き添えが起きる
+
+図の下側が、PFC の代表的な副作用です（2016 年の論文は、head-of-line blocking とデッドロックの可能性を「よく知られた」問題として挙げています）。
+
+**PFC はフロー単位ではなく、リンクと優先度の単位で止めます。** 輻輳を起こしているのが送信 A だけでも、同じリンク・同じ優先度クラスを使っている送信 B まで一緒に止まります。
+
+これを **head-of-line blocking**（先頭の詰まりが後続を巻き込む）と呼びます。
+
+<Callout type="warning" title="1 ジョブの輻輳が、無関係なジョブを遅くしうる">
+
+複数の学習ジョブが同じファブリックを共有していると、**片方のジョブの通信パターンが悪いだけで、もう片方まで遅くなることがあります。** DCQCN の論文は、PFC の輻輳が広がる性質のために「スループットが下がったり、ばらついたりしうる」と書いています。
+
+利用者から見ると、**原因が自分のジョブの外にある**ことになります。レッスン 5 で扱う「性能分離」は、この種の問題を扱う機能です。
+
+</Callout>
+
+---
+
+## headroom — 止めても、すぐには止まらない
+
+PFC でもう 1 つ重要なのが **headroom** です。
+
+PAUSE を出してから相手が実際に送信を止めるまでには、時間がかかります。その間に飛んできたデータを受け止める余白が必要です。
+
+```text
+PAUSE を出す判断をする
+  ↓ PAUSE フレームがケーブルを伝わる時間
+  ↓ 相手が PAUSE を処理する時間
+  ↓ 相手が送信中だったフレームを送り終える時間
+相手が実際に止まる
+
+→ この間に届いたデータを捨てないための余白が headroom
+```
+
+---
+
+<h2 className="slide-cont">headroom — 止めても、すぐには止まらない（続き）</h2>
+
+**必要な headroom はケーブル長とリンク速度で変わります。**
+
+```text
+速度が上がる → 同じ時間に飛んでくるバイト数が増える
+距離が伸びる → PAUSE が届くまでの時間が伸びる
+```
+
+出典にある数字で、桁の感覚をつかんでおきます。DCQCN の論文は、Broadcom Trident II を使う 40Gbps のスイッチ（Arista 7050QX32 など）・MTU 1500 の条件で、この余白を **1 ポート・1 優先度あたり 22.4KB** と見積もっています。
+
+SONiC の設計資料は、Mellanox MSN2700 向けの設定例で「ポートごとの設定を、ポートの速度とつながっているケーブルの長さで選ぶ」と書いています。この例では、PFC を送り始める閾値（Xoff）の設定値が、40Gbps・ケーブル 40m で 23K、100Gbps・300m で 162K です。22.4KB とは別の種類の量ですが、**速度とケーブル長の組み合わせで、設定する値が大きく変わる**ことが分かります。
+
+<Callout type="pitfall">
+
+**ケーブルを長くしただけでロスが出ることがあります。**
+
+ファシリティコース レッスン 5 で「距離で光モジュールを選ぶ」話を扱いましたが、RoCE では**距離がバッファ設計にも効きます。**
+
+ラックをまたぐ配線に変えた、EoR から MoR に変えた、といった物理の変更のあとで、**スイッチの headroom 設定を見直していない**と、そこだけロスが出ます。GPU 基盤の導入コース レッスン 3 で「レイアウトを変えたら配線の再確認とセット」と書いたのは、こういう波及があるためです。
+
+</Callout>
+
+---
+
+## 全経路で設定する
+
+**PFC は、経路上のすべてのリンクで有効になっていないと意味がありません。**
+
+```text
+ノード ─ リーフ ─ スパイン ─ リーフ ─ ノード
+        ①      ②        ③      ④
+
+→ ①②③④ のすべてで、優先度 3 が lossless になっている必要がある
+→ 1 箇所でも漏れていたら、そこで捨てられる
+```
+
+漏れた箇所ではバッファ不足による廃棄が起き、**error ではなく discard 系のカウンタ**に現れます。NVIDIA の資料も「PFC を使うには、経路上のすべての端点とスイッチで有効にする必要がある」としています。
+
+NVIDIA ConnectX の NIC（mlx5 ドライバ）なら、次のように見ます。
+
+```bash
+# どの優先度で PFC が有効か
+mlnx_qos -i eth2
+
+# 優先度ごとの PAUSE の送受信カウンタ（rx_prio3_pause など）
+ethtool -S eth2 | grep -i pause
+
+# バッファ不足で捨てられた数（rx_discards_phy など）
+ethtool -S eth2 | grep -iE 'discard|drop'
+```
+
+**スイッチ側は機種ごとにコマンドが違いますが、見るものは同じ**です。優先度ごとの lossless 設定、PAUSE カウンタ、廃棄カウンタの 3 つを確認します。
+
+---
+
+## デッドロックという最悪の事態
+
+PFC には、デッドロックという破綻モードがあります。
+
+止まっているスイッチ同士が、互いの解除を待つ形になると、**どちらも永久に動けなくなります。**
+
+```text
+スイッチ A は B が止めているので送れない
+スイッチ B は C が止めているので送れない
+スイッチ C は A が止めているので送れない
+
+→ 循環して、誰も解除できない
+```
+
+Microsoft の論文は、これについて 2 つの見解を残しています。
+
+- **SIGCOMM 2015**（DCQCN の論文）: Clos 構成では、**故障した機器や誤った設定が無い限り**循環は生じない
+- **SIGCOMM 2016**（RoCEv2 の大規模運用の論文）: Clos と up-down ルーティングだから起きないと考えていたが、**実際に起きた**。原因はスイッチの flooding（宛先が分からないパケットを全ポートに送る動作。論文は引用符付きで「正当な」動作と呼ぶ）で、論文の例では宛先のサーバーが止まっていた。NIC に起因する PFC の pause frame storm という問題もあわせて報告している
+
+<Callout type="field">
+
+**Clos だから安全、とは言い切れません。**
+
+2015 年の論文が条件として挙げるのは「故障した機器や誤った設定」です。2016 年の論文の例は、**止まったサーバー宛てのパケットを、スイッチが flooding したこと**から循環が生まれたというものでした。論文は、この例への対処として、宛先の分からない lossless のパケットを flooding せずに捨てる方法を選び、あわせて**ブロードキャストとマルチキャストを lossless のクラスに入れない**ことを勧めています。
+
+</Callout>
+
+---
+
+## PFC は「最後の砦」
+
+ここまで読むと分かるとおり、PFC は副作用の大きい仕組みです。
+
+| 得られるもの | 代償 |
+| --- | --- |
+| パケットを落とさない | 巻き添えで無関係な通信が止まる |
+| | バッファ（headroom）を食う |
+| | デッドロックの可能性を持ち込む |
+
+**だから、PFC が常時発生している状態は正常ではありません。**
+
+```text
+PFC がほとんど出ない  → 設計どおり。輻輳は手前で解消されている
+PFC が常時出ている    → 原因を調べる対象（輻輳制御の効き、NIC 側、バッファ設定）
+```
+
+**PFC を「効いているから大丈夫」と読まないでください。** DCQCN の論文は、適切な輻輳制御があれば PFC は**まれにしか出ない**と書いています。逆に言えば、PAUSE カウンタが回り続けているなら、調べる理由があります。
+
+原因は 1 つとは限りません。2016 年の論文は PAUSE を減らすために、**NIC の不具合や処理の遅れ**（slow-receiver）への対処、**スイッチのバッファ共有の設定**の見直し、**DCQCN** の 3 方向から手を打ったと書いています。
+
+このうち「手前で止める」仕組みが、次のレッスンで扱う ECN と DCQCN です。
+
+---
+
+<Quiz
+  id="q1"
+  question="RoCE ファブリックの監視で、あるリーフスイッチの PFC PAUSE 送信カウンタが継続的に増加していることが分かりました。パケットの廃棄は発生していません。どう評価すべきですか。"
+  options={[
+    "正常。PFC が機能してパケットロスを防いでいる",
+    "異常として扱うべき。PFC は最後の砦であり、常時発動しているなら、輻輳制御が手前で効いていないなどの原因を調べる必要がある。同じ優先度クラスの無関係な通信も巻き添えで止まりうる",
+    "PFC の設定を無効にすべき",
+    "スイッチの故障を疑うべき"
+  ]}
+  answer={1}
+  explanation="PFC はリンクと優先度クラスの単位で送信を止めるため、輻輳の原因になっていないフローまで一緒に止まりえます。廃棄が出ていないのは PFC が効いている結果ですが、常時発動しているなら、本来 ECN と DCQCN で送信側のレートが下がるべきところで、それが効いていないことがあります。2016 年の論文は、NIC の不具合や処理の遅れ、スイッチのバッファ設定が原因だった例も報告しています。無効化すればロスに変わるだけで解決にならず、スイッチの故障と決めつける根拠にもなりません。ECN の閾値や輻輳制御、NIC とバッファの設定を見直す対象です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="ラック間の配線を見直し、計算ファブリックのケーブルを 10m から 100m に延長しました。リンクは正常にアップしていますが、そのリンクだけ廃棄カウンタが増えるようになりました。最も疑わしい原因はどれですか。"
+  options={[
+    "光モジュールの故障",
+    "距離が伸びたぶん PAUSE が相手に届くまでの時間が延び、その間に飛んでくるデータを受け止める headroom が不足している",
+    "ケーブルが長いと帯域が落ちる",
+    "MTU の設定誤り"
+  ]}
+  answer={1}
+  explanation="PFC は PAUSE を送ってから相手が止まるまでに遅れがあり、その間に届くデータを捨てないための余白が headroom です。必要な量は MTU や反応時間にも左右されますが、2016 年の論文が最も重要な要因に挙げるのは距離（伝搬遅延）です。ケーブルを 10 倍に延ばすと飛行中のデータ量も増えるので、headroom が短いケーブル長に合わせて設定されたまま見直されていなければ、足りなくなりえます（Cumulus Linux も、ケーブル長の設定が誤っていると廃棄が起きうるとしています）。物理構成を変えたらスイッチのバッファ設定を見直す必要があります。リンクの誤り率が高ければシンボルエラーや FEC 訂正のカウンタが増えるので、物理層の不良を疑うならまずそちらを見ます。"
+/>

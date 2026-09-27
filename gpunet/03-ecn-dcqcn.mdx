@@ -1,0 +1,285 @@
+---
+title: 輻輳を手前で消す — ECN と DCQCN
+description: 捨てずに知らせる ECN と、その通知で送信レートを調整する DCQCN。PFC に行き着く前に輻輳を解消する仕組みを扱います。
+order: 3
+minutes: 22
+tags: ["ECN", "DCQCN", "CNP", "DSCP", "輻輳制御"]
+objectives:
+  - ECN が「捨てずに知らせる」仕組みであることを説明できる
+  - DCQCN の 3 つの役割と信号の流れを説明できる
+  - ECN の閾値と PFC の閾値の順序がなぜ重要かを説明できる
+references:
+  - label: "RFC 3168 — The Addition of Explicit Congestion Notification (ECN) to IP"
+    url: "https://www.rfc-editor.org/rfc/rfc3168"
+  - label: "Congestion Control for Large-Scale RDMA Deployments (SIGCOMM 2015)"
+    url: "https://conferences.sigcomm.org/sigcomm/2015/pdf/papers/p523.pdf"
+  - label: "NVIDIA Cumulus Linux 5.9 — RDMA over Converged Ethernet (DSCP と優先度の構成例)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Quality-of-Service/RDMA-over-Converged-Ethernet-RoCE/"
+  - label: "NVIDIA Cumulus Linux 5.9 — Quality of Service (trust と既定の優先度)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Quality-of-Service/"
+  - label: "NVIDIA DOCA — Congestion Control Infrastructure (DCQCN と DPA)"
+    url: "https://networking-docs.nvidia.com/doca/archive/3-5-0/congestion-control-infrastructure"
+  - label: "NVIDIA DOCA PCC (BlueField-3 以降のプログラマブル輻輳制御)"
+    url: "https://docs.nvidia.com/doca/sdk/doca-pcc/"
+  - label: "Broadcom — Probabilistic Marking (DCQCN-P)"
+    url: "https://techdocs.broadcom.com/us/en/storage-and-ethernet-connectivity/ethernet-nic-controllers/bcm957xxx/adapters/RDMA-over-Converged-Ethernet/rdma-over-converged-ethernet--roce--in-linux/advanced-network-configuration/congestion-control1/probabilistic-marking--dcqcn-p-.html"
+  - label: "Intel Ethernet 800 Series — Linux Flow Control for RDMA Use Cases (DCQCN)"
+    url: "https://cdrdv2-public.intel.com/635330/635330_800%20Series%20Linux%20Flow%20Control%20for%20RDMA%20Use%20Cases_rev1_4.pdf"
+  - label: "IP Infusion — DCQCN in OcNOS (閾値とバッファの整合性検査)"
+    url: "https://www.ipinfusion.com/technology/dcqcn/"
+  - label: "NVIDIA MLNX_OFED 24.10 — Quality of Service (mlnx_qos と trust)"
+    url: "https://networking-docs.nvidia.com/mlnxofedswum/24.10-5.1.6.1lts/quality-of-service-qos"
+  - label: "NVIDIA MLNX_OFED — InfiniBand Interface (RDMA カウンタは sysfs の hw_counters)"
+    url: "https://networking-docs.nvidia.com/mlnxofedswum/24101140lts/infiniband-interface"
+  - label: "RFC 2474 — Definition of the Differentiated Services Field (DS Field)"
+    url: "https://www.rfc-editor.org/rfc/rfc2474"
+  - label: "Linux kernel — mlx5 ethtool counters"
+    url: "https://docs.kernel.org/networking/device_drivers/ethernet/mellanox/mlx5/counters.html"
+  - label: "Linux kernel — drivers/infiniband/hw/mlx5/counters.c (RDMA 側の輻輳カウンタ)"
+    url: "https://codebrowser.dev/linux/linux/drivers/infiniband/hw/mlx5/counters.c.html"
+  - label: "Junos QFX — 共有バッファを lossless 向けに割り当てる例"
+    url: "https://www.juniper.net/documentation/us/en/software/junos/traffic-mgmt-qfx/topics/example/cos-shared-buffer-allocation-lossless-qfx-series-configuring.html"
+  - label: "Multi-Path Transport for RDMA in Datacenters (MP-RDMA, NSDI 2018)"
+    url: "https://www.usenix.org/system/files/conference/nsdi18/nsdi18-lu.pdf"
+---
+
+## 捨てる代わりに、印を付ける
+
+前のレッスンで見たとおり、PFC は「溢れそうだから止めろ」という**乱暴な**仕組みです。巻き添えが出ます。
+
+もっと手前で、もっと穏やかに輻輳を伝える方法が **ECN**（Explicit Congestion Notification、RFC 3168）です。
+
+```text
+従来          : バッファが溢れた → パケットを捨てる → 送信側が「落ちた」と気づく
+ECN           : バッファが溜まってきた → パケットに印を付けて通す → 送信側が気づく
+```
+
+**捨てずに知らせる**のが要点です。データは届くので、**再送による遅延は避けられます。** 届いたパケットに「この経路は混んでいる」という情報が乗っています。
+
+ただし速度は落とします。RFC は、印を受けた送信側に「**パケットが 1 個落ちたときと実質同じ**」輻輳対応を求めています。**落とさないのは再送だけで、速度は同じように下げる**、という仕組みです。
+
+<Callout type="note" title="RoCEv2 だから使える">
+
+ECN は IP ヘッダの 2 ビットを使います。**RoCEv2 は RDMA を UDP / IP の上に載せた方式**なので、この仕組みがそのまま使えます。
+
+AI 基盤コース レッスン 2 で扱った「RoCEv2 は L3 をまたげる」という性質の副産物です。IP の道具が全部使えます。
+
+</Callout>
+
+---
+
+## DCQCN — 印を受けて、速度を落とす
+
+ECN は「印を付ける」だけです。**印を見て実際に速度を落とす仕組み**が要ります。それが **DCQCN**（Data Center Quantized Congestion Notification）です。
+
+**DCQCN は、2015 年に Microsoft と Mellanox が論文で発表したアルゴリズムです。** 論文は、RoCEv2 の規格が定める輻輳制御の部品（通知パケット CNP など）の上に DCQCN を組み立てた、と書いています。規格が定めているのは CNP というパケットで、**いつ CNP を出し、受けた側が速度をどう変えるか**を決めているのが DCQCN です。
+
+**主要な NIC ベンダーは、そろってこれを実装しています。** NVIDIA、Broadcom（BCM957608 は DCQCN-P に設定されている）、Intel（E810 は DCTCP・TIMELY と並ぶ選択肢の 1 つ）です。
+
+---
+
+<h2 className="slide-cont">DCQCN — 印を受けて、速度を落とす（続き）</h2>
+
+登場するのは 3 者です。
+
+<Figure name="dcqcn-loop" caption="スイッチが印を付け、受信側が通知を返し、送信側が速度を落とす" />
+
+| 役割 | どこ | やること |
+| --- | --- | --- |
+| **CP**（輻輳点） | スイッチ | キュー長が閾値を超えたらパケットに ECN の印を付ける |
+| **NP**（通知点） | 受信 NIC | 印の付いたパケットを見たら **CNP** を送信元へ返す |
+| **RP**（反応点） | 送信 NIC | CNP を受けたらそのフローの送信レートを下げる |
+
+**CNP**（Congestion Notification Packet）が、受信側から送信側へ逆向きに飛ぶ通知です。
+
+---
+
+## レートの下げ方と戻し方
+
+DCQCN のレート制御は、**下げるときと戻すときで形が違います。**
+
+```text
+CNP を受けた  → レートを掛け算で下げる
+                下げる直前のレートを「目標」として覚えておく
+
+CNP が来ない  → 3 段階で戻す
+                ① fast recovery      目標との差を半分ずつ詰める（論文の設定では 5 回）
+                ② additive increase  目標そのものを一定幅ずつ上げ、ゆっくり探る
+                ③ hyper increase     さらに速く引き上げる
+```
+
+論文の設定どおり ① で差を半分ずつ 5 回詰めると、**目標との差は 32 分の 1 になります。** 下げた直後は、下げる前の速さのすぐ近くまで急いで戻るということです。**すぐ戻り、そこから先を慎重に探る**、という形です。
+
+もう 1 つ TCP と違う点があります。**DCQCN には slow start がありません。** 論文は「同じホストからほかに送っているフローが無ければ、フローは開始時から回線速度で送る」と書き、別の節で「**DCQCN は PFC を不要にしない**」と明記しています。いきなり回線速度で送り出すので、PFC が無ければロスにつながりえます。論文の実験でも、PFC を外すとロスが頻繁に起きていました。レッスン 2 で PFC を「最後の砦」と呼んだのはこのためです。
+
+---
+
+<h2 className="slide-cont">レートの下げ方と戻し方（続き）</h2>
+
+<Callout type="field">
+
+**DCQCN の大部分は NIC で動きます。**（印を付けるのはスイッチです）
+
+論文が NIC に実装した理由として挙げているのは、**ホストの CPU 負荷を低く抑えること**です。ちなみに 400Gbps のリンクには、計算すると 1 マイクロ秒で 50 キロバイトが流れます。
+
+論文の実装でも、通知点（NP）と反応点（RP）の状態機械は NIC に載っていました（当時の ConnectX-3 Pro / ConnectX-4）。Intel の E810 では configfs の `roce_dcqcn_enable` で有効にします（Intel の資料 Rev 1.4 の既定値一覧では off）。Broadcom の BCM957608 は DCQCN-P に設定されています。**NIC の機能なので、使えるかどうかは NIC の世代とドライバで決まります。**
+
+</Callout>
+
+<Callout type="note" title="BlueField-3 以降">
+
+NVIDIA の現行世代では、**BlueField-3 以降の DPU** と ConnectX SuperNIC の **DPA**（データパス・アクセラレータ）という処理系の上で輻輳制御が動きます（ConnectX SuperNIC の世代は資料に書かれていません）。DCQCN はそこで動くアルゴリズムの 1 つです。
+
+BlueField-3 以降では、この処理系に**独自の輻輳制御を書き込めます**（DOCA PCC）。DOCA 3.5 の資料では、NVIDIA は DCQCN を「legacy interoperability」用と位置づけ、RTT を併用する方式（ZTR-RTT）を別に用意しています。
+
+DOCA の資料は対象を「BlueField-3 以降」としています。**BlueField-4 で使う場合は、導入する版の DOCA の対応表で確認してください。**
+
+</Callout>
+
+---
+
+## 閾値の順序が設計の要
+
+ここが RoCE の設計で最も重要な点です。
+
+**ECN が先に効き、PFC は最後の砦として残す。** この順序を、バッファの閾値で作ります。
+
+```text
+キューの深さ
+  ↑
+  │  ■■■■■■■■  ← PFC の閾値（ここまで来たら止める。来てほしくない）
+  │  ■■■■■
+  │  ■■■         ← ECN の閾値（Kmin。ここで印を付け始める）
+  │  ■
+  └──────────────→ 時間
+```
+
+**逆転すると、ECN が印を付ける前に PFC が出ることがあります。** PFC が先に出た場面では、レッスン 2 で見た巻き添えが起きます。
+
+論文には、閾値をわざとこう設定した実験があります。書かれているのは「PFC が ECN より先に発動しうる」「DCQCN の効果が十分に得られなくなる」で、結果は **PFC だけの場合よりは良く、正しく設定した DCQCN よりは悪い** というものでした。**効かなくなるのではなく、効きが落ちます。**
+
+---
+
+<h2 className="slide-cont">閾値の順序が設計の要（続き）</h2>
+
+実際の設定では、次の値が関係します。
+
+| 値 | 意味 |
+| --- | --- |
+| **Kmin** | ここから ECN の印を付け始める |
+| **Kmax** | これを超えたら全部に印を付ける |
+| **PFC の閾値 + headroom** | 止める判断をする点と、止まるまでの余白 |
+
+論文が示している条件は、**ECN が PFC より先に効くように閾値を置くこと**です。ただし 2 つは測る場所が違います。**ECN は出口側、PFC は入口側のキュー**で判定するため、単純な大小比較にはならず、論文はポート数を掛けた式で条件を立てています。**上の図は順序のイメージで、同じキューを測っているわけではありません。**
+
+<Callout type="pitfall">
+
+**この 3 つは、スイッチのバッファという 1 つの資源を奪い合います。**
+
+headroom を厚くすると、ECN の閾値に使える余地が減ります。lossless の優先度クラスにバッファを寄せると、他のクラスが細ります。
+
+**「PFC を入れました」「ECN を入れました」で終わりにせず、数字が整合しているかまで確認してください。** 機種によっては整合性を検査するコマンドがあります。
+
+</Callout>
+
+---
+
+## 通知そのものを遅らせない
+
+DCQCN で見落とされやすいのが、**CNP の扱い**です。
+
+CNP は「速度を落とせ」という通知です。NVIDIA の Cumulus Linux 5.9 の RoCE 構成例では、CNP をデータとは別の優先度クラスに置き、**優先的に通しています。**
+
+| トラフィック | DSCP | 優先度 / トラフィッククラス | 扱い |
+| --- | --- | --- | --- |
+| **RoCE のデータ** | **26** | 3 | lossless（PFC 有効、ECN 有効） |
+| **CNP** | **48** | 6 | **最優先**（strict priority） |
+
+ここでの値は Cumulus Linux 5.9 の構成例のうち、ポート単位の表示（`nv show interface <port> qos roce status`）のものです。同じページの全体の対応表（`nv show qos roce`）では、DSCP 24〜31 を優先度 3 に、48〜55 を優先度 6 にまとめて対応させています。
+
+論文も CNP を高い優先度で送っています。理由として挙げているのは「**CNP の期限を逃さないため**」と「**収束を速めるため**」です。一方で、DCQCN は戻り経路の輻輳には「それほど敏感ではない」とも書いています。**CNP が遅れても制御が壊れるわけではない**、という位置づけです。優先して送るのは、期限を守り、収束を速めるためです。
+
+```bash
+# NIC 側の設定確認。優先度と trust の状態を見る
+mlnx_qos -i eth2
+
+# RoCE の ECN と CNP のカウンタは RDMA 側にある（mlx5 では sysfs）
+grep -H . /sys/class/infiniband/*/ports/*/{hw_counters,counters}/*{ecn,cnp}* 2>/dev/null
+```
+
+**RoCE の ECN と CNP の数は、RDMA 側のカウンタで見ます。** mlx5 のカーネルソースは `np_ecn_marked_roce_packets`・`np_cnp_sent`・`rp_cnp_handled` などを RDMA のカウンタとして定義しています。NVIDIA の資料は、RDMA のカウンタを sysfs（`hw_counters` と `counters`）で読むとしています。
+
+---
+
+## DSCP でやるか、PCP でやるか
+
+優先度の伝え方には 2 通りあります。
+
+| | **PCP**（L2） | **DSCP**（L3） |
+| --- | --- | --- |
+| どこに書くか | VLAN タグの中 | IP ヘッダの中 |
+| ルーティング後も元の値が運ばれるか | **運ばれない**（Ethernet ヘッダは付け替わる） | **運ばれる**（IP ヘッダの中。ただし経路上の機器が書き換えることは RFC で認められている） |
+| VLAN タグが要るか | **要る**（VLAN を構成する必要はない） | 不要 |
+
+PCP に要るのはタグで、VLAN を切ることではありません。たとえば Intel の E810 は RoCEv2 モードで PFC を有効にすると、タグの無いパケットに VLAN ID 0 のタグを自動で付けます。
+
+**経路に L3 のホップを挟むなら、DSCP で伝えます。** DCQCN の論文は「IP でルーティングされるネットワークでは、元の Ethernet ヘッダはパケットとともに運ばれない」と書いています。PCP はその Ethernet ヘッダの VLAN タグの中にあります。上の NVIDIA の構成例も、DSCP で優先度を振っています。
+
+<Callout type="warning" title="trust の設定を合わせる">
+
+スイッチは「どちらを信じるか」を `trust` として設定します。**NIC 側が VLAN タグを付けずに DSCP だけで送っているのに、スイッチが PCP を信じていると、そのパケットは既定の優先度に落ちます。**
+
+既定の優先度は設定で変えられるので、何番に落ちるかは機種と設定しだいです。**既定を lossless のクラスにしていない限り、lossless からは外れます。**
+
+この状態でも通信は成立します。**lossless のクラスに入らないだけです。** つまり黙って落ちます。設定した本人が気づかないまま「なぜか遅い」になる典型例です。
+
+経路上の全機器で `trust dscp` が揃っているかを、レッスン 2 の PFC と同じ粒度で確認してください。
+
+</Callout>
+
+---
+
+## それでも詰まるものは詰まる
+
+DCQCN を正しく設定しても、**解けない輻輳があります。**
+
+```text
+解ける輻輳 : 送信が速すぎる → レートを落とせば消える
+解けない輻輳 : 出口のリンクが物理的に足りない → 落としても詰まったまま
+```
+
+前のレッスンの incast は前者です。全ノードが同じ宛先へ送るとき、レートを落とせば溢れずに済みます。
+
+**後者は、経路の選び方が悪いときに起きます。** 空いているリンクが隣にあるのに、全部が同じリンクへ吸い寄せられている場合、送信レートを落としても「遅いまま」になるだけです。
+
+それが次のレッスンで扱う **ECMP の偏り**です。
+
+---
+
+<Quiz
+  id="q1"
+  question="DCQCN の論文は CNP を高い優先度で送っています。その理由として論文が挙げているものはどれですか。"
+  options={[
+    "CNP はデータより大きく、分けないと帯域を食うため",
+    "CNP の期限を逃さず、収束を速めるため",
+    "CNP が遅れると DCQCN の制御が壊れるため",
+    "CNP で PFC の PAUSE を止めるため"
+  ]}
+  answer={1}
+  explanation="DCQCN の論文は、CNP を高い優先度で送る理由を、CNP の期限を逃さないためと、収束を速めるためと書いています。論文が挙げている理由はこの 2 つです。選択肢 3 番目は論文の理由ではなく、同じ論文は DCQCN は戻り経路の輻輳にはそれほど敏感ではないと書いています。CNP が遅れても制御が壊れるわけではありません。NVIDIA の Cumulus Linux 5.9 の構成例でも、CNP は DSCP 48 として優先度 6 に置き、strict priority で通しています。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="RoCE ファブリックのチューニングで、ECN のマーキング閾値 Kmin を PFC の発動閾値より大きい値に設定してしまいました。何が起きますか。"
+  options={[
+    "ECN のマーキングがより正確になる",
+    "ECN が印を付ける前に PFC が発動することがあり、DCQCN の効果が十分に得られなくなる。PFC が先に出た場面では巻き添えの送信停止が起きる",
+    "パケットロスが増える",
+    "CNP が送信されなくなるだけで、性能上の影響はない"
+  ]}
+  answer={1}
+  explanation="RoCE の設計では、キューが伸びてきたらまず ECN で送信側に速度を落とさせ、PFC は最後の砦として残します。Kmin が PFC の閾値より大きいと、印を付ける前に PAUSE が出ることがあります。DCQCN の論文は閾値をわざとこう設定した実験で、PFC が ECN より先に発動しうるため DCQCN の効果が十分に得られないこと、ただし結果は PFC だけの場合よりは良かったことを報告しています。効かなくなるのではなく、効きが落ちます。PFC が先に出た場面では、リンクと優先度クラスの単位で止めるため、輻輳に関係ない通信まで巻き添えで止まります。"
+/>

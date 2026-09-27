@@ -1,0 +1,326 @@
+---
+title: リバースプロキシの実運用
+description: タイムアウト・バッファリング・ヘルスチェックの設定が、障害時の挙動をどう変えるかを押さえます。
+order: 2
+minutes: 17
+tags: ["nginx", "HAProxy", "timeout", "buffering", "healthcheck"]
+objectives:
+  - タイムアウト設定の階層を理解し、適切な値を決められる
+  - バッファリングの有無が上流に与える影響を説明できる
+  - ヘルスチェックの設計が障害の波及範囲を決めることを理解できる
+references:
+  - label: "nginx documentation — ngx_http_proxy_module"
+    url: "https://nginx.org/en/docs/http/ngx_http_proxy_module.html"
+  - label: "HAProxy Documentation"
+    url: "https://docs.haproxy.org/"
+  - label: "nginx — Configuring Logging"
+    url: "https://nginx.org/en/docs/http/ngx_http_log_module.html"
+---
+
+## タイムアウトは階層になっている
+
+リバースプロキシの設定で最も事故を生むのがタイムアウトです。**1 つの値ではなく、複数の段階がある**ことを押さえる必要があります。
+
+```text
+クライアント ──① ② ──► nginx ──③ ④ ⑤ ──► 上流サーバー
+```
+
+| 設定 | 対象 | 既定値 |
+| --- | --- | --- |
+| ① `client_header_timeout` | リクエストヘッダの受信 | 60s |
+| ② `client_body_timeout` | リクエストボディの受信 | 60s |
+| ③ `proxy_connect_timeout` | **上流への TCP 接続確立** | 60s |
+| ④ `proxy_send_timeout` | 上流へのリクエスト送信 | 60s |
+| ⑤ `proxy_read_timeout` | **上流からの応答待ち** | **60s** |
+
+```nginx
+location / {
+    proxy_pass http://backend;
+    proxy_connect_timeout 3s;    # 接続できないなら早く諦める
+    proxy_send_timeout    30s;
+    proxy_read_timeout    30s;   # アプリの処理時間に合わせる
+}
+```
+
+<Callout type="pitfall" title="connect と read は分けて考える">
+
+**`proxy_connect_timeout` は短く、`proxy_read_timeout` は処理時間に合わせる**のが原則です。
+
+- 上流が**落ちている**なら、TCP 接続は即座に失敗するか、数秒で判断できる。ここを 60s にすると、落ちたサーバーに 60 秒待ち続ける
+- 上流が**生きていて処理中**なら、時間がかかるのは正常。ここを短くすると、正常な長時間処理が切られる
+
+両方を一律 60s にすると、「障害時は遅く、正常時は切られる」という最悪の組み合わせになります。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">タイムアウトは階層になっている（続き）</h2>
+
+<Callout type="field">
+
+**タイムアウトは経路全体で整合させてください。**
+
+```text
+クライアント (30s) → LB (60s) → nginx (60s) → アプリ (120s) → DB (300s)
+                ↑ ここで切れる        ↑ でも後段は処理を続けている
+```
+
+クライアントが諦めた後も、後段は延々と処理を続けます。DB のコネクションが解放されず、**負荷が上がっているのにリクエストは返っていない**という状態になります。
+
+**手前ほど短く、奥ほど短く**（つまり奥に行くほど短くする）が正しい設計です。
+
+```text
+クライアント (60s) → LB (50s) → nginx (40s) → アプリ (30s) → DB (20s)
+```
+
+こうすれば、どこで打ち切られても後段にゴミが残りません。現状を一度書き出して、逆転していないか確認する価値があります。
+
+</Callout>
+
+---
+
+## バッファリング
+
+nginx は既定で、**上流からの応答を一旦受け取ってからクライアントへ送ります**。
+
+```nginx
+proxy_buffering on;                    # 既定
+proxy_buffer_size        4k;
+proxy_buffers            8 4k;
+proxy_busy_buffers_size  8k;
+proxy_max_temp_file_size 1024m;        # 溢れたらディスクへ
+```
+
+<Figure name="proxy-buffering" caption="遅いクライアントが上流のワーカーを占有し続けるかどうかの違い" />
+
+**遅いクライアント（モバイル回線など）から上流を守るのが、バッファリングの主目的です。** レッスン 1 で見たとおり、上流のワーカー数は有限なので、これは重要な保護になります。
+
+---
+
+<h2 className="slide-cont">バッファリング（続き）</h2>
+
+<Callout type="warning" title="バッファリングを切るべき場合">
+
+一方で、**応答を逐次流したい場合は切る必要があります**。
+
+- Server-Sent Events (SSE)
+- ストリーミング API（LLM の逐次出力など）
+- 長時間実行されるジョブの進捗表示
+
+```nginx
+location /api/stream {
+    proxy_pass http://backend;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;    # ストリームは長時間開いたまま
+}
+```
+
+**「ストリーミングにしたのに、処理が全部終わってから一気に届く」**という症状は、ほぼこの設定漏れです。アプリ側から `X-Accel-Buffering: no` ヘッダを返して制御することもできます。
+
+</Callout>
+
+---
+
+## ヘルスチェックと障害の波及
+
+ネットワークコース レッスン 6 で触れた点を、実装の観点で掘り下げます。
+
+### パッシブチェック（nginx OSS）
+
+```nginx
+upstream backend {
+    server 10.0.0.10:8080 max_fails=3 fail_timeout=30s;
+    server 10.0.0.11:8080 max_fails=3 fail_timeout=30s;
+}
+```
+
+実際のリクエストの失敗を数え、`fail_timeout` の間に `max_fails` 回失敗したら、そのサーバーを `fail_timeout` の間だけ外します。**専用の監視リクエストは送りません。**
+
+```nginx
+# どの条件で「失敗」とみなし、次の上流へ回すか
+proxy_next_upstream error timeout http_502 http_503 http_504;
+proxy_next_upstream_tries 2;
+proxy_next_upstream_timeout 10s;
+```
+
+<Callout type="pitfall">
+
+**`proxy_next_upstream` に `non_idempotent` を安易に加えないでください。**
+
+既定では、**POST などの非冪等なリクエストは再送されません**。上流がリクエストを受け取って処理した後にタイムアウトした場合、再送すると**二重処理**になるためです。
+
+```nginx
+# 危険: 決済やデータ登録が二重に実行されうる
+proxy_next_upstream error timeout non_idempotent;
+```
+
+「たまに 502 が出るから」という理由でこれを加えると、**再現性の低い二重登録**を生みます。冪等性がアプリ側で担保されていることを確認してからにしてください。
+
+</Callout>
+
+### 全台が同時に落ちる構成
+
+---
+
+<h2 className="slide-cont">ヘルスチェックと障害の波及（続き）</h2>
+
+ネットワークコース レッスン 6 でも触れましたが、実装上の注意点です。
+
+```text
+ヘルスチェックのエンドポイントが DB への接続を確認している
+    ↓
+DB が瞬断する
+    ↓
+全バックエンドが同時に不健全と判定される
+    ↓
+ロードバランサから全台が外れ、サービス全断
+```
+
+DB の瞬断は「一部のリクエストが失敗する」で済んだはずが、**全断に拡大**します。
+
+```text
+/healthz  : プロセスが応答できるか（軽い。LB のチェック用）
+/readyz   : 依存先も含めて処理可能か（投入判断・デプロイ時用）
+```
+
+<Callout type="tip">
+
+さらに踏み込むなら、**「全台が不健全なら、全台を健全として扱う」**という考え方があります（panic mode / fail-open）。
+
+全台が落ちているなら、LB が全部外しても状況は改善しません。**外さずに流したほうが、一部でも成功する可能性が残ります。** HAProxy や Envoy にはこの挙動を制御する設定があります。
+
+「全部だめなときの振る舞い」を決めておくのは、大規模障害の被害を小さくする実践的な手段です。
+
+</Callout>
+
+---
+
+## ログを設計する
+
+既定のログ形式では、**障害調査に必要な情報が足りません**。
+
+```nginx
+log_format detailed '$remote_addr - $remote_user [$time_local] '
+                    '"$request" $status $body_bytes_sent '
+                    'rt=$request_time uct=$upstream_connect_time '
+                    'uht=$upstream_header_time urt=$upstream_response_time '
+                    'us=$upstream_status ua="$upstream_addr" '
+                    'rid=$request_id';
+
+access_log /var/log/nginx/access.log detailed;
+```
+
+| 変数 | 何が分かるか |
+| --- | --- |
+| **`$request_time`** | nginx から見た全体の所要時間 |
+| **`$upstream_connect_time`** | 上流への接続にかかった時間 |
+| **`$upstream_response_time`** | 上流の処理時間 |
+| `$upstream_addr` | **実際にどのサーバーへ送ったか** |
+| `$upstream_status` | 上流が返したステータス |
+| `$request_id` | nginx が生成する一意 ID。**上流のログと突き合わせられる** |
+
+---
+
+<h2 className="slide-cont">ログを設計する（続き）</h2>
+
+<Callout type="field">
+
+**`$request_time` と `$upstream_response_time` の差**が、切り分けの鍵になります。
+
+```text
+request_time 30.0 / upstream_response_time 29.8
+  → 上流の処理が遅い。アプリ側を調べる
+
+request_time 30.0 / upstream_response_time 0.2
+  → nginx とクライアントの間が遅い。ネットワーク、あるいは遅いクライアント
+
+upstream_addr に複数の IP が並んでいる
+  → 1 台目が失敗して次へ回っている（proxy_next_upstream が動いた）
+```
+
+`$request_id` は上流へ渡して、アプリのログにも出させます。
+
+```nginx
+proxy_set_header X-Request-ID $request_id;
+```
+
+これで、**1 リクエストを nginx からアプリまで追跡できます**。分散環境では必須と言ってよい設定です。
+
+</Callout>
+
+---
+
+## 設定変更の作法
+
+運用コース レッスン 6 の内容が、そのまま適用されます。
+
+```bash
+# ① 構文チェック（必須）
+sudo nginx -t
+
+# ② 設定の最終形を確認（include を展開して表示）
+sudo nginx -T | less
+
+# ③ 反映（既存接続を維持したまま、ワーカーを入れ替える）
+sudo systemctl reload nginx
+```
+
+<Callout type="note" title="reload の仕組み">
+
+nginx の `reload` は、**古いワーカープロセスを残したまま新しいワーカーを起動**し、古いワーカーは処理中のリクエストを終えてから終了します。
+
+```bash
+# reload 直後は新旧のワーカーが並存する
+ps aux | grep 'nginx: worker'
+# nginx: worker process           ← 新
+# nginx: worker process is shutting down   ← 旧（処理中のものを待っている）
+```
+
+長時間の接続（WebSocket、ストリーミング）がある場合、**古いワーカーが長く残ります**。メモリ使用量が一時的に増えるため、頻繁な reload には注意が必要です。
+
+`worker_shutdown_timeout` で、古いワーカーを強制終了するまでの時間を設定できます。
+
+</Callout>
+
+---
+
+## まとめ
+
+- タイムアウトは階層。**`connect` は短く、`read` は処理時間に合わせる**
+- **経路全体で、奥に行くほど短く**する。逆転していると後段にゴミが残る
+- バッファリングは**遅いクライアントから上流を守る**仕組み
+- **ストリーミングでは `proxy_buffering off` が必須**
+- `proxy_next_upstream` に **`non_idempotent` を安易に加えない**（二重処理）
+- ヘルスチェックに依存先チェックを入れると、**瞬断が全断に拡大する**
+- ログに `$upstream_response_time` と `$request_id` を入れる。**切り分けが段違いに速くなる**
+- `reload` では新旧ワーカーが並存する
+
+<Quiz
+  id="q1"
+  question="nginx のアクセスログで、request_time=30.0 に対して upstream_response_time=0.15 という行が多数記録されています。どう解釈すべきですか。"
+  options={[
+    "上流アプリケーションの処理が遅い",
+    "上流の処理は 0.15 秒で完了しており、nginx とクライアントの間（ネットワークや遅いクライアントへの送信）に時間がかかっている",
+    "DB のクエリが遅い",
+    "proxy_connect_timeout の設定が短すぎる"
+  ]}
+  answer={1}
+  explanation="upstream_response_time は上流が応答を返すまでの時間、request_time は nginx がリクエストを受けてからクライアントへ返し終わるまでの全体時間です。両者に大きな差がある場合、上流は速く応答しているのにクライアントへの送信に時間がかかっていることを意味します。モバイル回線などの遅いクライアント、あるいは応答サイズが大きい場合に起こります。アプリケーションを調べても原因は見つかりません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="ロードバランサのヘルスチェック先を、DB への接続確認まで行う /readyz に設定しています。この構成のリスクはどれですか。"
+  options={[
+    "ヘルスチェックの負荷が高くなる",
+    "DB の瞬断で全バックエンドが同時に不健全と判定され、LB から全台が外れてサービス全断に拡大する",
+    "ヘルスチェックのタイムアウトが長くなる",
+    "特にリスクはない"
+  ]}
+  answer={1}
+  explanation="共有の依存先をヘルスチェックに含めると、その依存先の障害が全バックエンドで同時に顕在化します。本来なら「一部のリクエストが失敗する」で済んだ事象が、全台切り離しによる全断に拡大します。LB のチェックにはプロセスの応答性だけを見る軽い /healthz を使い、依存先の確認はデプロイ時の投入判断に使う /readyz として分けるのが定石です。"
+/>

@@ -1,0 +1,357 @@
+---
+title: オンプレ IdP の構築と LDAP 連携
+description: Keycloak を例に、レルム設計・既存ディレクトリとの連携・可用性の勘所をまとめます。
+order: 5
+minutes: 18
+tags: ["Keycloak", "LDAP", "Active Directory", "SSO", "フェデレーション"]
+objectives:
+  - IdP を立てることで何が集約されるかを説明できる
+  - 既存の LDAP / AD と連携する際の設計判断ができる
+  - IdP 自体の可用性とバックアップの考え方を理解できる
+references:
+  - label: "Keycloak Documentation — Server Administration"
+    url: "https://www.keycloak.org/documentation"
+  - label: "RFC 4511 — Lightweight Directory Access Protocol (LDAP)"
+    url: "https://www.rfc-editor.org/rfc/rfc4511.html"
+  - label: "OpenID Connect Core 1.0"
+    url: "https://openid.net/specs/openid-connect-core-1_0.html"
+---
+
+## IdP を立てると何が集約されるか
+
+レッスン 1 で「認証は自前実装しない」と述べました。その受け皿が **IdP**（Identity Provider）です。
+
+```text
+IdP なし:
+  アプリA ── 独自のログイン画面・パスワード保存・MFA
+  アプリB ── 独自のログイン画面・パスワード保存・MFA      ← 全部バラバラ
+  アプリC ── 独自のログイン画面・パスワード保存・MFA
+
+IdP あり:
+  アプリA ─┐
+  アプリB ─┼──► IdP （認証はここだけ）
+  アプリC ─┘
+```
+
+集約される効果は、セキュリティだけではありません。
+
+| | 効果 |
+| --- | --- |
+| **退職者の遮断** | **IdP で無効化すれば全アプリから締め出せる** |
+| MFA | 1 か所に入れれば全アプリに効く |
+| 監査 | ログイン記録が 1 か所に集まる |
+| パスワードポリシー | 統一できる |
+| SSO | ユーザーは 1 回のログインで済む |
+
+<Callout type="field">
+
+**「退職者の即時遮断」は、実務で最も価値が出る点です。**
+
+アプリごとにアカウントを持っていると、退職時に漏れが出ます。半年後の棚卸しで「まだ生きているアカウント」が見つかる、というのはよくある話です。
+
+IdP に集約されていれば、**IdP 側で無効化するだけで全アプリのアクセスが止まります**（ただしレッスン 1・4 で見たとおり、発行済みアクセストークンの寿命ぶんの猶予は残ります）。
+
+</Callout>
+
+---
+
+## Keycloak の構造
+
+オンプレの IdP として広く使われています。**用語を最初に押さえると、以降の設定が理解しやすくなります。**
+
+| 概念 | 意味 |
+| --- | --- |
+| **Realm** | **独立した territory**。ユーザー・クライアント・設定の単位 |
+| **Client** | IdP を利用するアプリケーション（レッスン 4 の Client） |
+| **User Federation** | **外部のユーザーストア**（LDAP / AD）との連携 |
+| **Identity Provider** | **外部の IdP** との連携（他社の IdP、SAML、ソーシャル） |
+| **Role** | 権限。Realm ロールと Client ロールがある |
+| **Group** | ユーザーの集合。ロールをまとめて付与できる |
+
+```text
+Realm: corp
+├── Users            （または LDAP から連携）
+├── Groups           /infra/sre, /dev/backend
+├── Roles            operator, auditor, admin
+├── Clients
+│   ├── grafana          (confidential)
+│   ├── internal-spa     (public + PKCE)
+│   └── orders-api       (bearer-only / リソースサーバー)
+└── Identity Providers   （他の IdP と繋ぐ場合）
+```
+
+<Callout type="note" title="Realm の分け方">
+
+**master レルムは Keycloak 自身の管理用**です。ここにアプリのユーザーを入れてはいけません。業務用のレルム（例: `corp`）を別に作ります。
+
+レルムを複数に分けるのは、**テナントを完全に分離したい場合**です。レルムをまたいだ SSO はできないため、社内で 1 つのレルムにまとめるのが普通です。
+
+「部署ごとにレルムを分ける」と、部署をまたぐアプリで SSO が効かなくなります。**分離はグループとロールで行い、レルムは分けない**のが原則です。
+
+</Callout>
+
+### クライアントの設定
+
+---
+
+<h2 className="slide-cont">Keycloak の構造（続き）</h2>
+
+レッスン 4 の内容が、そのまま設定項目に対応します。
+
+```text
+Client: internal-spa
+  Client authentication : Off          ← Public クライアント（secret なし）
+  Standard flow         : On           ← Authorization Code
+  PKCE method           : S256         ← 必須
+  Valid redirect URIs   : https://app.internal/callback
+  Web origins           : https://app.internal
+```
+
+<Callout type="warning" title="redirect URI にワイルドカードを使わない">
+
+```text
+✗ Valid redirect URIs: https://app.internal/*
+✗ Valid redirect URIs: *
+```
+
+リダイレクト先が緩いと、**認可コードを攻撃者のページへ送らせる**ことができます。レッスン 4 の PKCE があれば被害は限定されますが、**そもそも許可先を厳密に列挙する**のが正しい設定です。
+
+開発中に `*` にしたまま本番へ持っていく、というのが典型的な事故です。
+
+</Callout>
+
+---
+
+## LDAP / Active Directory との連携
+
+**オンプレでは、既に AD や OpenLDAP がある**ことがほとんどです。IdP を新設する際は、そこに繋ぐのが現実的です。
+
+### LDAP の基本構造
+
+```text
+dc=example,dc=com                      ← ドメイン
+├── ou=Users                           ← 組織単位 (Organizational Unit)
+│   ├── uid=tanaka,ou=Users,dc=...     ← DN (Distinguished Name)
+│   └── uid=suzuki,ou=Users,dc=...
+└── ou=Groups
+    └── cn=sre,ou=Groups,dc=...
+```
+
+```bash
+# 接続確認（まずこれが通ることを確かめる）
+ldapsearch -x -H ldaps://dc01.example.com \
+  -D "cn=svc-keycloak,ou=Services,dc=example,dc=com" -W \
+  -b "ou=Users,dc=example,dc=com" "(uid=tanaka)"
+```
+
+### 連携の設計判断
+
+| 項目 | 選択肢 | 判断 |
+| --- | --- | --- |
+| **Edit mode** | `READ_ONLY` / `WRITABLE` / `UNSYNCED` | **既存 AD が正なら `READ_ONLY`** |
+| Import users | On / Off | On にすると IdP 側にコピーを持つ（速い） |
+| Sync | 定期 / 変更時 | 大規模なら定期フルシンクは重い |
+| **バインドユーザー** | 専用サービスアカウント | **読み取り専用の専用アカウントを作る** |
+
+---
+
+<h2 className="slide-cont">LDAP / Active Directory との連携（続き）</h2>
+
+<Callout type="pitfall" title="WRITABLE の危険">
+
+`WRITABLE` にすると、**Keycloak 側の操作が AD に書き戻されます**。パスワード変更やユーザー削除が AD に反映されるため、影響範囲が一気に広がります。
+
+**AD が人事システムなど他の正本と連携している場合、事故になります。** 既存のディレクトリが「正」であるなら `READ_ONLY` にし、Keycloak は認証の窓口に徹させるのが安全です。
+
+また、**バインド用のサービスアカウントには読み取り権限だけを与えてください**（運用コース レッスン 3 の最小権限）。管理者アカウントを流用している構成をときどき見かけますが、Keycloak が侵害されたときの被害が桁違いになります。
+
+</Callout>
+
+### グループとロールのマッピング
+
+**LDAP のグループを、そのままアプリの権限にはできません。** マッピングを設計する必要があります。
+
+```text
+LDAP: cn=sre,ou=Groups,dc=example,dc=com
+          ↓ Group LDAP Mapper
+Keycloak Group: /sre
+          ↓ Group Role Mapping
+Keycloak Role: operator
+          ↓ トークンのクレームに含める
+アプリ: realm_access.roles に "operator" があるので許可
+```
+
+---
+
+<h2 className="slide-cont">LDAP / Active Directory との連携（続き）</h2>
+
+<Callout type="tip">
+
+**ロールは「アプリが理解する言葉」で定義してください。**
+
+```text
+✗ アプリが LDAP のグループ DN を直接解釈する
+   → ディレクトリの構造変更でアプリが壊れる
+
+✓ IdP がグループ → ロールに変換し、アプリはロールだけを見る
+   → 組織変更はマッピングの修正で吸収できる
+```
+
+レッスン 4 の最後で触れたとおり、**アプリはトークンのクレーム（ロール）だけを見て認可判定する**設計にしておくと、組織の変更に強くなります。
+
+</Callout>
+
+---
+
+## オンプレ特有の前提
+
+<Callout type="warning" title="証明書・DNS・時刻">
+
+IdP を立てるとき、**このコースの前半と他コースの内容が同時に効いてきます。**
+
+**① 証明書（レッスン 2・3）**
+
+IdP は HTTPS 必須です。内部 FQDN の証明書が要るため、**自己認証局が前提**になります。さらに、IdP に繋ぐすべてのクライアント（アプリ、Java、コンテナ）のトラストストアに CA を入れる必要があります。
+
+**② DNS（ネットワークコース レッスン 5）**
+
+`iss`（issuer）は URL で、**全クライアントから同じ名前で解決できる必要があります**。内部と外部で名前が違うと、トークンの `iss` 検証が失敗します。
+
+```text
+内部から https://idp.internal/realms/corp
+外部から https://idp.example.com/realms/corp
+  → issuer が一致せず検証エラー
+```
+
+**③ 時刻同期**
+
+JWT の `exp` / `nbf` / `iat` は時刻で判定されます（レッスン 4）。**サーバー間の時刻がずれていると、有効なトークンが拒否されます。**
+
+```bash
+chronyc tracking      # または timedatectl show-timesync
+```
+
+Kerberos（AD 連携）は特に厳格で、既定では **5 分以上のずれで認証が失敗**します。NTP は必須です。
+
+</Callout>
+
+---
+
+## 可用性とバックアップ
+
+<Callout type="field">
+
+**IdP が止まると、全アプリにログインできなくなります。** 認証を集約した代償として、IdP は単一障害点になります。
+
+```text
+Keycloak （ステートレスに近い。複数台で冗長化できる）
+     │
+     ▼
+  データベース （実質的にここが可用性を決める）
+```
+
+Keycloak 自体は複数ノードでクラスタを組めますが、**状態は DB にあります**。つまり**ミドルウェアコース レッスン 3 の PostgreSQL 冗長化が、そのまま IdP の可用性**になります。
+
+さらに考えておくこと。
+
+- **IdP 障害中に、既存セッションはどうなるか** — 発行済みアクセストークンは有効期限まで使えます（レッスン 4）。寿命を極端に短くしていると、IdP 障害が即座に全断になります
+- **緊急用の経路** — IdP を介さずに入れる管理者アカウントを、各システムに 1 つ残しておくか。利便性と安全性のトレードオフですが、**IdP 障害時に何もできない状態は避けたい**
+
+</Callout>
+
+### バックアップ対象
+
+```bash
+# ① レルム設定のエクスポート（構成の復元用）
+/opt/keycloak/bin/kc.sh export --dir /backup/realm --realm corp --users skip
+
+# ② データベース（ユーザー、セッション、同意情報）
+pg_dump -Fc keycloak > /backup/keycloak-$(date +%F).dump
+```
+
+**③ 署名鍵**も忘れないでください。レルムごとに保持され、これが変わると**発行済みトークンがすべて検証できなくなります**。
+
+---
+
+<h2 className="slide-cont">可用性とバックアップ（続き）</h2>
+
+<Callout type="note" title="署名鍵のローテーション">
+
+署名鍵を更新する際は、**新旧の鍵を一定期間併存させます**。
+
+```text
+1. 新しい鍵を「有効」として追加（新規トークンは新鍵で署名）
+2. 古い鍵は「パッシブ」として残す（既存トークンの検証は可能）
+3. 古いトークンがすべて期限切れになったら、古い鍵を削除
+```
+
+レッスン 4 で触れた **JWKS の `kid` によるキャッシュ**が、ここで機能します。クライアントは未知の `kid` を見たら JWKS を取り直すため、正しく実装されていればローテーションは無停止で行えます。
+
+`kid` を無視して鍵を 1 つだけキャッシュしている実装があると、**ローテーションの瞬間に全リクエストが失敗**します。
+
+</Callout>
+
+---
+
+## 監査とログ
+
+```text
+Keycloak の Events:
+  Login Events      ログイン成功・失敗、ログアウト
+  Admin Events      設定変更（誰が何を変えたか）
+```
+
+**既定では無効か保持期間が短い**ことが多いので、明示的に有効化してください。運用コース レッスン 2 で扱ったとおり、外部への転送まで含めて設計します。
+
+```text
+有効化する項目:
+  ・Login Events（失敗も含む）— 総当たり攻撃の検知
+  ・Admin Events（Include representation 付き）— 設定変更の追跡
+  ・保持期間の設定
+  ・外部のログ基盤への転送
+```
+
+---
+
+## まとめ
+
+- IdP に集約する最大の実務価値は**退職者の即時遮断**と MFA の一元化
+- **master レルムは管理用**。業務用レルムを別に作る。部署でレルムを分けない
+- **redirect URI にワイルドカードを使わない**
+- 既存 AD が正なら **`READ_ONLY`** で連携する。`WRITABLE` は書き戻しの事故を招く
+- バインド用サービスアカウントは**読み取り専用**にする
+- **アプリは LDAP グループではなくロールを見る**。組織変更を吸収できる
+- オンプレでは **証明書・DNS（issuer の一致）・時刻同期**が前提条件になる
+- **IdP の可用性は実質 DB の可用性**。単一障害点になることを設計に織り込む
+- 署名鍵は**新旧併存でローテーション**する。`kid` を無視する実装があると全断する
+- ログイン/管理イベントは**明示的に有効化**して外部へ転送する
+
+---
+
+<Quiz
+  id="q1"
+  question="既存の Active Directory を正本として Keycloak の User Federation を設定します。Edit mode の選択として適切なものと、その理由はどれですか。"
+  options={[
+    "WRITABLE。Keycloak から一元管理できるため",
+    "READ_ONLY。AD が人事システムなど他の正本と連携している場合、Keycloak 側の操作が AD に書き戻されると影響範囲が広がり事故になるため",
+    "UNSYNCED。同期のオーバーヘッドがないため",
+    "どれを選んでも動作に違いはない"
+  ]}
+  answer={1}
+  explanation="WRITABLE にすると Keycloak での変更（パスワード変更、ユーザー削除など）が AD に書き戻されます。AD が人事システムや他システムと連携している環境では、その変更が想定外の範囲まで波及します。既存のディレクトリが正本であるなら READ_ONLY にして Keycloak は認証の窓口に徹させるのが安全です。併せて、バインド用のサービスアカウントにも読み取り権限のみを付与し、管理者アカウントの流用は避けるべきです。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Keycloak の署名鍵をローテーションしたところ、一部のアプリケーションで既存のトークンがすべて検証エラーになりました。そのアプリの実装上の問題はどれですか。"
+  options={[
+    "JWKS を毎回取得していた",
+    "JWT ヘッダの kid を見ずに公開鍵を 1 つだけキャッシュしていたため、新しい鍵で署名されたトークンを検証できなかった",
+    "aud の検証を行っていなかった",
+    "有効期限の検証が厳しすぎた"
+  ]}
+  answer={1}
+  explanation="署名鍵のローテーションでは新旧の鍵を併存させ、JWKS には複数の鍵が kid 付きで公開されます。クライアントは JWT ヘッダの kid に対応する鍵を選んで検証し、未知の kid を見たら JWKS を取り直すのが正しい実装です。kid を無視して鍵を 1 つだけキャッシュしていると、ローテーションの瞬間から検証に失敗します。多くの標準ライブラリはこの挙動を備えているため、自前実装を避けるのが確実です。"
+/>

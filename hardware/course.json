@@ -1,0 +1,9 @@
+{
+  "title": "サーバーハードウェア",
+  "subtitle": "Hardware",
+  "description": "CPU・メモリ階層・ストレージ・PCIe・BMC といった物理層の仕組み。OS の挙動やベンチマークの数字が「なぜその値になるか」を説明できるようにします。",
+  "order": 3,
+  "accent": "hardware",
+  "level": "基礎 → 実務",
+  "status": "ready"
+}

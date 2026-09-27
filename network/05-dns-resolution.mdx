@@ -1,0 +1,289 @@
+---
+title: 名前解決の経路と DNS の落とし穴
+description: dig では引けるのにアプリが解決できない、という食い違いの原因を nsswitch と resolv.conf から説明できるようにします。
+order: 5
+minutes: 16
+tags: ["DNS", "nsswitch", "resolv.conf", "systemd-resolved", "TTL"]
+objectives:
+  - dig と getent で結果が異なる理由を説明できる
+  - search ドメインと ndots が引き起こす余計なクエリを理解できる
+  - アプリケーション側の DNS キャッシュが障害を長引かせる仕組みを説明できる
+references:
+  - label: "nsswitch.conf(5) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man5/nsswitch.conf.5.html"
+  - label: "resolv.conf(5) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man5/resolv.conf.5.html"
+  - label: "systemd-resolved.service(8)"
+    url: "https://www.freedesktop.org/software/systemd/man/latest/systemd-resolved.service.html"
+---
+
+## 名前解決は DNS だけではない
+
+「名前解決 = DNS」と考えていると、必ずどこかでつまずきます。Linux の名前解決は **NSS**（Name Service Switch）という仕組みで、複数の情報源を順に試します。
+
+```bash
+grep '^hosts' /etc/nsswitch.conf
+```
+
+```text
+hosts: files dns myhostname
+        ↑     ↑
+        │     └─ /etc/resolv.conf を使って DNS に問い合わせる
+        └─ /etc/hosts を先に見る
+```
+
+順序が重要です。`files` が先にあるため、**`/etc/hosts` に書かれていれば DNS には一切問い合わせません**。
+
+<Callout type="pitfall" title="dig では引けるのに、アプリが違う IP に繋ぐ">
+
+これが最も多い食い違いの原因です。
+
+- **`dig` / `nslookup`** … NSS を**通らず**、`/etc/resolv.conf` の DNS サーバーへ直接問い合わせる
+- **アプリケーション**（`getaddrinfo()` を使う通常のプログラム）… **NSS を通る**ので `/etc/hosts` が優先される
+
+```bash
+# NSS を通した結果（アプリと同じ経路）— こちらで検証する
+getent hosts api.example.com
+getent ahosts api.example.com     # IPv4/IPv6 の両方と順序が見える
+
+# DNS サーバーへの直接問い合わせ（サーバー側の応答を確認する用途）
+dig api.example.com +short
+```
+
+**アプリの挙動を調べるときは `getent` を使ってください。** `dig` の結果が正しくても、`/etc/hosts` に古いエントリが残っていればアプリはそちらを見ます。
+
+</Callout>
+
+---
+
+## resolv.conf と search ドメイン
+
+```bash
+cat /etc/resolv.conf
+```
+
+```text
+nameserver 10.0.0.53
+nameserver 10.0.0.54
+search corp.example.com example.com
+options timeout:2 attempts:2 ndots:1
+```
+
+| 項目 | 意味 |
+| --- | --- |
+| `nameserver` | 問い合わせ先。**最大 3 つまで**（それ以降は無視される） |
+| `search` | 短い名前に補完するドメイン。上から順に試す |
+| `timeout` | 1 台あたりの待ち時間（既定 5 秒） |
+| `attempts` | 全 nameserver を何巡するか（既定 2） |
+| `ndots` | 名前に含まれるドットがこの数未満なら、**先に search を試す** |
+
+### ndots の挙動
+
+`ndots:1` で `api` を引く場合（ドット 0 個 < 1）:
+
+```text
+1. api.corp.example.com  を問い合わせ
+2. api.example.com       を問い合わせ
+3. api                   を問い合わせ
+```
+
+**1 回の解決で最大 3 往復**します。`search` が多いほど遅くなります。
+
+---
+
+<h2 className="slide-cont">resolv.conf と search ドメイン（続き）</h2>
+
+<Callout type="warning" title="Kubernetes の ndots:5">
+
+Kubernetes の Pod では既定で `ndots:5` が設定されます。これにより、`api.example.com`（ドット 2 個 < 5）のような**完全に外部の FQDN でも、先に search ドメインが試されます**。
+
+```text
+api.example.com.default.svc.cluster.local   ← NXDOMAIN
+api.example.com.svc.cluster.local           ← NXDOMAIN
+api.example.com.cluster.local               ← NXDOMAIN
+api.example.com                             ← ようやく正解
+```
+
+**外部 API を呼ぶたびに 4 倍のクエリ**が飛びます。クラスタ DNS の負荷が跳ね上がり、レイテンシも悪化します。
+
+対処は末尾にドットを付けて FQDN であることを明示するか、Pod 側で `dnsConfig` の `ndots` を下げることです。
+
+```text
+api.example.com.        ← 末尾のドットで search をスキップ
+```
+
+</Callout>
+
+<Callout type="field">
+
+**`timeout` の既定 5 秒は長すぎます。** 1 台目の DNS サーバーが応答しない場合、既定（`timeout:5, attempts:2`、nameserver 2 台）では最悪 20 秒待たされます。
+
+アプリケーションのタイムアウトがそれより短ければ、「DNS が原因なのに、アプリのタイムアウトエラーとして記録される」という分かりにくい障害になります。
+
+```text
+options timeout:2 attempts:2
+```
+
+に下げておくと、切り替わりが早くなります。
+
+</Callout>
+
+---
+
+## systemd-resolved がいる場合
+
+多くの新しいディストリビューションでは `systemd-resolved` が動いており、`/etc/resolv.conf` の中身が変わります。
+
+```text
+nameserver 127.0.0.53
+options edns0 trust-ad
+```
+
+`127.0.0.53` はローカルのスタブリゾルバです。**実際の上流 DNS サーバーはここには書かれていません。**
+
+```bash
+# 実際に使われている上流サーバーと、インターフェースごとの設定
+resolvectl status
+
+# systemd-resolved のキャッシュを通した問い合わせ
+resolvectl query api.example.com
+
+# キャッシュを消す（DNS レコードを変更した直後の検証に必須）
+sudo resolvectl flush-caches
+
+# 統計（キャッシュヒット率、失敗数）
+resolvectl statistics
+```
+
+<Callout type="note">
+
+`systemd-resolved` はネガティブキャッシュ（NXDOMAIN の結果）も保持します。**まだ作成していないレコードを引いてしまうと、その「存在しない」結果がキャッシュされます。**
+
+レコードを追加した直後に解決できない場合、`resolvectl flush-caches` を実行してから再確認してください。「作ったのに引けない」の相当数はこれです。
+
+</Callout>
+
+---
+
+## dig の読み方
+
+```bash
+dig api.example.com
+
+# 権威サーバーに直接聞く（キャッシュの影響を排除する）
+dig @ns1.example.com api.example.com
+
+# ルートから順に辿る（委任のどこで壊れているかが分かる）
+dig +trace api.example.com
+
+# 応答時間だけ見る
+dig api.example.com | grep 'Query time'
+```
+
+```text
+;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0
+                ↑
+;; ANSWER SECTION:
+api.example.com.    287    IN    A    203.0.113.10
+                     ↑
+                     残り TTL（秒）。毎回減っていればキャッシュされている
+
+;; Query time: 2 msec
+;; SERVER: 10.0.0.53#53(10.0.0.53)
+```
+
+| フラグ | 意味 |
+| --- | --- |
+| `aa` | 権威応答（そのゾーンを持つサーバーからの直接の答え） |
+| `ra` | 再帰問い合わせが可能 |
+| `rd` | 再帰を要求した |
+
+`status: NXDOMAIN` はレコードが存在しない、`status: SERVFAIL` はサーバー側の失敗（DNSSEC 検証エラー、上流への到達不能など）です。この 2 つは原因がまったく違うので、区別してください。
+
+---
+
+## TTL とアプリ側キャッシュ
+
+DNS レコードの TTL は「この秒数はキャッシュしてよい」という指示です。IP アドレスを切り替える作業では、**事前に TTL を短くしておく**のが定石です。
+
+```text
+切替の 1 週間前 : TTL を 3600 → 60 に下げる（旧 TTL が切れるのを待つ必要がある）
+切替当日        : レコードを変更。60 秒で伝播
+切替の完了後    : TTL を元に戻す
+```
+
+<Callout type="pitfall" title="アプリが TTL を無視する">
+
+DNS 側で TTL を 60 秒にしても、**アプリケーションが独自にキャッシュしていれば意味がありません**。
+
+- **JVM**: `networkaddress.cache.ttl` の設定次第で、解決結果を長期間、場合によっては**プロセスが終わるまで**保持します。切り替え作業の前に、この値が明示設定されているか必ず確認してください
+- **コネクションプール**: 既に確立済みの接続は、DNS が変わっても張り替わりません。新規接続時にしか解決は行われません
+- **一部の HTTP クライアント**: 独自の DNS キャッシュ層を持つものがあります
+
+「DNS を切り替えたのに古いサーバーへのアクセスが続く」という状況では、**DNS ではなくアプリ側を調べてください**。最終的にプロセスの再起動でしか解消しないこともあります。
+
+</Callout>
+
+---
+
+## 障害時の切り分け手順
+
+```bash
+# ① アプリと同じ経路で解決できるか（NSS 経由）
+getent hosts api.example.com
+
+# ② /etc/hosts に邪魔なエントリがないか
+grep api.example.com /etc/hosts
+
+# ③ DNS サーバー自体は答えられるか
+dig @10.0.0.53 api.example.com
+
+# ④ 権威サーバーは正しい値を持っているか（キャッシュを排除）
+dig +trace api.example.com
+
+# ⑤ そもそも DNS サーバーへ到達できるか
+ss -u -a | grep :53
+nc -zvu 10.0.0.53 53
+```
+
+① と ③ の結果が食い違えば `/etc/hosts` か NSS の設定、③ と ④ が食い違えばキャッシュ、④ で失敗すれば権威サーバーかゾーンの設定、という切り分けになります。
+
+---
+
+## まとめ
+
+- 名前解決は NSS 経由。**`/etc/hosts` が DNS より先に見られる**
+- **`dig` は NSS を通らない。アプリの挙動の検証は `getent`** を使う
+- `search` と `ndots` の組み合わせで、1 回の解決が複数往復になる
+- Kubernetes の `ndots:5` は外部 FQDN の解決を 4 倍に膨らませる
+- `systemd-resolved` 環境では `/etc/resolv.conf` に上流が書かれていない。`resolvectl status` を見る
+- ネガティブキャッシュがあるため、レコード追加直後は `flush-caches` してから検証する
+- **TTL を短くしてもアプリが独自キャッシュを持っていれば効かない**
+
+<Quiz
+  id="q1"
+  question="dig api.example.com は正しい新 IP を返すのに、サーバー上のアプリケーションは古い IP に接続し続けます。まず確認すべきものはどれですか。"
+  options={[
+    "DNS サーバーのゾーンファイル",
+    "/etc/hosts に該当エントリが残っていないか（getent hosts で NSS 経由の結果を確認する）",
+    "ファイアウォールの設定",
+    "TCP の keepalive 設定"
+  ]}
+  answer={1}
+  explanation="dig は NSS を通らず DNS サーバーへ直接問い合わせますが、通常のアプリケーションは getaddrinfo() 経由で NSS を通ります。nsswitch.conf の hosts 行は files dns の順なので、/etc/hosts にエントリがあれば DNS より優先されます。アプリと同じ経路で検証するには getent hosts を使います。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="移行のため DNS の TTL を 60 秒に下げてレコードを切り替えました。大半のクライアントは新サーバーに向きましたが、ある Java アプリケーションだけ数時間経っても旧サーバーへ接続し続けています。原因として最も可能性が高いものはどれですか。"
+  options={[
+    "DNS サーバーのキャッシュが残っている",
+    "JVM の DNS キャッシュ設定（networkaddress.cache.ttl）により、解決結果がプロセス内に長期保持されている",
+    "TTL の設定が反映されていない",
+    "クライアントの nsswitch.conf が誤っている"
+  ]}
+  answer={1}
+  explanation="JVM は解決結果を独自にキャッシュし、設定によっては非常に長い期間、場合によってはプロセスの生存期間中ずっと保持します。DNS 側で TTL をいくら短くしても、アプリがそれを尊重しなければ効果がありません。加えて既存のコネクションプールは張り替わらないため、最終的にプロセスの再起動が必要になることもあります。切り替え作業の前に、この設定を確認しておくのが定石です。"
+/>

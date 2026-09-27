@@ -1,0 +1,9 @@
+{
+  "title": "AI 基盤",
+  "subtitle": "AI Infrastructure",
+  "description": "GPU を並べただけでは学習は速くなりません。InfiniBand によるノード間通信、NCCL のチューニング、データを供給するストレージ、そして Kubernetes でのジョブ運用まで、GPU を実際に使い切るための層を扱います。",
+  "order": 7,
+  "accent": "ai",
+  "level": "実務",
+  "status": "ready"
+}

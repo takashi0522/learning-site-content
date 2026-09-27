@@ -1,0 +1,150 @@
+{
+  "id": "gpu-network",
+  "title": "GPU クラスタのネットワーク",
+  "subtitle": "なぜ 1 本ではなく 4 本引くのか",
+  "goal": "GPU クラスタのネットワークが用途ごとに分かれていること、計算ファブリックが別格の要件を持つこと、そしてレール最適化が何を短くしているのかを確かめる。",
+  "minutes": 14,
+  "status": "ready",
+  "mode": "walk",
+  "accent": "ai",
+  "intro": {
+    "title": "はじめに — GPU クラスタのネットワークは 1 本ではない",
+    "body": [
+      "一般的なサーバーなら、ネットワークは「業務用」と「管理用」の 2 本もあれば足ります。GPU クラスタはそうなりません。NVIDIA の DGX BasePOD を例にすると、引くネットワークは 4 本です。",
+      "ibnet … 計算ファブリック。GPU 同士の集合通信（All-Reduce など）だけが流れます。BasePOD A100 世代では ConnectX-6 と Quantum QM8700 による HDR 200Gbps の InfiniBand でした。",
+      "internalnet … クラスタ内で閉じたネットワーク。ストレージと帯域内管理が流れます。Ethernet で、100Gbps を 2 ポート束ねる構成です。",
+      "externalnet … 社内ネットワークなど外部との接続。こちらも 100Gbps Ethernet。",
+      "ipminet … 帯域外管理。各ノードの BMC を繋ぎます。1Gbps の Ethernet で十分です。",
+      "速度が 200Gbps から 1Gbps まで 200 倍開いていることに注目してください。1 本にまとめないのは、単に速度が違うからではなく、要求される性質がまったく違うからです。以下でそれを 1 つずつ確かめます。",
+      "なお、これは RA の記述ではなく教材としての見立てですが、計算ファブリックが NVIDIA（InfiniBand なら Quantum、Ethernet なら Spectrum）でも、Ethernet 側に別のベンダーを検討する余地はあると考えられます。実際に組めるかは各製品の資料で確かめてください。"
+    ]
+  },
+  "rowLabels": [
+    { "label": "スパイン", "sub": "レールをまたぐとき" },
+    { "label": "リーフ", "sub": "レール 1〜4" },
+    { "label": "GPU の NIC", "sub": "ノード 1 / 2" }
+  ],
+  "nodes": [
+    { "id": "spine-1", "row": 0, "x": 250, "w": 180, "kind": "spine", "label": "スパイン 1" },
+    { "id": "spine-2", "row": 0, "x": 580, "w": 180, "kind": "spine", "label": "スパイン 2" },
+    { "id": "leaf-1", "row": 1, "x": 130, "w": 150, "kind": "leaf", "label": "リーフ 1", "sub": "レール 1" },
+    { "id": "leaf-2", "row": 1, "x": 320, "w": 150, "kind": "leaf", "label": "リーフ 2", "sub": "レール 2" },
+    { "id": "leaf-3", "row": 1, "x": 510, "w": 150, "kind": "leaf", "label": "リーフ 3", "sub": "レール 3" },
+    { "id": "leaf-4", "row": 1, "x": 700, "w": 150, "kind": "leaf", "label": "リーフ 4", "sub": "レール 4" },
+    { "id": "n1g1", "row": 2, "x": 120, "w": 82, "kind": "host", "label": "GPU 1", "sub": "ノード1" },
+    { "id": "n1g2", "row": 2, "x": 214, "w": 82, "kind": "host", "label": "GPU 2", "sub": "ノード1" },
+    { "id": "n1g3", "row": 2, "x": 308, "w": 82, "kind": "host", "label": "GPU 3", "sub": "ノード1" },
+    { "id": "n1g4", "row": 2, "x": 402, "w": 82, "kind": "host", "label": "GPU 4", "sub": "ノード1" },
+    { "id": "n2g1", "row": 2, "x": 496, "w": 82, "kind": "host", "label": "GPU 1", "sub": "ノード2" },
+    { "id": "n2g2", "row": 2, "x": 590, "w": 82, "kind": "host", "label": "GPU 2", "sub": "ノード2" },
+    { "id": "n2g3", "row": 2, "x": 684, "w": 82, "kind": "host", "label": "GPU 3", "sub": "ノード2" },
+    { "id": "n2g4", "row": 2, "x": 778, "w": 82, "kind": "host", "label": "GPU 4", "sub": "ノード2" }
+  ],
+  "links": [
+    { "from": "leaf-1", "to": "spine-1", "id": "l1-s1" },
+    { "from": "leaf-1", "to": "spine-2", "id": "l1-s2" },
+    { "from": "leaf-2", "to": "spine-1", "id": "l2-s1" },
+    { "from": "leaf-2", "to": "spine-2", "id": "l2-s2" },
+    { "from": "leaf-3", "to": "spine-1", "id": "l3-s1" },
+    { "from": "leaf-3", "to": "spine-2", "id": "l3-s2" },
+    { "from": "leaf-4", "to": "spine-1", "id": "l4-s1" },
+    { "from": "leaf-4", "to": "spine-2", "id": "l4-s2" },
+    { "from": "n1g1", "to": "leaf-1", "id": "n1g1-l1" },
+    { "from": "n1g2", "to": "leaf-2", "id": "n1g2-l2" },
+    { "from": "n1g3", "to": "leaf-3", "id": "n1g3-l3" },
+    { "from": "n1g4", "to": "leaf-4", "id": "n1g4-l4" },
+    { "from": "n2g1", "to": "leaf-1", "id": "n2g1-l1" },
+    { "from": "n2g2", "to": "leaf-2", "id": "n2g2-l2" },
+    { "from": "n2g3", "to": "leaf-3", "id": "n2g3-l3" },
+    { "from": "n2g4", "to": "leaf-4", "id": "n2g4-l4" }
+  ],
+  "steps": [
+    {
+      "id": "s1",
+      "at": "leaf-1",
+      "prompt": "GPU ノードを 1 台ラックに載せました。ネットワークケーブルを何系統つなぐ必要がありますか。図に出ているのは、そのうち 1 系統（計算ファブリック）だけです。",
+      "options": [
+        { "label": "1 系統。速いネットワークが 1 本あれば、全部そこに流せばよい", "hint": "BMC は OS が動いていないときに使うものです。OS が使うネットワークに相乗りさせると、いちばん必要なときに届きません。" },
+        { "label": "2 系統。業務用と管理用に分ける", "hint": "普通のサーバーならそれで足ります。GPU クラスタでは、計算とストレージを同じ線に流すかどうかという判断がもう 1 つ増えます。" },
+        { "label": "4 系統。計算・ストレージと帯域内管理・外部接続・帯域外管理", "correct": true, "hint": "" }
+      ],
+      "explain": "DGX BasePOD の A100 世代の構成でいうと、ibnet（計算ファブリック）、internalnet（ストレージと帯域内管理）、externalnet（外部接続）、ipminet（BMC 用の帯域外管理）の 4 系統です（internalnet と externalnet は同じボンドの上に VLAN で乗る、論理的な分け方）。速度は 200Gbps の InfiniBand から 1Gbps の Ethernet まで開きます。用途ごとに要求が違うので、まとめようとすると一番厳しい要求に全部を合わせることになり、割に合いません。"
+    },
+    {
+      "id": "s2",
+      "at": "leaf-2",
+      "path": ["n1g2-l2", "l2-s1"],
+      "prompt": "計算ファブリックのオーバーサブスクリプション比を決めます。サーバー向けのリーフ・スパインでは、3:1 の設計例がよく示されます。GPU の計算ファブリックはどうしますか。",
+      "options": [
+        { "label": "3:1。サーバー用のファブリックと同じでよい", "hint": "3:1 はサーバー向けの設計例です。PyTorch の DDP によるデータ並列の学習では、毎イテレーション全プロセスが勾配の allreduce に参加します。" },
+        { "label": "1:1（ノンブロッキング）", "correct": true, "hint": "" },
+        { "label": "10:1。GPU は計算しているあいだ通信しないので、細くてよい", "hint": "1 ステップごとに勾配の All-Reduce が入ります。PyTorch の DDP では、逆伝播の計算と重ねて allreduce を行います。計算しているあいだも通信は起きています。" }
+      ],
+      "explain": "分散学習では、1 ステップごとに全 GPU が同時に All-Reduce します。全台が同時に全力で通信する前提なので、細らせた分がそのまま学習時間に乗ります。計算ファブリックはノンブロッキング（1:1）で設計するのが基本です。高価な GPU を通信待ちで遊ばせないためのコストと考えます。"
+    },
+    {
+      "id": "s3",
+      "at": "leaf-1",
+      "prompt": "帯域外管理（BMC）は 1Gbps しか要りません。もったいないので、計算ファブリックに相乗りさせてはどうか、と提案されました。",
+      "options": [
+        { "label": "相乗りさせてよい。帯域は余っている", "hint": "帯域の問題ではありません。BMC を使う場面を思い出してください。" },
+        { "label": "独立させる。BMC は OS も計算ファブリックも死んでいるときに使うもの", "correct": true, "hint": "" },
+        { "label": "相乗りさせたうえで、VLAN で分ければよい", "hint": "VLAN で分けても、物理のスイッチや配線が同じなら、そこが壊れたときに一緒に落ちます。" }
+      ],
+      "explain": "BMC に用があるのは、OS が固まった、ネットワークが落ちた、電源を落としたい、という場面です。その経路が本番のネットワークと運命を共にしていたら、いちばん必要なときに届きません。だから ipminet は物理的に別のスイッチ（BasePOD では SN2201 のような安価な 1G スイッチ）で組みます。安いのは手を抜いているからではなく、そこに速度が要らないからです。"
+    },
+    {
+      "id": "s4",
+      "at": "leaf-1",
+      "path": ["n1g1-l1", "n2g1-l1"],
+      "prompt": "計算ファブリックの配線に入ります。各ノードには GPU ごとに NIC があります。ノード 1 の GPU 1 と、ノード 2 の GPU 1 は、どのリーフに繋ぎますか。",
+      "options": [
+        { "label": "ノードごとにまとめる。ノード 1 の 4 つは全部リーフ 1 へ", "hint": "それだとノード 1 の全 GPU がリーフ 1 の 1 台に集中し、そのリーフが落ちるとノードが丸ごと孤立します。" },
+        { "label": "GPU の番号ごとにまとめる。全ノードの GPU 1 が同じリーフへ", "correct": true, "hint": "" },
+        { "label": "空いているポートに順に繋いでいけばよい", "hint": "繋ぎ方で経路の長さが変わります。順不同だと、後で述べる短絡が効かなくなります。" }
+      ],
+      "explain": "これがレール最適化（rail-optimized）です。同じ GPU 番号の NIC を、全ノードで同じリーフに集めます。この「GPU 番号ごとの束」を 1 本のレールと呼びます。図の線が斜めに交差しているのは、ノード 2 の GPU 1 がノード 1 の GPU 1 と同じリーフ 1 へ向かっているからです。"
+    },
+    {
+      "id": "s5",
+      "at": "leaf-1",
+      "path": ["n1g1-l1", "n2g1-l1"],
+      "prompt": "ノード 1 の GPU 1 と、ノード 2 の GPU 1 が通信します。この通信はスパインを通りますか。",
+      "options": [
+        { "label": "通らない。同じリーフに繋がっているので、リーフの中で折り返す", "correct": true, "hint": "" },
+        { "label": "通る。ノードが違うので必ず上位へ上がる", "hint": "上がるかどうかを決めるのは「ノードが違うか」ではなく「同じスイッチに繋がっているか」です。" },
+        { "label": "スパインを 2 台とも通る", "hint": "1 つのフローが複数の経路を同時に使うことはありません。" }
+      ],
+      "explain": "これがレール最適化の効き目です。NCCL の集合通信の多くは「同じ GPU 番号どうし」で行われるため、その通信がリーフ 1 台の中で完結します。スパインを通らないぶん、ホップが減り、レイテンシが下がり、スパインの帯域も空きます。ノードごとにまとめて配線していたら、同じ通信が毎回スパインまで上がっていました。"
+    },
+    {
+      "id": "s6",
+      "at": "spine-1",
+      "path": ["n1g1-l1", "l1-s1", "l2-s1", "n2g2-l2"],
+      "prompt": "では、ノード 1 の GPU 1 とノード 2 の GPU 2 が通信する場合はどうですか。",
+      "options": [
+        { "label": "レールが違うので、スパインを経由する", "correct": true, "hint": "" },
+        { "label": "これもリーフの中で折り返す", "hint": "GPU 1 はリーフ 1、GPU 2 はリーフ 2 に繋がっています。別のスイッチです。" },
+        { "label": "この組み合わせは通信できない", "hint": "通信はできます。経路が長くなるだけです。" }
+      ],
+      "explain": "レールをまたぐ通信は、リーフからスパインへ上がって別のリーフへ降ります。レール最適化は「レールをまたぐ通信をなくす」仕組みではなく、「頻度の高い通信をレール内に収める」仕組みです。だからスパインは要りますし、そこもノンブロッキングで組みます。NCCL がトポロジを見て通信パターンを決めるのは、この差を使うためです。"
+    }
+  ],
+  "summary": [
+    "GPU クラスタのネットワークは 4 本。計算・ストレージと帯域内管理・外部接続・帯域外管理",
+    "速度は 200Gbps から 1Gbps まで開く。まとめないのは速度差ではなく、要求される性質が違うから",
+    "計算ファブリックはノンブロッキング（1:1）で組む。PyTorch の DDP によるデータ並列では、毎イテレーション全プロセスが allreduce に参加するため",
+    "BMC 用の帯域外管理は物理的に独立させる。本番と運命を共にすると、必要なときに届かない",
+    "レール最適化 = 全ノードの同じ GPU 番号を同じリーフに集める。頻度の高い通信がリーフ内で完結する",
+    "レールをまたぐ通信はスパインを通る。だからスパイン側もノンブロッキングで組む",
+    "系統が分かれていれば、Ethernet 側に別のベンダーを検討する余地はある（RA の記述ではなく教材としての見立て。実際は製品の資料で確かめる）"
+  ],
+  "next": [
+    { "label": "AI 基盤コース レッスン 2 — InfiniBand と RoCE", "href": "/courses/ai/infiniband/" },
+    { "label": "AI 基盤コース レッスン 3 — NCCL のチューニング", "href": "/courses/ai/nccl-tuning/" },
+    { "label": "GPU コース レッスン 3 — 複数 GPU とインターコネクト", "href": "/courses/gpu/multi-gpu-interconnect/" },
+    { "label": "NVIDIA DGX BasePOD — Architecture（ネットワーク 4 系統の定義）", "href": "https://docs.nvidia.com/dgx-basepod/deployment-guides/dgx-basepod-a100/latest/architecture.html" },
+    { "label": "NVIDIA NVL72 AI Factory — Network Logical Architecture（レール最適化）", "href": "https://docs.nvidia.com/enterprise-reference-architectures/nvl72-ai-factory/latest/network-logical-architecture.html" },
+    { "label": "NVIDIA DGX SuperPOD — Architecture", "href": "https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/dgx-superpod-architecture.html" }
+  ]
+}

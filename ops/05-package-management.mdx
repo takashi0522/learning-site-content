@@ -1,0 +1,353 @@
+---
+title: パッケージ管理と更新戦略
+description: dnf / apt の実務的な使い方と、更新で壊さないためのバージョン固定・ロールバックの手順をまとめます。
+order: 5
+minutes: 16
+tags: ["dnf", "apt", "yum", "kernel", "versionlock"]
+objectives:
+  - 更新の前に「何が変わるか」を確認できる
+  - 特定パッケージのバージョンを固定し、意図しない更新を防げる
+  - カーネル更新後の再起動要否を判断できる
+references:
+  - label: "dnf(8) — DNF Command Reference"
+    url: "https://dnf.readthedocs.io/en/latest/command_ref.html"
+  - label: "apt(8) — Linux manual page"
+    url: "https://manpages.debian.org/stable/apt/apt.8.en.html"
+  - label: "Red Hat Enterprise Linux Documentation"
+    url: "https://docs.redhat.com/"
+---
+
+## 更新の前に確認する
+
+`dnf update -y` をいきなり打つのは、本番サーバーでは避けたい操作です。**何が変わるかを先に見ます。**
+
+### RHEL 系 (dnf / yum)
+
+```bash
+# 更新可能なパッケージの一覧（実行はしない）
+dnf check-update
+
+# セキュリティ更新だけを一覧
+dnf updateinfo list security
+
+# セキュリティ更新だけを適用
+sudo dnf update --security
+
+# 特定パッケージだけ更新
+sudo dnf update nginx
+
+# 何が起きるかを詳しく見る（依存関係の変化を含む）
+dnf update --assumeno
+```
+
+### Debian 系 (apt)
+
+---
+
+<h2 className="slide-cont">更新の前に確認する（続き）</h2>
+
+```bash
+# パッケージ情報を更新（この時点では何もインストールされない）
+sudo apt update
+
+# 更新可能な一覧
+apt list --upgradable
+
+# 適用（新規パッケージの追加・削除は行わない安全側）
+sudo apt upgrade
+
+# 依存関係の変化に伴う削除も許可する（慎重に）
+sudo apt full-upgrade
+
+# シミュレーション
+sudo apt -s upgrade
+```
+
+<Callout type="pitfall">
+
+`apt upgrade` と `apt full-upgrade`（旧 `dist-upgrade`）は挙動が違います。
+
+- **`upgrade`** … 既存パッケージの更新のみ。**削除は一切行わない**。安全側
+- **`full-upgrade`** … 依存関係の解決のために**既存パッケージを削除することがある**
+
+本番で `full-upgrade` を打つ前に、必ず `-s` で何が削除されるかを確認してください。想定外のパッケージが消えることがあります。
+
+</Callout>
+
+---
+
+## 変更履歴を追う
+
+「いつ何を入れたか」は、障害調査で頻繁に必要になります。
+
+```bash
+# RHEL 系: トランザクション履歴
+sudo dnf history
+sudo dnf history info 42          # 特定トランザクションの詳細
+sudo dnf history list nginx       # 特定パッケージの履歴
+
+# Debian 系
+less /var/log/apt/history.log
+zless /var/log/apt/history.log.1.gz
+grep ' install \| upgrade ' /var/log/dpkg.log
+```
+
+<Callout type="field">
+
+**「昨日まで動いていたのに」の調査で最初に見る場所の一つです。**
+
+```bash
+# 直近の更新を時系列で（RHEL 系）
+sudo dnf history list | head
+
+# 直近の更新（Debian 系）
+grep -E '^(Start-Date|Commandline|Upgrade)' /var/log/apt/history.log | tail -20
+```
+
+障害発生時刻の直前に更新が走っていれば、それが第一容疑者です。自動更新（`dnf-automatic` / `unattended-upgrades`）が有効な環境では、**誰も操作していなくても更新が入ります**。
+
+</Callout>
+
+### ロールバック
+
+RHEL 系にはトランザクション単位の取り消し機能があります。
+
+---
+
+<h2 className="slide-cont">変更履歴を追う（続き）</h2>
+
+```bash
+# 直前のトランザクションを取り消す
+sudo dnf history undo last
+
+# 特定のトランザクションを取り消す
+sudo dnf history undo 42
+```
+
+Debian 系には同等の機能がないため、**バージョンを明示して戻します**。
+
+```bash
+# 利用可能なバージョンを確認
+apt-cache policy nginx
+apt list -a nginx
+
+# バージョン指定でインストール（=ダウングレード）
+sudo apt install nginx=1.24.0-2ubuntu7
+```
+
+<Callout type="warning">
+
+**ダウングレードは常に成功するとは限りません。** 設定ファイルの書式が変わっていたり、データベースのスキーマが更新されていたりすると、古いバージョンでは起動しません。
+
+特にデータベースやミドルウェアでは、**更新前のバックアップがロールバックの前提**になります。パッケージのダウングレードだけで戻せると考えないでください。
+
+</Callout>
+
+---
+
+## バージョンを固定する
+
+「このパッケージだけは勝手に上げたくない」という要件は頻繁にあります。
+
+### RHEL 系
+
+```bash
+# プラグインを入れる（RHEL 8 以降は標準で入っていることが多い）
+sudo dnf install python3-dnf-plugin-versionlock
+
+# 固定する
+sudo dnf versionlock add nginx
+sudo dnf versionlock list
+
+# 解除
+sudo dnf versionlock delete nginx
+```
+
+一時的に除外するだけなら、オプションでも指定できます。
+
+```bash
+sudo dnf update --exclude=kernel*
+```
+
+恒久化する場合は `/etc/dnf/dnf.conf` に書きます。
+
+```text
+[main]
+exclude=kernel* nginx
+```
+
+### Debian 系
+
+---
+
+<h2 className="slide-cont">バージョンを固定する（続き）</h2>
+
+```bash
+# 固定（hold）
+sudo apt-mark hold nginx
+apt-mark showhold
+
+# 解除
+sudo apt-mark unhold nginx
+```
+
+<Callout type="pitfall">
+
+**固定したことを忘れると、セキュリティ更新も止まります。**
+
+`apt-mark showhold` や `dnf versionlock list` を定期確認の項目に入れておかないと、「更新しているつもりで、その一本だけ何年も古いまま」という状態が生まれます。
+
+固定する場合は、**なぜ固定したか・いつ見直すか**を記録に残してください。設定ファイルにコメントを書いておくのが手軽です。
+
+</Callout>
+
+---
+
+## カーネル更新と再起動の判断
+
+カーネルの更新は、**再起動するまで有効になりません**。
+
+```bash
+# 今動いているカーネル
+uname -r
+
+# インストール済みのカーネル一覧
+rpm -q kernel                     # RHEL 系
+dpkg -l | grep linux-image        # Debian 系
+```
+
+`uname -r` の結果と最新のインストール済みバージョンが食い違っていれば、**再起動待ちの状態**です。
+
+```bash
+# RHEL 系: 再起動が必要か判定してくれる
+sudo dnf needs-restarting -r      # 終了コード 1 なら再起動が必要
+sudo dnf needs-restarting         # 再起動が必要なプロセス一覧
+
+# Debian 系
+cat /var/run/reboot-required 2>/dev/null
+cat /var/run/reboot-required.pkgs 2>/dev/null
+```
+
+---
+
+<h2 className="slide-cont">カーネル更新と再起動の判断（続き）</h2>
+
+<Callout type="field">
+
+**カーネル以外でも再起動または再起動相当の対応が必要な更新があります。**
+
+`glibc` や `openssl` のような共有ライブラリを更新しても、**既に起動しているプロセスは古いライブラリをメモリに載せたまま動き続けます**。脆弱性対応で更新した場合、該当プロセスを再起動しなければ意味がありません。
+
+```bash
+# 削除済みのライブラリを掴んだままのプロセスを探す
+sudo lsof +c0 2>/dev/null | grep -i 'DEL.*lib' | awk '{print $1, $2}' | sort -u
+
+# RHEL 系ならこちらが確実
+sudo dnf needs-restarting -s      # 再起動が必要なサービス一覧
+```
+
+「更新した = 対策完了」ではありません。**プロセスの再起動までが対応です。**
+
+</Callout>
+
+### 古いカーネルの保持数
+
+カーネルは複数世代が `/boot` に残ります。`/boot` は小さいパーティションのことが多く、**溜まると更新が失敗します**。
+
+```bash
+# RHEL 系: 保持数の設定
+grep installonly_limit /etc/dnf/dnf.conf     # 既定 3
+sudo dnf remove --oldinstallonly             # 古いカーネルを削除
+
+# Debian 系: 不要になったものを削除
+sudo apt autoremove --purge
+```
+
+<Callout type="tip">
+
+問題が起きたとき、**古いカーネルで起動できることは重要な保険**です。保持数を 1 にはせず、最低 2〜3 世代は残しておいてください。
+
+GRUB のメニューから前のカーネルを選べば、カーネル更新が原因の障害から復旧できます。
+
+</Callout>
+
+---
+
+## リポジトリの管理
+
+```bash
+# 有効なリポジトリ一覧
+dnf repolist --enabled              # RHEL 系
+apt-cache policy                    # Debian 系
+ls /etc/apt/sources.list.d/
+
+# あるパッケージがどのリポジトリから来るか
+dnf info nginx | grep -i repo
+apt-cache policy nginx
+```
+
+<Callout type="warning" title="サードパーティリポジトリの優先度">
+
+複数のリポジトリが同じパッケージを提供していると、意図しない方から入ることがあります。特に、OS 標準より新しいバージョンを提供するサードパーティリポジトリを追加した場合、**関連する依存パッケージまで置き換わる**ことがあります。
+
+対策として、そのリポジトリから取るパッケージを限定します。
+
+```text
+# RHEL 系: /etc/yum.repos.d/xxx.repo に
+includepkgs=nginx nginx-module-*
+```
+
+```text
+# Debian 系: /etc/apt/preferences.d/xxx に
+Package: *
+Pin: origin repo.example.com
+Pin-Priority: 100
+
+Package: nginx
+Pin: origin repo.example.com
+Pin-Priority: 600
+```
+
+追加したリポジトリが何を上書きしうるかを、追加時に確認してください。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 更新前に `check-update` / `apt list --upgradable` で**何が変わるかを見る**
+- `apt upgrade` と `full-upgrade` は別物。後者は削除を伴う
+- 変更履歴（`dnf history` / `/var/log/apt/history.log`）は障害調査の一次情報
+- 固定は `versionlock` / `apt-mark hold`。**固定したことを記録し、定期的に見直す**
+- カーネル更新は再起動するまで効かない。`needs-restarting -r` で判定できる
+- **`glibc` や `openssl` の更新は、プロセスを再起動するまで対策が完了しない**
+- 古いカーネルは 2〜3 世代残す。復旧の保険になる
+
+<Quiz
+  id="q1"
+  question="脆弱性対応として openssl パッケージを更新し、dnf の完了を確認しました。サーバーの再起動は行っていません。この時点での状態として正しいものはどれですか。"
+  options={[
+    "更新は完了しており、追加の対応は不要",
+    "既に起動しているプロセスは古いライブラリをメモリ上に保持したままなので、該当サービスを再起動するまで脆弱性は解消していない",
+    "パッケージ更新と同時に全プロセスが自動的に再読み込みされる",
+    "カーネルの再起動が必要で、サービス単位の再起動では意味がない"
+  ]}
+  answer={1}
+  explanation="共有ライブラリはプロセス起動時にメモリへマップされるため、ファイルを更新しても既存プロセスは古いコードを実行し続けます。lsof で DEL 状態のライブラリを掴んでいるプロセスを特定するか、dnf needs-restarting -s で再起動が必要なサービスを確認し、それらを再起動して初めて対策が完了します。カーネルの更新でない限り、サーバー全体の再起動は必須ではありません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="本番サーバーで apt full-upgrade を実行しようとしています。事前に確認すべき最も重要な点はどれですか。"
+  options={[
+    "ディスクの空き容量のみ",
+    "-s オプションでシミュレーションし、依存関係の解決のために削除されるパッケージがないかを確認する",
+    "カーネルのバージョン",
+    "リポジトリの応答速度"
+  ]}
+  answer={1}
+  explanation="apt upgrade が既存パッケージの更新のみを行うのに対し、full-upgrade は依存関係を解決するために既存パッケージを削除することがあります。本番環境で想定外のパッケージが削除されるとサービス停止に直結するため、apt -s full-upgrade で削除対象を事前に確認するのが必須です。ディスク容量の確認も必要ですが、優先度はこちらが上です。"
+/>

@@ -1,0 +1,232 @@
+---
+title: ミドルウェアのプロセスモデル
+description: Web サーバーやアプリケーションサーバーの同時接続処理方式を比較し、設定値をカーネルの挙動から決められるようにします。
+order: 1
+minutes: 14
+tags: ["nginx", "epoll", "worker", "C10K", "ulimit"]
+objectives:
+  - プロセス型・スレッド型・イベント駆動型の違いと適性を説明できる
+  - nginx の worker_processes / worker_connections を根拠を持って決められる
+  - ファイル記述子の上限がどこで決まるかを追跡できる
+references:
+  - label: "epoll(7) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man7/epoll.7.html"
+  - label: "nginx documentation — Core functionality"
+    url: "https://nginx.org/en/docs/ngx_core_module.html"
+  - label: "The C10K problem (Dan Kegel)"
+    url: "http://www.kegel.com/c10k.html"
+---
+
+## 同時接続をどう捌くか
+
+1 万の同時接続を 1 台で処理する、という問題（C10K 問題）に対する答えが、ミドルウェアのプロセスモデルの違いを生みました。
+
+| 方式 | 1接続あたりのコスト | 代表例 | 性質 |
+| --- | --- | --- | --- |
+| **プロセス型** | プロセス1つ（数MB） | Apache prefork | 堅牢だが重い。1万接続は非現実的 |
+| **スレッド型** | スレッド1つ（スタック数百KB〜) | Apache worker, Tomcat | 中間。コンテキストスイッチが増える |
+| **イベント駆動型** | ソケット1つ（数KB） | nginx, Redis, Node.js | 軽いが、1つのブロッキング処理で全体が止まる |
+
+なぜプロセス型が重いのか。前半のレッスンで扱った内容がそのまま効いてきます。
+
+- プロセスごとにページテーブルと `task_struct` が必要（メモリ）
+- 実行を切り替えるたびにコンテキストスイッチが発生（CPU）
+- スケジューラが管理するタスク数が増える（レッスン2のロードアベレージにも影響）
+
+---
+
+## イベント駆動型の核: epoll
+
+イベント駆動型が軽い理由は、**「1 接続 = 1 実行単位」という対応をやめた**ことにあります。1 つのスレッドが数千のソケットを同時に監視し、実際にデータが来たものだけを処理します。
+
+その監視を担うのが `epoll` です。
+
+<Figure name="epoll-vs-poll" caption="監視数に比例して遅くなるか、準備できた数にしか比例しないか" />
+
+この差が、接続数が多いほど決定的になります。10,000 接続のうち実際にデータが来ているのが 10 個なら、`select` は 10,000 個を調べ、`epoll` は 10 個だけを返します。
+
+```bash
+# プロセスが epoll を使っているかの確認
+ls -l /proc/$(pgrep -f 'nginx: worker' | head -1)/fd/ | grep -c eventpoll
+
+# 実際のイベントループの動きを見る
+strace -p <nginx worker pid> -e trace=epoll_wait,accept4,recvfrom
+```
+
+---
+
+<h2 className="slide-cont">イベント駆動型の核: epoll（続き）</h2>
+
+<Callout type="warning" title="イベント駆動型の弱点">
+
+1 つのワーカーが多数の接続を順番に処理するため、**どこか 1 か所でブロックすると、そのワーカーが担当する全接続が待たされます。**
+
+- 同期的なディスク I/O（レッスン3の major fault がここで致命傷になる）
+- CPU を長時間占有する処理
+- 名前解決などの同期的なネットワーク呼び出し
+
+nginx が静的ファイル配信で `aio` や `sendfile` を使うのも、PHP を直接実行せず FastCGI で別プロセスに投げるのも、この弱点を避けるためです。
+
+</Callout>
+
+---
+
+## nginx の設定値を根拠から決める
+
+```nginx
+worker_processes  auto;      # ワーカープロセス数
+worker_rlimit_nofile 65536;  # ワーカーあたりのファイル記述子上限
+
+events {
+    worker_connections  4096;  # ワーカーあたりの同時接続数
+    multi_accept on;
+}
+```
+
+### worker_processes
+
+イベント駆動型では、1 ワーカーが多数の接続を処理します。増やす理由は「接続を捌くため」ではなく「**CPU コアを使い切るため**」です。
+
+`auto` は CPU コア数に合わせます。これより多くしても、コンテキストスイッチが増えるだけで得はありません。
+
+### worker_connections
+
+**この値がそのまま最大同時接続数になるわけではありません。**
+
+```text
+理論上の最大クライアント接続数 = worker_processes × worker_connections
+
+ただしリバースプロキシとして動作する場合、1 クライアント接続あたり
+  ・クライアント側ソケット 1 つ
+  ・上流サーバー側ソケット 1 つ
+の計 2 つを消費するため、実質は半分になる。
+```
+
+さらに、`worker_connections` はファイル記述子の上限を超えられません。ここで OS 側の設定が効いてきます。
+
+---
+
+## ファイル記述子の上限を追跡する
+
+「接続が増えると `Too many open files` が出る」は頻出の問題です。上限は**複数の場所で独立に**決まっており、どれか 1 つでも低いとそこで頭打ちになります。
+
+```bash
+# ① システム全体の上限
+sysctl fs.file-max
+
+# ② 現在のプロセスに適用されている上限（ここを見るのが確実）
+cat /proc/<pid>/limits | grep 'open files'
+
+# ③ ログインシェル経由の上限（systemd 管理下のサービスには効かない）
+ulimit -n
+```
+
+---
+
+<h2 className="slide-cont">ファイル記述子の上限を追跡する（続き）</h2>
+
+<Callout type="pitfall">
+
+**`/etc/security/limits.conf` を編集したのに反映されない**、という相談が非常に多いです。
+
+このファイルは PAM（ログインセッション）経由で適用されるもので、**systemd が起動するサービスには効きません**。systemd 管理下のサービスには unit で指定する必要があります。
+
+```bash
+systemctl edit nginx.service
+```
+
+```ini
+[Service]
+LimitNOFILE=65536
+```
+
+```bash
+systemctl daemon-reload
+systemctl restart nginx
+
+# 実際に効いているかを必ず確認する
+cat /proc/$(pgrep -o nginx)/limits | grep 'open files'
+```
+
+`ulimit -n` の出力は「今のシェルの上限」であって、サービスの上限ではありません。**必ず `/proc/<pid>/limits` で確認してください。**
+
+</Callout>
+
+### 見落としやすい上限: エフェメラルポート
+
+上流サーバーへ大量のコネクションを張るリバースプロキシでは、**送信元ポートが枯渇**することがあります。
+
+```bash
+sysctl net.ipv4.ip_local_port_range   # 既定 32768 60999 （約28000個）
+
+# TIME_WAIT 状態のソケット数を数える
+ss -tan state time-wait | wc -l
+```
+
+---
+
+<h2 className="slide-cont">ファイル記述子の上限を追跡する（続き）</h2>
+
+1 接続ごとに新しいポートを使い、切断後も `TIME_WAIT`（既定 60 秒）の間はポートが解放されません。秒間 500 接続なら 30,000 個が滞留し、範囲を使い切ります。
+
+対策は**上流への keepalive を有効にすること**です。接続を使い回せば、そもそもポートを消費しません。
+
+```nginx
+upstream backend {
+    server 10.0.0.10:8080;
+    keepalive 64;              # 各ワーカーが保持する空きコネクション数
+}
+
+server {
+    location / {
+        proxy_pass http://backend;
+        proxy_http_version 1.1;   # keepalive には 1.1 が必須
+        proxy_set_header Connection "";  # 既定の close ヘッダを消す
+    }
+}
+```
+
+<Callout type="field">
+
+`proxy_http_version 1.1;` と `proxy_set_header Connection "";` の 2 行がないと、`keepalive` を書いても効きません。nginx は既定で上流に HTTP/1.0 で接続し、`Connection: close` を送るためです。設定したのに TIME_WAIT が減らない場合は、まずこの 2 行を確認してください。
+
+</Callout>
+
+---
+
+## まとめ
+
+- プロセス型・スレッド型・イベント駆動型は、1 接続あたりのコストが 3 桁違う
+- `epoll` は「準備できたものだけ返す」ため、接続数が増えても劣化しない
+- イベント駆動型は 1 か所のブロックが全接続に波及する。同期 I/O を持ち込まない
+- `worker_processes` は CPU を使い切るため、`worker_connections` は fd 上限に従う
+- **`limits.conf` は systemd サービスに効かない。`LimitNOFILE=` を使い、`/proc/<pid>/limits` で検証する**
+- 上流への keepalive がないとエフェメラルポートが枯渇する
+
+<Quiz
+  id="q1"
+  question="/etc/security/limits.conf に nofile 65536 を設定して再起動しましたが、systemd 管理下の nginx で Too many open files が出続けます。原因はどれですか。"
+  options={[
+    "設定後に sysctl -p を実行していないため",
+    "limits.conf は PAM のログインセッションに適用されるもので、systemd が起動するサービスには効かないため",
+    "fs.file-max が不足しているため",
+    "worker_connections の設定が優先されるため"
+  ]}
+  answer={1}
+  explanation="limits.conf は pam_limits によってログインセッションに適用されます。systemd が直接起動するサービスはこの経路を通らないため、unit ファイルの LimitNOFILE= で指定する必要があります。実際に適用されている値は /proc/<pid>/limits で確認するのが確実で、ulimit -n はシェルの値であって当てになりません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="リバースプロキシで負荷が上がると「Cannot assign requested address」というエラーが出ます。ss で TIME_WAIT が 28000 件ありました。最も効果的な対処はどれですか。"
+  options={[
+    "worker_connections を増やす",
+    "上流への keepalive を有効にし、コネクションを再利用してポート消費自体を減らす",
+    "fs.file-max を増やす",
+    "worker_processes を増やす"
+  ]}
+  answer={1}
+  explanation="エフェメラルポート（既定で約28000個）の枯渇です。ポート範囲の拡大や tcp_tw_reuse も緩和にはなりますが、根本的には毎回新規接続を張っていることが原因です。upstream に keepalive を設定して接続を再利用すれば、ポートの消費そのものがなくなります。その際 proxy_http_version 1.1 と Connection ヘッダのクリアが必須です。"
+/>

@@ -1,0 +1,351 @@
+---
+title: NCCL の動作とチューニング
+description: NCCL がどう経路とアルゴリズムを選ぶかを理解し、実測とログから問題を切り分けられるようにします。
+order: 3
+minutes: 18
+tags: ["NCCL", "All-Reduce", "nccl-tests", "環境変数", "トラブルシュート"]
+objectives:
+  - NCCL のアルゴリズム選択（Ring / Tree）の使い分けを説明できる
+  - nccl-tests で帯域を実測し、健全性を判断できる
+  - 分散学習が遅い・起動しないときの切り分け手順を実行できる
+references:
+  - label: "NCCL User Guide — NVIDIA Docs"
+    url: "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html"
+  - label: "NCCL Environment Variables"
+    url: "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html"
+  - label: "nccl-tests (GitHub)"
+    url: "https://github.com/NVIDIA/nccl-tests"
+---
+
+## NCCL が引き受けていること
+
+PyTorch で `dist.all_reduce()` を呼ぶと、その裏では NCCL が次を自動的に行っています。
+
+```text
+① トポロジ検出   どの GPU がどう繋がっているか（NVLink? PCIe? ネットワーク?）
+② 経路の決定     どの順序でデータを回すか
+③ アルゴリズム選択 Ring? Tree? メッセージサイズに応じて
+④ プロトコル選択  LL / LL128 / Simple
+⑤ 実行           カーネルを起動してデータを転送
+```
+
+**うまく動いているときは意識する必要がありません。** 問題は、①〜④ のどこかで想定外の選択がされたときに、性能が数倍〜数十倍変わることです。
+
+---
+
+## アルゴリズム: Ring と Tree
+
+GPU コース レッスン 3 で Ring All-Reduce に触れました。NCCL はこれに加えて Tree も持っており、**メッセージサイズで使い分けます**。
+
+| | **Ring** | **Tree** |
+| --- | --- | --- |
+| 構造 | 全 GPU を輪に繋ぐ | 木構造で集約・配布 |
+| 転送量 | 多い | 少ない |
+| ホップ数 | **GPU 数に比例** | **log(GPU 数)** |
+| 得意 | **大きなメッセージ**（帯域律速） | **小さなメッセージ**（レイテンシ律速） |
+
+<Figure name="nccl-ring-tree" caption="Ring と Tree。ホップ数が GPU 数に比例するか、log に収まるかの違い" />
+
+---
+
+<h2 className="slide-cont">アルゴリズム: Ring と Tree（続き）</h2>
+
+NCCL は自動で選びますが、明示することもできます。
+
+```bash
+export NCCL_ALGO=Ring       # または Tree, CollNet, NVLS
+export NCCL_PROTO=Simple    # または LL, LL128
+```
+
+<Callout type="note">
+
+`NCCL_ALGO` を手で固定するのは、**自動選択が明らかにおかしいと実測で確認できた場合だけ**にしてください。NCCL のバージョンごとに閾値は改善されており、固定すると別のサイズで損をします。
+
+`NVLS`（NVLink SHARP）は NVSwitch 搭載システムで使える、スイッチ内で集約を行う方式です。`CollNet` はレッスン 2 で触れた InfiniBand の SHARP を使います。どちらも条件が揃えば自動で選ばれます。
+
+</Callout>
+
+---
+
+## まず実測する
+
+チューニングの前に、**現在どれだけ出ているか**を測ります。
+
+```bash
+# nccl-tests のビルド
+git clone https://github.com/NVIDIA/nccl-tests
+cd nccl-tests && make MPI=1 MPI_HOME=/usr/lib/x86_64-linux-gnu/openmpi
+
+# 単一ノード 8 GPU での All-Reduce
+./build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
+
+# 複数ノード（MPI 経由）
+mpirun -np 16 -H node1:8,node2:8 ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 1
+```
+
+```text
+       size         count      type   time(us)  algbw(GB/s)  busbw(GB/s)
+    8388608       2097152     float     186.3        45.02       78.79
+   67108864      16777216     float    1102.4       60.87      106.53
+  536870912     134217728     float    7821.6       68.64      120.12
+ 8589934592    2147483648     float  119204.3       72.06      126.10
+```
+
+**`busbw`（バス帯域）がリンクの理論値にどれだけ近いか**で健全性を判断します。
+
+| 環境 | 期待される `busbw` の目安 |
+| --- | --- |
+| NVLink（H100 SXM、ノード内 8 GPU） | 300–400 GB/s 以上 |
+| InfiniBand NDR 400G ×8（ノード間） | 300 GB/s 前後 |
+| PCIe 経由（NVLink なし） | 20–40 GB/s |
+| **TCP/IP（Socket フォールバック）** | **数 GB/s** ← 異常 |
+
+---
+
+<h2 className="slide-cont">まず実測する（続き）</h2>
+
+<Callout type="field">
+
+**クラスタ構築時に必ずこの測定を行い、結果を保存してください。**
+
+- 設計した性能が実際に出ているかの受け入れ検査になる
+- 後から「遅くなった」と言われたときの比較基準になる
+- ノードの組み合わせを変えて測れば、**特定のノードやリンクの不良を特定できる**
+
+```bash
+# 全ノードペアを総当たりで測り、異常なペアを見つける
+for a in node{1..8}; do for b in node{1..8}; do
+  [ "$a" = "$b" ] && continue
+  echo -n "$a-$b: "
+  mpirun -np 2 -H "$a:1,$b:1" ./build/all_reduce_perf -b 1G -e 1G -g 1 2>/dev/null \
+    | awk '/1073741824/{print $NF}'
+done; done
+```
+
+1 組だけ極端に遅ければ、そのリンクかトランシーバを疑います（ファシリティコース レッスン 4 の受信光レベル、レッスン 2 の `ibdiagnet`）。
+
+</Callout>
+
+---
+
+## ログで経路を確認する
+
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,ENV
+python train.py 2>&1 | tee nccl.log
+```
+
+出力から読み取るべき行です。
+
+```text
+NCCL INFO Bootstrap : Using eth0:10.0.0.5<0>
+NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB     ← IB を使えている
+NCCL INFO Using network IB
+NCCL INFO Channel 00/24 :  0  1  2  3  4  5  6  7
+NCCL INFO Channel 00 : 0[7000] -> 1[a000] via P2P/direct pointer   ← NVLink 直結
+NCCL INFO Channel 00 : 7[e000] -> 8[7000] [send] via NET/IB/0/GDRDMA  ← GPUDirect 有効
+NCCL INFO Connected all rings
+```
+
+| 出力 | 意味 |
+| --- | --- |
+| `Using network IB` | **正常**（InfiniBand / RoCE を使用） |
+| **`Using network Socket`** | **TCP/IP にフォールバック。要調査** |
+| `via P2P/direct pointer` | GPU 間が直接接続（NVLink / PCIe P2P） |
+| `via SHM` | **ホストの共有メモリ経由。GPU 直接通信が効いていない** |
+| `GDRDMA` | **GPUDirect RDMA が有効**（VRAM ↔ NIC 直接） |
+| `via NET/IB/0` （GDRDMA なし） | ホストメモリを経由している |
+
+---
+
+<h2 className="slide-cont">ログで経路を確認する（続き）</h2>
+
+<Callout type="pitfall" title="トポロジ検出が失敗する典型">
+
+NCCL はトポロジを自動検出しますが、**コンテナ内では情報が見えず、誤った判断をする**ことがあります。
+
+```bash
+# NCCL が認識したトポロジをダンプして確認する
+export NCCL_TOPO_DUMP_FILE=/tmp/nccl-topo.xml
+python train.py
+cat /tmp/nccl-topo.xml
+```
+
+実際のハードウェア構成（`nvidia-smi topo -m`）と食い違っていたら、コンテナに必要な情報が渡っていません。
+
+- `/sys` がマウントされていない
+- IB デバイス（`/dev/infiniband`）が渡されていない
+- PCI のトポロジ情報が見えない
+
+Kubernetes での渡し方はレッスン 5 で扱います。
+
+</Callout>
+
+---
+
+## よく使う環境変数
+
+```bash
+# ── 経路の指定 ──────────────────────────────
+export NCCL_SOCKET_IFNAME=eth0        # Bootstrap に使う NIC（管理用を明示）
+export NCCL_IB_HCA=mlx5_0,mlx5_1      # 使う HCA を限定する
+export NCCL_IB_GID_INDEX=3            # RoCE のとき必須（レッスン 2）
+export NCCL_IB_DISABLE=0              # 1 にすると IB を使わない（切り分け用）
+
+# ── 機能の有効化 ────────────────────────────
+export NCCL_NET_GDR_LEVEL=PIX         # GPUDirect RDMA を使う条件
+export NCCL_COLLNET_ENABLE=1          # SHARP を使う
+
+# ── デバッグ ────────────────────────────────
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,ENV
+export NCCL_TOPO_DUMP_FILE=/tmp/topo.xml
+```
+
+<Callout type="warning" title="NCCL_SOCKET_IFNAME は明示する">
+
+**複数の NIC があるサーバーでは、NCCL が管理用の低速 NIC を選んでしまうことがあります。**
+
+NCCL は起動時の情報交換（bootstrap）に TCP を使い、そのインターフェースを自動選択します。1GbE の管理 NIC が選ばれると、**初期化に長時間かかる**、あるいは**タイムアウトして起動しない**という症状が出ます。
+
+```bash
+# 使ってほしくない NIC を除外する書き方もできる
+export NCCL_SOCKET_IFNAME=^docker,lo,virbr
+```
+
+Docker や仮想ブリッジのインターフェースが選ばれて、**ノード間で到達できずハングする**のも典型的なパターンです。`^` で除外しておくのが安全です。
+
+</Callout>
+
+---
+
+## 切り分けの手順
+
+分散学習が「起動しない」「遅い」ときの順序です。
+
+### ① 起動しない・ハングする
+
+```bash
+# まず NCCL のログを出す
+export NCCL_DEBUG=INFO
+
+# よくある症状と原因
+#  - "Connection timed out" → ノード間の疎通、ファイアウォール、IFNAME の誤り
+#  - 初期化で止まる         → bootstrap が到達できない NIC を選んでいる
+#  - "unhandled system error" → /dev/shm 不足、デバイスの渡し漏れ
+```
+
+```bash
+# ノード間の素の疎通を先に確認する
+ping <other-node>
+ib_write_bw            # サーバー側
+ib_write_bw <server>   # クライアント側（IB の帯域を NCCL 抜きで測る）
+```
+
+<Callout type="tip">
+
+**`ib_write_bw` で RDMA の素の性能を測ると、NCCL の問題かネットワークの問題かを分離できます。**
+
+```text
+ib_write_bw が理論値に近い → ネットワークは正常。NCCL の設定を疑う
+ib_write_bw も遅い         → ネットワーク側の問題（レッスン 2 の ibdiagnet へ）
+```
+
+層を 1 つずつ切り分けるのが、結局いちばん速い進め方です。
+
+</Callout>
+
+### ② 遅い
+
+---
+
+<h2 className="slide-cont">切り分けの手順（続き）</h2>
+
+```text
+1. nccl-tests で busbw を測る
+     └─ 理論値に近い → NCCL は正常。ボトルネックは別（レッスン 1 の ①②③）
+     └─ 遅い         → 2 へ
+
+2. NCCL_DEBUG=INFO で経路を確認
+     └─ "Using network Socket"  → IB が使えていない（レッスン 2）
+     └─ "via SHM"               → GPU 直接通信が効いていない
+     └─ GDRDMA が出ない         → GPUDirect が無効
+
+3. nvidia-smi topo -m と突き合わせる
+     └─ SYS や NODE を経由していないか（GPU コース レッスン 1）
+
+4. ノードペアを総当たりで測り、不良リンクを特定する
+```
+
+---
+
+## タイムアウトの設定
+
+大規模なジョブでは、**NCCL のタイムアウトが実務上の問題になります**。
+
+```python
+import datetime, torch.distributed as dist
+dist.init_process_group(
+    backend="nccl",
+    timeout=datetime.timedelta(minutes=30),   # 既定は 10 分
+)
+```
+
+既定では、集合通信の完了を 10 分待って応答がなければ異常終了します。次のような場面で、**正常な処理が誤って打ち切られる**ことがあります。
+
+- チェックポイント保存中、保存を担当するランクだけ時間がかかる（レッスン 4）
+- データローダの初期化が遅いランクがある
+- 大規模クラスタで、初期化そのものに時間がかかる
+
+<Callout type="field">
+
+**逆に、タイムアウトを長くしすぎるのも問題です。** 1 ノードが本当に故障した場合、残りの全 GPU がタイムアウトまで待ち続けます。数千 GPU のクラスタでは、この待ち時間が大きな損失になります。
+
+- **正常時の集合通信にかかる最大時間を実測し**、その数倍に設定する
+- 故障を早く検知する仕組み（DCGM の Xid 監視、レッスン 6 のスケジューラ連携）を別に用意する
+
+「タイムアウトを伸ばして解決」は、根本原因を隠すことが多いので注意してください。
+
+</Callout>
+
+---
+
+## まとめ
+
+- NCCL はトポロジ検出・アルゴリズム選択・プロトコル選択を自動で行う
+- **Ring は大きなメッセージ、Tree は小さなメッセージ**に向く。手動固定は実測してから
+- **まず `nccl-tests` で `busbw` を測る**。構築時の値を保存しておく
+- ログで見るのは `Using network IB` / `GDRDMA` / `via SHM` / `Socket`
+- **`NCCL_SOCKET_IFNAME` は明示する**。管理 NIC や docker0 が選ばれてハングする
+- コンテナではトポロジ検出が失敗しうる。`NCCL_TOPO_DUMP_FILE` で確認
+- **`ib_write_bw` で素の RDMA 性能を測れば、NCCL と NW を分離できる**
+- タイムアウトは実測に基づいて決める。伸ばすだけでは原因が隠れる
+
+<Quiz
+  id="q1"
+  question="2 ノード間の分散学習が初期化で止まり、タイムアウトします。各ノードには管理用の 1GbE NIC、docker0 ブリッジ、そして 200G の InfiniBand HCA があります。最も疑わしい原因はどれですか。"
+  options={[
+    "InfiniBand のケーブルが断線している",
+    "NCCL の bootstrap がノード間で到達できないインターフェース（docker0 など）を自動選択している。NCCL_SOCKET_IFNAME で明示または除外する必要がある",
+    "GPU のドライバが古い",
+    "NCCL_ALGO の設定が誤っている"
+  ]}
+  answer={1}
+  explanation="NCCL は起動時の情報交換（bootstrap）に TCP を使い、インターフェースを自動選択します。docker0 や virbr のような各ノードでローカルに閉じたブリッジが選ばれると、ノード間で到達できず初期化がハングします。NCCL_SOCKET_IFNAME=eth0 のように明示するか、^docker,lo,virbr のように除外指定するのが定石です。実データ転送は IB を使う場合でも、bootstrap は別経路である点に注意が必要です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="分散学習が想定より遅いため nccl-tests を実行したところ、busbw は環境の理論値に近い値が出ました。次に確認すべきものはどれですか。"
+  options={[
+    "NCCL_ALGO を Tree に固定する",
+    "NCCL の通信性能は正常なので、データ読み出し・前処理・ホストからの転送など GPU 外の要因を DCGM や プロファイラで調べる",
+    "InfiniBand のケーブルを交換する",
+    "NCCL のバージョンを上げる"
+  ]}
+  answer={1}
+  explanation="busbw が理論値に近いということは、集合通信そのものは健全です。学習の 1 ステップにはデータ読み出し・CPU 前処理・ホストから GPU への転送・演算が含まれ、通信以外の工程がボトルネックになっている可能性が高い状態です。DCGM の SM_ACTIVE / PIPE_TENSOR_ACTIVE や Nsight Systems のタイムラインで、GPU が待っている区間を特定するのが次の一手になります。"
+/>

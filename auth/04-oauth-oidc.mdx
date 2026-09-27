@@ -1,0 +1,345 @@
+---
+title: OAuth 2.0 と OpenID Connect
+description: 認可と認証の分離を理解し、トークンの種類と検証項目を正しく扱えるようにします。
+order: 4
+minutes: 19
+tags: ["OAuth", "OIDC", "JWT", "PKCE", "JWKS"]
+objectives:
+  - OAuth 2.0 が認可の枠組みであり認証ではないことを説明できる
+  - Authorization Code + PKCE の流れと、PKCE が防ぐ攻撃を説明できる
+  - JWT の検証項目を列挙し、代表的な誤用を指摘できる
+references:
+  - label: "RFC 6749 — The OAuth 2.0 Authorization Framework"
+    url: "https://www.rfc-editor.org/rfc/rfc6749.html"
+  - label: "OpenID Connect Core 1.0"
+    url: "https://openid.net/specs/openid-connect-core-1_0.html"
+  - label: "RFC 9700 — Best Current Practice for OAuth 2.0 Security"
+    url: "https://www.rfc-editor.org/rfc/rfc9700.html"
+---
+
+## OAuth 2.0 は認証の仕組みではない
+
+**最も重要な前提です。** OAuth 2.0 が解いている問題は次です。
+
+> **パスワードを渡さずに、アプリに「自分の代わりに API を叩く権限」を与える。**
+
+```text
+ユーザー ──► 「このアプリに、私のカレンダーの読み取りを許可します」
+                 ↓
+         アプリはアクセストークンを受け取る
+                 ↓
+         アプリはそのトークンで Calendar API を叩く
+```
+
+これは**認可**（何をしてよいか）です。レッスン 1 の区別でいえば AuthZ にあたります。
+
+**「このユーザーは誰か」を伝える仕組みは、OAuth 2.0 には含まれていません。** それを後から標準化したのが **OpenID Connect (OIDC)** です。
+
+```text
+OpenID Connect = OAuth 2.0 + 認証のための ID トークンと規約
+```
+
+<Callout type="pitfall" title="アクセストークンでユーザー認証をしてはいけない">
+
+かつて広く行われ、今も残っている誤用です。
+
+```text
+✗ 危険なフロー
+  1. クライアントがアクセストークンを取得
+  2. そのトークンで /userinfo を叩いてユーザー ID を得る
+  3. 「このユーザーがログインした」とみなす
+```
+
+**アクセストークンには「誰に発行されたか」しか入っておらず、「誰が、いつ、どのように認証されたか」は含まれません。**
+
+問題は、**アクセストークンが別のアプリ向けに発行されたものでも、API は受け付けてしまう**点です（confused deputy 問題）。悪意あるアプリが自分向けに取得したトークンを渡してくると、それを正規のログインとして受け入れてしまいます。
+
+**認証には ID トークンを使い、`aud`（誰宛か）を必ず検証してください。** これが OIDC が存在する理由です。
+
+</Callout>
+
+---
+
+## 登場人物
+
+| 役割 | 実体 |
+| --- | --- |
+| **Resource Owner** | ユーザー本人 |
+| **Client** | アプリケーション（Web アプリ、SPA、モバイル） |
+| **Authorization Server** | **IdP**（Keycloak など。レッスン 5） |
+| **Resource Server** | 保護された API |
+
+---
+
+## Authorization Code + PKCE
+
+**現在の標準フロー**です。OAuth 2.1 では、これ以外のフロー（Implicit、Resource Owner Password Credentials）は廃止されました。
+
+<Figure name="oidc-code-pkce" caption="Authorization Code + PKCE。④ のフロントチャネルと ⑤ のバックチャネルの違いが PKCE の存在理由" />
+
+---
+
+<h2 className="slide-cont">Authorization Code + PKCE（続き）</h2>
+
+<Callout type="note" title="PKCE が防いでいるもの">
+
+**認可コードの横取り**です。
+
+④ のリダイレクトは URL に認可コードが乗るため、**ブラウザ履歴、ログ、Referer、あるいはモバイルのカスタム URL スキームの乗っ取り**によって、第三者に盗まれる可能性があります。
+
+PKCE（Proof Key for Code Exchange）があると、認可コードだけを盗んでも `code_verifier` を知らないためトークンに交換できません。
+
+```text
+攻撃者が認可コードを入手
+  → ⑤ でトークンに交換しようとする
+  → code_verifier が分からないので失敗
+```
+
+**元々はモバイルアプリ向けの拡張でしたが、現在はすべてのクライアント種別で推奨されています。** サーバーサイドの Web アプリでも付けてください。
+
+</Callout>
+
+### クライアントの種別
+
+---
+
+<h2 className="slide-cont">Authorization Code + PKCE（続き）</h2>
+
+| 種別 | 例 | client secret |
+| --- | --- | --- |
+| **Confidential** | サーバーサイド Web アプリ | **持てる**（サーバー上に保管） |
+| **Public** | **SPA、モバイルアプリ** | **持てない**（配布物に埋め込むと漏れる） |
+
+**SPA に client secret を埋め込むのは意味がありません。** ブラウザの開発者ツールで誰でも読めます。Public クライアントでは PKCE が secret の代わりに機能します。
+
+---
+
+## トークンの種類
+
+**この区別が実務で最も混乱するところです。**
+
+| トークン | 宛先 | 用途 | 中身 |
+| --- | --- | --- | --- |
+| **ID トークン** | **クライアント** | **「誰がログインしたか」を伝える** | JWT。ユーザー情報 |
+| **アクセストークン** | **API（Resource Server）** | API 呼び出しの認可 | JWT または不透明な文字列 |
+| **リフレッシュトークン** | Authorization Server | アクセストークンの再取得 | 不透明 |
+
+```text
+ID トークン        → クライアントが検証して「ログイン成功」と判断する
+                     API には送らない
+
+アクセストークン   → Authorization: Bearer <token> で API に送る
+                     クライアントは中身を解釈しなくてよい
+```
+
+<Callout type="warning" title="ID トークンを API に送らない">
+
+**よくある誤用です。**
+
+```text
+✗ Authorization: Bearer <ID トークン>
+✓ Authorization: Bearer <アクセストークン>
+```
+
+ID トークンは**そのクライアントに向けて**発行されたもので、`aud` にはクライアント ID が入っています。API がこれを受け入れてしまうと、`aud` の検証が正しく行われていないことになります。
+
+逆に、**API 側が ID トークンを受け付ける実装になっていると、クライアントの認証情報が API の認可に流用できてしまいます。** API は `aud` が自分（API の識別子）であることを必ず検証してください。
+
+</Callout>
+
+---
+
+## JWT の検証
+
+アクセストークンや ID トークンが JWT の場合、**受け取った側は必ず検証します**。
+
+```text
+eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYzEyMyJ9 . eyJpc3MiOiJodHRwczovL2lkcC... . SflKxwRJSMeKKF2QT4f...
+└──────────── Header ────────────────┘   └──────── Payload ────────┘   └──── Signature ────┘
+```
+
+```bash
+# 中身を見る（検証はしていない。デコードするだけ）
+echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+```
+
+### 検証項目
+
+| 項目 | 確認内容 |
+| --- | --- |
+| **署名** | **JWKS から `kid` に対応する公開鍵を取得して検証** |
+| `alg` | **サーバー側で期待するアルゴリズムを指定する**（トークンの値を信用しない） |
+| **`iss`** | 発行者が期待する IdP か |
+| **`aud`** | **自分宛か** |
+| `exp` | 有効期限内か |
+| `nbf` / `iat` | 発行時刻が未来になっていないか |
+| `nonce`（ID トークン） | 自分が送った値と一致するか（リプレイ防止） |
+
+```bash
+# IdP の設定を取得する（Discovery）
+curl -s https://idp.internal/realms/corp/.well-known/openid-configuration | jq .
+
+# 公開鍵の一覧（JWKS）
+curl -s https://idp.internal/realms/corp/protocol/openid-connect/certs | jq .
+```
+
+---
+
+<h2 className="slide-cont">JWT の検証（続き）</h2>
+
+<Callout type="warning" title="署名検証の 2 つの古典的な攻撃">
+
+**① `alg: none` 攻撃**
+
+```json
+{ "alg": "none", "typ": "JWT" }
+```
+
+ライブラリが素直にこれを受け入れると、**署名なしのトークンが通ります**。攻撃者はペイロードを自由に書き換えられます。
+
+**② HS256 / RS256 混同攻撃**
+
+RS256（公開鍵で検証）を期待しているのに、攻撃者が `alg` を HS256（共通鍵）に書き換えて送ります。ライブラリが `alg` をそのまま信じると、**公開鍵を共通鍵として使って検証**してしまいます。公開鍵は誰でも入手できるため、攻撃者は有効な署名を作れます。
+
+**どちらも「トークンに書かれた `alg` を信用する」ことが原因です。**
+
+```python
+# 検証側で明示的に指定する
+jwt.decode(token, key, algorithms=["RS256"], audience="my-api", issuer="https://idp.internal/...")
+```
+
+現在の主要ライブラリは対策済みですが、**`algorithms` を明示するのは自分で書く際の必須事項**です。
+
+</Callout>
+
+<Callout type="field">
+
+**JWKS は「毎回取得」も「一度だけ取得」も誤りです。**
+
+- 毎回取得 → IdP への負荷、IdP 障害でサービス全断
+- 一度だけ → **鍵のローテーション（レッスン 5）で検証できなくなる**
+
+正しくは **`kid` をキーにキャッシュし、未知の `kid` が来たときだけ再取得**します。多くのライブラリがこの挙動を持っているので、自前実装せずライブラリに任せてください。
+
+</Callout>
+
+---
+
+## 不透明トークンとイントロスペクション
+
+アクセストークンが JWT ではなく**ランダムな文字列（不透明トークン）**の場合もあります。
+
+```bash
+# トークンの有効性を IdP に問い合わせる
+curl -s -X POST https://idp.internal/realms/corp/protocol/openid-connect/token/introspect \
+  -u "$CLIENT_ID:$CLIENT_SECRET" \
+  -d "token=$ACCESS_TOKEN" | jq .
+```
+
+```json
+{ "active": true, "sub": "u-1024", "scope": "orders:read", "exp": 1789779600 }
+```
+
+| | **JWT** | **不透明トークン** |
+| --- | --- | --- |
+| 検証 | ローカルで完結（速い） | **IdP への問い合わせが必要** |
+| **失効** | **困難**（レッスン 1） | **即座にできる** |
+| IdP への依存 | 低い | 高い |
+
+レッスン 1 で見たセッション vs トークンと、同じトレードオフがここにも現れます。**失効の即時性が要るなら不透明トークン**、スケールと独立性が要るなら JWT です。
+
+---
+
+## スコープとクレーム
+
+```text
+scope=openid profile email orders:read
+      │      │       │     └─ API へのアクセス権（認可）
+      │      └───────┴─────── ユーザー情報の取得範囲
+      └─ これがあると OIDC として ID トークンが返る
+```
+
+<Callout type="pitfall">
+
+**`scope` は「アプリが要求した権限の範囲」であって、「ユーザーが持つ権限」ではありません。**
+
+```text
+scope に admin が入っている = そのユーザーが管理者である、ではない
+  → 単にアプリがその範囲を要求した、というだけ
+```
+
+実際の権限判定は、**IdP が発行したクレーム（ロール、グループ）を見て、API 側が行います**。レッスン 1 で述べたとおり、**認可はアプリの責任**です。
+
+```json
+{
+  "sub": "u-1024",
+  "preferred_username": "tanaka",
+  "realm_access": { "roles": ["operator", "auditor"] },   ← ここを見て判定する
+  "groups": ["/infra/sre"]
+}
+```
+
+</Callout>
+
+---
+
+## ログアウトの難しさ
+
+<Callout type="note">
+
+OIDC には RP-Initiated Logout（クライアント起点のログアウト）や Back-Channel Logout がありますが、**完全なログアウトは難しい**のが実情です。
+
+```text
+クライアントのセッションを消す     → そのアプリからはログアウト
+IdP のセッションを消す             → 他のアプリにも波及（SSO の裏返し）
+発行済みアクセストークンは？       → 有効期限まで生きている（レッスン 1）
+```
+
+「ログアウトしたのに、まだ API が叩ける」という状態は、**アクセストークンの寿命の問題**です。短命化（5〜15 分）とリフレッシュトークンの失効で対処します。
+
+</Callout>
+
+---
+
+## まとめ
+
+- **OAuth 2.0 は認可の枠組み。認証ではない**。認証を載せたのが OIDC
+- **アクセストークンでユーザー認証をしない**。ID トークンを使い `aud` を検証する
+- 現在の標準は **Authorization Code + PKCE**。Implicit と ROPC は廃止
+- **PKCE は認可コードの横取りを防ぐ**。全クライアント種別で推奨
+- SPA は Public クライアント。**client secret を埋め込んでも意味がない**
+- ID トークンは**クライアント宛**、アクセストークンは **API 宛**。送り先を間違えない
+- JWT の検証項目は **署名 / `alg` の明示 / `iss` / `aud` / `exp`**
+- **`alg: none` と HS256/RS256 混同**は「トークンの `alg` を信じる」ことが原因
+- JWKS は **`kid` でキャッシュし、未知の `kid` で再取得**
+- **`scope` は権限そのものではない**。ロールやグループのクレームで認可判定する
+
+---
+
+<Quiz
+  id="q1"
+  question="API サーバーが、クライアントから送られてきた ID トークンを Authorization ヘッダで受け取り、それを検証してユーザーを識別する実装になっています。この設計の問題点はどれですか。"
+  options={[
+    "ID トークンは JWT ではないため検証できない",
+    "ID トークンはクライアント宛（aud にクライアント ID）に発行されたものであり、API が自分宛でないトークンを受け入れていることになる。API にはアクセストークンを送り、aud が自分であることを検証すべき",
+    "ID トークンには有効期限がないため",
+    "ID トークンは暗号化されていないため"
+  ]}
+  answer={1}
+  explanation="ID トークンは「誰がログインしたか」をクライアントに伝えるためのもので、aud にはクライアント ID が入ります。API がこれを受け入れるということは aud の検証を正しく行っていないことを意味し、別のアプリ向けに発行されたトークンも通してしまう可能性があります。API に送るのはアクセストークンで、API 側は aud が自分（API の識別子）であることを必ず検証する必要があります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="JWT の検証を自前で実装する際、トークンのヘッダに書かれた alg の値をそのまま使ってアルゴリズムを決定する実装には、どのような危険がありますか。"
+  options={[
+    "パフォーマンスが低下する",
+    "alg を none に書き換えて署名検証を回避されたり、RS256 を HS256 に書き換えて公開鍵を共通鍵として使わせる混同攻撃を受けたりする",
+    "トークンのサイズが大きくなる",
+    "有効期限の検証ができなくなる"
+  ]}
+  answer={1}
+  explanation="トークンに書かれた alg は攻撃者が制御できる値です。none に書き換えれば署名検証自体を回避できる実装があり、RS256 を期待しているところに HS256 を指定されると、誰でも入手できる公開鍵を共通鍵として検証に使ってしまい、攻撃者が有効な署名を作れてしまいます。検証側で algorithms に RS256 のみを列挙するなど期待するアルゴリズムを明示し、トークンの申告を信用しないことが必須です。"
+/>

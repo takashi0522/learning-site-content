@@ -1,0 +1,238 @@
+---
+title: 各社が足しているもの
+description: PFC / ECN / DCQCN は共通の土台です。その上で NVIDIA・Arista・Cisco が何を足し、Ultra Ethernet が何を標準化しようとしているかを整理します。
+order: 5
+minutes: 20
+tags: ["Spectrum-X", "Etherlink", "Silicon One", "Ultra Ethernet", "機器選定"]
+objectives:
+  - どこまでが標準機能で、どこからが製品ごとの差かを切り分けられる
+  - 各社が採っている負荷分散のアプローチの違いを説明できる
+  - Ultra Ethernet が何を標準化しようとしているかを説明できる
+references:
+  - label: "NVIDIA Spectrum-X Ethernet Platform"
+    url: "https://www.nvidia.com/en-us/networking/spectrumx/"
+  - label: "Arista — AI Networking Center"
+    url: "https://www.arista.com/en/solutions/ai-networking/literature"
+  - label: "Cisco — Why Cisco Nexus 9000 for AI Networking (White Paper)"
+    url: "https://www.cisco.com/c/en/us/products/collateral/networking/cloud-networking-switches/nexus-9000-switches/nexus-9000-ai-networking-wp.html"
+  - label: "Ultra Ethernet Consortium"
+    url: "https://ultraethernet.org/"
+  - label: "UEC — Launches Specification 1.0"
+    url: "https://ultraethernet.org/ultra-ethernet-consortium-uec-launches-specification-1-0-transforming-ethernet-for-ai-and-hpc-at-scale/"
+  - label: "UEC — Progresses Towards v1.0 Set of Specifications (RUD の説明)"
+    url: "https://ultraethernet.org/uec-progresses-towards-v1-0-set-of-specifications/"
+  - label: "Arista — Press Release 2025-03-12 (Cluster Load Balancing)"
+    url: "https://www.arista.com/en/company/news/press-release/21271-pr-20250312"
+  - label: "Arista — Etherlink Smart Networking Portfolio Solution Brief"
+    url: "https://www.arista.com/assets/data/pdf/Arista-Etherlink-Smart-Networking-Portfolio-Solution-Brief.pdf"
+  - label: "Cisco — Silicon One G200 Data Sheet"
+    url: "https://www.cisco.com/c/en/us/solutions/collateral/silicon-one/silicon-one-g200-ds.html"
+  - label: "Cisco — AI Networking for Data Center with NVIDIA Spectrum-X"
+    url: "https://www.cisco.com/c/en/us/products/collateral/networking/cloud-networking-switches/nexus-9000-switches/ai-networking-dc-nvidia-spectrum-x-so.html"
+  - label: "Congestion Control for Large-Scale RDMA Deployments (SIGCOMM 2015, DCQCN の論文)"
+    url: "https://conferences.sigcomm.org/sigcomm/2015/pdf/papers/p523.pdf"
+  - label: "NVIDIA DOCA — Congestion Control Infrastructure (CP / NP / RP)"
+    url: "https://networking-docs.nvidia.com/doca/archive/3-5-0/congestion-control-infrastructure"
+  - label: "IP Infusion — DCQCN in OcNOS"
+    url: "https://www.ipinfusion.com/technology/dcqcn/"
+  - label: "NVIDIA Cumulus Linux 5.9 — RoCE (PFC と ECN)"
+    url: "https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-59/Layer-1-and-Switch-Ports/Quality-of-Service/RDMA-over-Converged-Ethernet-RoCE/"
+  - label: "Broadcom — Introduction to Congestion Control for RoCE (White Paper)"
+    url: "https://docs.broadcom.com/doc/NCC-WP1XX"
+  - label: "Meta Engineering — RoCE networks for distributed AI training at scale (DCQCN なしの運用)"
+    url: "https://engineering.fb.com/2024/08/05/data-center-engineering/roce-network-distributed-ai-training-at-scale/"
+  - label: "NVIDIA Technical Blog — Powering Next-Generation AI Networking with NVIDIA SuperNICs (パケットスプレーと順序)"
+    url: "https://developer.nvidia.com/blog/powering-next-generation-ai-networking-with-nvidia-supernics/"
+  - label: "Intel Ethernet 800 Series — Congestion Control Parameter Settings (DCQCN)"
+    url: "https://edc.intel.com/content/www/us/en/design/products/ethernet/800-series-linux-flow-control-configuration-guide-for-rdma-use-c/congestion-control-parameter-settings/"
+---
+
+## 共通の土台と、その上の差
+
+ここまでの 3 レッスンで扱った **PFC / ECN / DCQCN** は、土台の機能です。このレッスンで扱う 3 社は、いずれも PFC と ECN に対応しています。DCQCN は、スイッチ（印を付ける CP）と NIC（通知を返す NP、速度を落とす RP）が協調する仕組みで、**速度を制御するのは NIC 側**です。
+
+ただし、機能があることと使うことは別です。Meta は 400G の構成で DCQCN を使わず、PFC だけで 1 年以上運用したと報告しています（2024 年 8 月の記事。輻輳は、集合通信ライブラリと RoCE の転送を合わせて設計し、受信側が流量を受け入れる方式で抑えています）。
+
+差が出るのは、その上の層です。
+
+| | 差が出るか | 中身 |
+| --- | --- | --- |
+| PFC / ECN / DCQCN | **出にくい** | PFC と ECN は標準規格。DCQCN は論文で提案され、NVIDIA・Broadcom・Intel（800 Series）の NIC が対応 |
+| **負荷分散の粒度** | **大きく出る** | フロー / キューペア / フローレット / パケット |
+| **NIC との協調** | **大きく出る** | スイッチ単独か、NIC とセットか |
+| **可観測性** | 出る | リンク単位か、ジョブ単位まで見えるか |
+
+**カタログで「PFC 対応」「ECN 対応」を比べても、AI 向けの差はほとんど分かりません。** 見るべきは、レッスン 4 で扱った**経路の偏りをどう解くか**です。
+
+---
+
+## NVIDIA Spectrum-X
+
+NVIDIA の Ethernet 側の答えが **Spectrum-X** です。単体のスイッチではなく、**スイッチと SuperNIC を組み合わせたプラットフォーム**として売られています。
+
+NVIDIA の説明から、ここでは 3 つを取り上げます。
+
+- **適応ルーティング** … 「Spectrum-X のスイッチと SuperNIC が密接に協調し、動的に経路を決める」
+- **輻輳制御** … 「テレメトリに基づく高度な輻輳制御によって、テナント間のノイズを分離する」
+- **性能分離** … 「各テナントの AI ワークロードが予測可能に、一貫して動く」
+
+**「スイッチと SuperNIC が協調」という書き方が要点です。** レッスン 4 で見たとおり、パケット単位で散らすには受信側が順序崩れを吸収できる必要があります。NVIDIA は 2024 年のブログ（Spectrum-4 世代）で、SuperNIC が順序の崩れたパケットを並べて受け取り、**スイッチと SuperNIC の密な協調**で成り立つと説明しています。
+
+<Callout type="note" title="公称値の読み方">
+
+NVIDIA は Spectrum-X について「既製の Ethernet に対して AI ネットワークの性能を **1.6 倍**」と説明しています。
+
+**これはベンダーの公称値です。** 製品ページに書かれているのは比較の対象（off-the-shelf Ethernet）までで、**試験の条件も、どの世代の製品の数字かも書かれていません。** 現行のページは Spectrum-6 と BlueField-3 / ConnectX-8 / ConnectX-9 を挙げています。
+
+**比較の対象は、NVIDIA が「既製の Ethernet」と呼ぶものとしか書かれていません。** 何と比べていないのかは、このページからは分かりません。自分の構成でそのまま出る数字として読まないでください。
+
+</Callout>
+
+---
+
+## Arista
+
+Arista は **Etherlink** というくくりで AI 向けの機能を提供しています。
+
+**負荷分散では、2025 年 3 月に発表した Cluster Load Balancing（CLB）が特徴的です。** CLB は、**RDMA のキューペアを単位としてフローを配置する**方式だと説明されています。
+
+```text
+ECMP            : 5-tuple のハッシュ。運まかせ
+Cluster LB      : RDMA のキューペアを認識してフローを配置する
+パケットスプレー : 1 パケットずつ散らす。順序が崩れうる
+```
+
+**CLB は「散らす」のではなく「配置する」方式です。** ただし Arista は、DLB（動的な負荷分散）やパケットスプレーも Etherlink の機能に挙げていて、散らす側の機能も持っています。
+
+また Arista は 2024 年 6 月の Solution Brief で、Etherlink の製品群について NIC に依存しない設計だとしています。
+
+もう 1 つの特徴が**可観測性**で、2025 年 3 月の発表では、ネットワーク・システム・ジョブのデータを統合して**ジョブ単位で見られる**ようにするとしています。レッスン 4 で扱った経路の偏りは、ジョブと経路の対応が見えないと追いにくくなります。
+
+Arista 自身が **Ultra Ethernet への前方互換**を明記しているのも、選定時の判断材料になります。
+
+---
+
+## Cisco
+
+Cisco は **Nexus 9000** で AI ファブリックを扱います。以下の機能は **Silicon One G200** を載せた機種（Nexus 9364E-SG2 など）のものです。
+
+**負荷分散は複数の粒度を用意する形です。**
+
+| 方式 | 単位 | 順序 |
+| --- | --- | --- |
+| **DLB-flowlet** | フローレット（通信の切れ目） | ほぼ保たれる |
+| **パケットスプレー** | パケット | 崩れうる |
+
+**フローレットとパケットスプレーを選べる**のが特徴で、NIC 側の対応状況に合わせて選べます。
+
+Silicon One G200 には **packet trimming** という機能もあります。**捨てるしかない状況で、パケットを丸ごと落とすのではなく、小さく切り詰めて優先して送り届ける**という考え方です。Cisco は、**切り詰めたパケットを解釈できるトランスポートなら**、元のデータを速く再送させられると説明しています。
+
+<Callout type="field">
+
+**Cisco は NVIDIA Spectrum-X と組み合わせる構成も出しています。**
+
+「Cisco AI Networking for Data Center with NVIDIA Spectrum-X」として、Nexus のスイッチと NVIDIA の BlueField-3 SuperNIC を組み合わせる形です。
+
+**ベンダーを 1 つに揃えなければならない、という話ではありません。** GPU 基盤の導入コース レッスン 2 で「計算ファブリックは NVIDIA、Ethernet 側は Arista」という組み合わせに触れましたが、計算ファブリックそのものでも混成は成立します。
+
+ただし**適応ルーティングやスプレーのように両端の協調が要る機能は、組み合わせで使えるかを個別に確認してください。**
+
+</Callout>
+
+---
+
+## Ultra Ethernet — 標準化の動き
+
+ここまでの話には、**各社が独自に解いている**という問題があります。機器を混ぜると、いいところが使えません。
+
+それを標準化しようとしているのが **Ultra Ethernet Consortium**（UEC）で、**1.0 仕様が 2025 年 6 月に公開**されました（その後 1.0.3 が配布されています）。
+
+UEC が 1.0 に向けた進捗を報告した資料（最終更新 2024 年 8 月）は、ECMP のハッシュや go-back-N と対比して新しい仕組みを説明しています。これまでのレッスンで見た課題と並べると、次のようになります（対応づけはこのレッスンの整理です）。
+
+| レッスンで見た課題 | UEC の資料にある仕組み |
+| --- | --- |
+| フローが固定されて偏る | **パケットスプレー**（経路はエンドポイントとスイッチが協調して選ぶ） |
+| 順序が崩れると再送が増える | **順不同で届いてよい転送モード**（RUD。並べ替えが起きても受け入れる） |
+| go-back-N で巻き戻る | **選択的確認応答** |
+| ロスが致命的 | **リンク単位の信頼性確保**（Link Level Reliability。任意の機能） |
+
+---
+
+<h2 className="slide-cont">Ultra Ethernet — 標準化の動き（続き）</h2>
+
+**特に効くのが「順不同で受け取れる」ことです。**
+
+レッスン 1 で扱ったとおり、RDMA が順序に厳しいのは、受信側のメモリへ直接書くからでした。UEC はその前提を**転送モードとして分けます。**
+
+```text
+順序を保つモード     : 従来どおりの厳密な順序
+順不同で受け取るモード : 順序を保証しない代わりに、散らせる
+```
+
+**散らしてよい通信と、そうでない通信を分けられる**ようになります。UEC は、この順不同のモードを使う例として大きな集合通信を挙げています。
+
+<Callout type="warning" title="いま買うものは、いま動く必要がある">
+
+UEC 対応をうたう機器は出始めていますが、**対応の範囲は製品ごとに違います。**
+
+「UEC 準拠」と書いてあっても、**スイッチ側だけなのか、NIC まで揃っているのか、どの転送モードまでか**で意味が変わります。
+
+**いま導入する構成は、いまの機能で性能が出ることを確認してから決めてください。** 将来の標準に対応していることは、買い替えのタイミングを遅らせる材料にはなりますが、**今日の busbw を上げてはくれません。**
+
+</Callout>
+
+---
+
+## 選定の観点
+
+カタログを比べるときに見る項目を整理します。
+
+```text
+□ 負荷分散の粒度は何か（フロー / キューペア / フローレット / パケット）
+□ その機能は NIC 側の対応を必要とするか
+□ 必要なら、使う NIC がそれに対応しているか
+□ 輻輳制御は DCQCN か、独自の拡張があるか
+□ ジョブ単位での可観測性があるか
+□ Ultra Ethernet への対応方針
+□ 既存の運用（監視・設定管理・保守契約）に載せられるか
+```
+
+<Callout type="field">
+
+**最後の 1 行を軽く見ないでください。**
+
+GPU 基盤の導入コース レッスン 2 で「どちらが正しいかではなく、自分たちが運用できるのはどちらかで決めてください」と書きました。同じことが Ethernet の中でも起きます。
+
+**適応ルーティングが強くても、社内に知見のない OS のスイッチを入れると、障害時に動けません。** 既存の Ethernet 運用を活かせることが RoCE を選ぶ理由だったのに、そこを手放しては本末転倒です。
+
+</Callout>
+
+---
+
+<Quiz
+  id="q1"
+  question="AI 向けのスイッチを比較しています。A 社と B 社のカタログを見ると、どちらも PFC・ECN・DCQCN 対応と書かれています。この情報から何が言えますか。"
+  options={[
+    "両者の AI 向け性能はほぼ同等である",
+    "ほとんど何も言えない。これらは土台の機能で、差が出るのは負荷分散の粒度や NIC との協調、可観測性の側である",
+    "A 社と B 社は同じ ASIC を使っている",
+    "両者とも Ultra Ethernet に対応している"
+  ]}
+  answer={1}
+  explanation="PFC は IEEE 802.1Qbb、ECN は RFC 3168 に基づく標準で、DCQCN は SIGCOMM 2015 の論文で提案された方式で、NVIDIA・Broadcom・Intel（800 Series）の NIC が対応しています（Broadcom は元の論文から手を加えた版だと書いています）。このレッスンで扱った 3 社はいずれも PFC と ECN に対応しているため、対応の有無では差がつきにくいと言えます。実際の性能差が出るのは、ECMP の偏りをどう解くか、つまり負荷分散の粒度がフローなのかキューペアなのかフローレットなのかパケットなのか、その機能が NIC 側の対応を必要とするか、そしてジョブ単位で経路の偏りを観測できるかです。ASIC や Ultra Ethernet 対応はこの記述からは分かりません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="ベンダーから Ultra Ethernet 準拠のスイッチを提案されました。評価として適切なものはどれですか。"
+  options={[
+    "UEC 準拠であれば、どのベンダーの NIC と組み合わせてもパケットスプレーの利点が得られる",
+    "準拠の範囲を確認する必要がある。スイッチ側だけの対応か NIC まで揃うか、どの転送モードまで実装しているかで意味が変わるため、今の構成で性能が出ることを実測で確認してから決める",
+    "UEC は策定中の仕様なので、対応をうたう製品は存在しない",
+    "UEC 準拠であれば PFC と ECN の設定は不要になる"
+  ]}
+  answer={1}
+  explanation="UEC の 1.0 仕様は 2025 年 6 月に公開され、対応をうたう製品も出ています。ただしパケットスプレーの利点は、受信側が順不同での受け取りに対応して初めて得られるため、スイッチだけが準拠していても成立しません。実装している転送モードの範囲も製品ごとに違います。将来の標準への対応は買い替え時期を遅らせる材料にはなりますが、導入時点の性能は実測で確認する必要があります。"
+/>

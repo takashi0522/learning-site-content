@@ -1,0 +1,9 @@
+{
+  "title": "ミドルウェア",
+  "subtitle": "Middleware",
+  "description": "Web サーバー・DB・キャッシュ・監視・メッセージングを、OS のリソース管理の上に乗るプロセスとして捉え直します。設定値の意味をカーネルの挙動から説明できることを目指します。",
+  "order": 10,
+  "accent": "middleware",
+  "level": "実務",
+  "status": "draft"
+}

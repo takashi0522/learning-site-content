@@ -1,0 +1,393 @@
+---
+title: 自己認証局の構築と運用
+description: オンプレでプライベート CA を立てる際の階層設計、トラストストア配布、そして自動更新までを扱います。
+order: 3
+minutes: 19
+tags: ["プライベートCA", "step-ca", "ACME", "トラストストア", "openssl"]
+objectives:
+  - ルート CA と中間 CA を分ける理由を説明できる
+  - トラストストアへの配布方法をディストリビューション別に実施できる
+  - 自動更新を前提とした証明書運用を設計できる
+references:
+  - label: "smallstep — step-ca Documentation"
+    url: "https://smallstep.com/docs/step-ca/"
+  - label: "HashiCorp Vault — PKI Secrets Engine"
+    url: "https://developer.hashicorp.com/vault/docs/secrets/pki"
+  - label: "RFC 8555 — Automatic Certificate Management Environment (ACME)"
+    url: "https://www.rfc-editor.org/rfc/rfc8555.html"
+---
+
+## なぜプライベート CA が必要か
+
+公開 CA（Let's Encrypt など）では対応できない場面があります。
+
+```text
+✗ 内部専用のホスト名     api.internal, db01.corp.local
+                          → 公開 CA は所有を証明できない名前に発行しない
+✗ インターネット非接続    ACME の検証に外部から到達できない
+✗ クライアント証明書      mTLS 用（レッスン 6）
+✗ 機器証明書              BMC、ネットワーク機器、IoT
+✗ 短命証明書              数時間単位の発行
+```
+
+**オンプレで認証基盤を組むなら、プライベート CA はほぼ必須になります。**
+
+<Callout type="note">
+
+「HTTPS にする必要があるのか、内部なのに」という議論がありますが、**内部ネットワークを信頼する前提（境界防御）は現在では成り立たない**とされています。
+
+ネットワークコース レッスン 2・3 で見たとおり、L2 / L3 のレベルで通信を覗いたり割り込んだりすることは技術的に可能です。**内部だからこそ、認証と暗号化が必要**という考え方（ゼロトラスト）が主流です。
+
+</Callout>
+
+---
+
+## 階層設計
+
+**ルート CA と中間 CA を分けるのが原則です。**
+
+<Figure name="ca-hierarchy" caption="ルートを分ける理由は、漏洩したときに復旧できるかどうか" />
+
+---
+
+<h2 className="slide-cont">階層設計（続き）</h2>
+
+<Callout type="warning" title="ルート CA を直接使ってはいけない">
+
+ルート CA で直接証明書を発行する構成は、**鍵が漏洩したときに復旧できません**。
+
+```text
+ルート鍵が漏洩した場合
+  → そのルートを信頼している全クライアントのトラストストアを入れ替える
+  → 全サーバーの証明書を再発行する
+  → その間、何も信頼できない
+```
+
+中間 CA を挟んでおけば、**中間だけを失効・作り直しすればよく、ルート証明書の再配布は不要**です。トラストストアの更新（後述）が最も手間のかかる作業なので、この差は決定的です。
+
+**ルート CA の鍵は、署名するとき以外はオフラインに置いてください。** 中間 CA への署名は数年に一度しか行いません。
+
+</Callout>
+
+---
+
+### 有効期限の目安
+
+| 対象 | 期限 | 理由 |
+| --- | --- | --- |
+| ルート CA | 10〜20 年 | 入れ替えが大変なので長く |
+| 中間 CA | 3〜5 年 | ルートより十分短く |
+| **サーバー / クライアント** | **90 日〜1 年** | **短いほど安全。自動更新が前提** |
+
+---
+
+<h2 className="slide-cont">階層設計（続き）</h2>
+
+```text
+ルートの残り期間 > 中間の残り期間 > 末端の残り期間
+```
+
+この関係を保ってください。**中間 CA の期限がルートより後になるような発行はできません**し、末端の証明書の有効期限が中間 CA の期限を超えることもできません。
+
+---
+
+## 実装の選択肢
+
+| ツール | 特徴 | 向く規模 |
+| --- | --- | --- |
+| **`openssl`** | 標準。設定ファイルが煩雑 | 数枚〜。学習用 |
+| **`step-ca`**（smallstep） | **ACME 対応**。軽量。運用しやすい | **小〜中規模。推奨** |
+| **Vault PKI** | 動的発行、短命証明書、API | 中〜大規模。Vault 前提 |
+| EJBCA / Dogtag | 本格的な商用グレード | 大規模、規制要件あり |
+
+<Callout type="tip">
+
+**オンプレで新規に立てるなら `step-ca` が扱いやすい**です。ACME に対応しているため、Let's Encrypt と同じ仕組み（`certbot`、`acme.sh`、`lego`、Caddy など）で自動更新が組めます。
+
+「openssl でコツコツ発行する」運用は、枚数が増えると必ず破綻します。**最初から自動更新を前提に選んでください。**
+
+</Callout>
+
+### openssl での最小構成
+
+仕組みを理解するために、手作業での流れを示します。
+
+---
+
+<h2 className="slide-cont">実装の選択肢（続き）</h2>
+
+```bash
+# ── ルート CA ──────────────────────────────
+openssl ecparam -genkey -name prime256v1 -out root.key
+chmod 600 root.key
+openssl req -x509 -new -key root.key -sha256 -days 7300 -out root.crt \
+  -subj "/C=JP/O=Example Corp/CN=Example Corp Root CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# ── 中間 CA ────────────────────────────────
+openssl ecparam -genkey -name prime256v1 -out intermediate.key
+openssl req -new -key intermediate.key -out intermediate.csr \
+  -subj "/C=JP/O=Example Corp/CN=Example Corp Intermediate CA R1"
+
+# pathlen:0 = この中間の下にさらに CA を作らせない
+openssl x509 -req -in intermediate.csr -CA root.crt -CAkey root.key \
+  -CAcreateserial -days 1825 -sha256 -out intermediate.crt \
+  -extfile <(printf "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\n")
+
+# ── サーバー証明書（SAN を必ず指定。レッスン 2）──
+openssl ecparam -genkey -name prime256v1 -out server.key
+openssl req -new -key server.key -out server.csr -subj "/CN=api.internal"
+openssl x509 -req -in server.csr -CA intermediate.crt -CAkey intermediate.key \
+  -CAcreateserial -days 90 -sha256 -out server.crt \
+  -extfile <(printf "subjectAltName=DNS:api.internal,DNS:api,IP:10.0.0.10\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+
+# ── 配布用のチェーンを作る ──────────────────
+cat server.crt intermediate.crt > fullchain.crt   # サーバーに置くのはこちら
+cat intermediate.crt root.crt   > ca-chain.crt
+
+# 検証
+openssl verify -CAfile root.crt -untrusted intermediate.crt server.crt
+```
+
+---
+
+<h2 className="slide-cont">実装の選択肢（続き）</h2>
+
+<Callout type="pitfall">
+
+ネットワークコース レッスン 6 で扱ったとおり、**サーバーには `fullchain`（サーバー証明書 + 中間証明書）を設定します**。`server.crt` だけを設定すると、ブラウザでは繋がるのに `curl` や Java から失敗する、という分かりにくい障害になります。
+
+`pathlen:0` の指定も重要です。これがないと、中間 CA がさらに下位の CA を作れてしまい、権限の範囲が意図せず広がります。
+
+</Callout>
+
+---
+
+## トラストストアへの配布
+
+**ここが自己認証局運用の最大の作業です。** レッスン 2 で見たとおり、信頼の根拠はトラストストアに入っていることだけなので、**配布できなければ何の意味もありません**。
+
+### OS のトラストストア
+
+```bash
+# RHEL / Rocky / AlmaLinux
+sudo cp root.crt /etc/pki/ca-trust/source/anchors/example-root-ca.crt
+sudo update-ca-trust extract
+
+# Debian / Ubuntu（拡張子は .crt でなければならない）
+sudo cp root.crt /usr/local/share/ca-certificates/example-root-ca.crt
+sudo update-ca-certificates
+
+# 確認
+openssl verify /path/to/server.crt
+curl -v https://api.internal/    # エラーが出なければ成功
+```
+
+---
+
+<h2 className="slide-cont">トラストストアへの配布（続き）</h2>
+
+<Callout type="warning" title="アプリは OS のトラストストアを見ないことがある">
+
+**最も厄介な問題です。** 多くの言語・ランタイムが**独自のトラストストアを持っています**。
+
+| 環境 | トラストストア | 対処 |
+| --- | --- | --- |
+| **Java** | `$JAVA_HOME/lib/security/cacerts` | `keytool -importcert` |
+| **Python (requests)** | `certifi` パッケージ同梱の PEM | `REQUESTS_CA_BUNDLE` 環境変数 |
+| **Node.js** | 内蔵のリスト | **`NODE_EXTRA_CA_CERTS`** 環境変数 |
+| Go | OS のものを使う（比較的素直） | — |
+| ブラウザ | Firefox は独自。Chrome/Edge は OS | 個別に追加 |
+| **コンテナ** | **イメージ内の `/etc/ssl/certs`** | イメージに焼くかマウント |
+
+```bash
+# Java
+sudo keytool -importcert -trustcacerts -noprompt \
+  -alias example-root-ca -file root.crt \
+  -keystore "$JAVA_HOME/lib/security/cacerts" -storepass changeit
+
+# Node.js
+export NODE_EXTRA_CA_CERTS=/etc/pki/ca-trust/source/anchors/example-root-ca.crt
+
+# Python
+export REQUESTS_CA_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+```
+
+**「OS には入れたのにアプリだけ繋がらない」**は、ほぼこれが原因です。導入時に、**使っているランタイムごとの配布手順を洗い出して手順書に落としてください。**
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">トラストストアへの配布（続き）</h2>
+
+<Callout type="field">
+
+**コンテナは特に忘れられます。** ホストに入れてもイメージの中には入りません。
+
+```dockerfile
+COPY example-root-ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+```
+
+```yaml
+# Kubernetes では ConfigMap でマウントする方法もある
+volumeMounts:
+  - name: ca-bundle
+    mountPath: /etc/ssl/certs/example-root-ca.pem
+    subPath: ca.crt
+```
+
+**ベースイメージに CA を焼いた「社内標準イメージ」を作る**のが、結局いちばん運用が楽になります。
+
+</Callout>
+
+### 配布の自動化
+
+新しいサーバーを立てるたびに手で入れるのは現実的ではありません。構成管理ツールか、キッティングの自動化に組み込みます。
+
+```yaml
+# Ansible の例
+- name: Install internal root CA
+  ansible.builtin.copy:
+    src: example-root-ca.crt
+    dest: /etc/pki/ca-trust/source/anchors/example-root-ca.crt
+    mode: '0644'
+  notify: update ca trust
+```
+
+---
+
+## 自動更新（ACME）
+
+レッスン 2 で見たとおり、**失効を完璧にするより短命化するほうが現実的**です。そのためには自動更新が必須になります。
+
+```bash
+# step-ca を立てる
+step ca init --name "Example Corp" --dns ca.internal --address :443 \
+  --provisioner admin@example.com --deployment-type standalone
+
+# ACME プロビジョナを有効にする
+step ca provisioner add acme --type ACME
+
+# サーバー側から証明書を取得する（Let's Encrypt と同じ手順）
+certbot certonly --standalone \
+  --server https://ca.internal/acme/acme/directory \
+  -d api.internal
+```
+
+<Callout type="tip">
+
+**ACME を使えば、内部でも「証明書は自動で更新されるもの」にできます。**
+
+- 証明書の期限切れによる障害が構造的に起きなくなる
+- 有効期限を短くできる（90 日、さらには 24 時間）
+- 失効の仕組みへの依存が減る
+
+`step-ca` はルート証明書の配布コマンドも持っています。
+
+```bash
+step ca bootstrap --ca-url https://ca.internal --fingerprint <root の SHA256>
+step ca root root.crt
+```
+
+**フィンガープリントで検証する**ため、初回取得時の中間者攻撃を防げます。このフィンガープリントは、安全な経路（社内ドキュメント、構成管理）で配ります。
+
+</Callout>
+
+---
+
+## 鍵の保護と運用
+
+<Callout type="warning" title="ルート鍵の扱い">
+
+**ルート CA の秘密鍵が漏れたら、PKI 全体を作り直すことになります。**
+
+- **オフライン保管** … ネットワークに繋がっていない端末、USB、金庫
+- **パスフレーズで暗号化** … 鍵ファイル単体では使えないようにする
+- **HSM** … 規制要件がある場合。鍵が外に出ない
+- **複数人管理** … 1 人では署名できない運用（鍵の分割、立会い）
+
+中間 CA の鍵はオンラインに置かざるを得ませんが、**その CA サーバーへのアクセスを厳しく制限**してください。運用コース レッスン 3 の権限管理がそのまま適用されます。
+
+</Callout>
+
+### 監視しておくこと
+
+```bash
+# 中間 CA の期限（これが切れると配下の証明書がすべて無効になる）
+openssl x509 -in intermediate.crt -noout -enddate
+
+# 発行した証明書の一覧と期限（step-ca の場合）
+step ca certificates --ca-url https://ca.internal
+```
+
+| 項目 | 閾値の目安 |
+| --- | --- |
+| **ルート CA の残期間** | 2 年を切ったら移行計画 |
+| **中間 CA の残期間** | 6 か月を切ったら更新 |
+| 末端証明書の残期間 | 自動更新が機能していれば不要。**機能の監視は必要** |
+| CA サービスの死活 | 止まると新規発行・更新ができない |
+
+---
+
+<h2 className="slide-cont">鍵の保護と運用（続き）</h2>
+
+<Callout type="pitfall">
+
+**自動更新を入れた後こそ、「更新が動いているか」の監視が必要です。**
+
+更新が静かに失敗していると、誰も気づかないまま期限切れを迎えます。ミドルウェアコース レッスン 5 で扱ったとおり、**実際の証明書の残日数を外形監視**しておくのが確実です。
+
+```promql
+(probe_ssl_earliest_cert_expiry - time()) / 86400 < 14
+```
+
+「自動化したから大丈夫」と監視を外すのは、よくある失敗です。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 内部名、mTLS、機器証明書のために、**オンプレではプライベート CA がほぼ必須**
+- **ルート CA はオフライン、中間 CA でオンライン発行**。ルート直接署名は復旧できなくなる
+- 期限は ルート 10〜20 年 > 中間 3〜5 年 > 末端 90 日〜1 年
+- 新規なら **`step-ca`** が扱いやすい。ACME による自動更新が組める
+- サーバーには **`fullchain`** を置く。`pathlen:0` で中間の権限を絞る
+- **最大の作業はトラストストアへの配布**
+- **Java / Node.js / Python / コンテナは独自のトラストストア**を持つ。OS に入れただけでは足りない
+- 配布は構成管理ツールで自動化し、**CA 入りの標準イメージ**を用意する
+- **自動更新を入れたら、更新が動いているかの外形監視**を必ず入れる
+
+---
+
+<Quiz
+  id="q1"
+  question="プライベート CA を構築する際、ルート CA で直接サーバー証明書を発行せず、中間 CA を挟むことが推奨される最大の理由はどれですか。"
+  options={[
+    "発行処理が高速になるため",
+    "ルート鍵が漏洩した場合に全クライアントのトラストストア入れ替えが必要になるが、中間 CA を挟めば中間だけを作り直せば済むため",
+    "中間 CA を挟まないと SAN が指定できないため",
+    "ACME プロトコルが中間 CA を必須としているため"
+  ]}
+  answer={1}
+  explanation="ルート証明書はすべてのクライアントのトラストストアに配布されており、その入れ替えは最も手間のかかる作業です。ルート鍵で直接発行していると、鍵漏洩時にはルートの再配布と全証明書の再発行が同時に必要になり、その間何も信頼できない状態になります。中間 CA を挟んでおけば、中間を失効させて作り直すだけで済み、ルート証明書の再配布は不要です。そのためルート鍵はオフラインに保管し、署名は数年に一度の中間 CA 発行時のみに限定します。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="自己認証局のルート証明書を全サーバーの OS トラストストアに配布し、curl では正常に接続できるようになりました。しかし Java アプリケーションだけが証明書検証エラーで接続できません。原因はどれですか。"
+  options={[
+    "証明書の SAN が不足している",
+    "Java は OS のトラストストアではなく独自の cacerts キーストアを参照するため、keytool で別途インポートする必要がある",
+    "中間証明書が配信されていない",
+    "ルート CA の有効期限が切れている"
+  ]}
+  answer={1}
+  explanation="Java は $JAVA_HOME/lib/security/cacerts という独自のキーストアを参照し、OS のトラストストアを見ません。keytool -importcert で個別に追加する必要があります。同様に Node.js は NODE_EXTRA_CA_CERTS、Python の requests は certifi ベースのため REQUESTS_CA_BUNDLE、コンテナはイメージ内の /etc/ssl/certs というように、ランタイムごとに配布先が異なります。プライベート CA 導入時は、使用するランタイムごとの配布手順を洗い出しておく必要があります。"
+/>

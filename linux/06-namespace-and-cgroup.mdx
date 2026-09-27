@@ -1,0 +1,290 @@
+---
+title: namespace と cgroup — コンテナの中身
+description: コンテナが「隔離」と「制限」の2つのカーネル機能の組み合わせであることを、実際に手で分解して確認します。
+order: 6
+minutes: 20
+tags: ["namespace", "cgroup", "container", "unshare", "systemd"]
+objectives:
+  - namespace が何を隔離し、cgroup が何を制限するのかを区別して説明できる
+  - コンテナを使わずに namespace と cgroup を直接操作できる
+  - コンテナのメモリ制限と OOM の関係を説明できる
+video:
+  provider: youtube
+  id: sK5i-N34im8
+  title: "Cgroups, namespaces, and beyond: what are containers made from?"
+  channel: Docker (Jérôme Petazzoni)
+references:
+  - label: "namespaces(7) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man7/namespaces.7.html"
+  - label: "Control Group v2 — kernel docs"
+    url: "https://docs.kernel.org/admin-guide/cgroup-v2.html"
+  - label: "unshare(1) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man1/unshare.1.html"
+---
+
+## コンテナという機能は存在しない
+
+Linux カーネルに「コンテナ」という機能はありません。あるのは独立した 2 つの仕組みで、コンテナランタイムはこれらを組み合わせているだけです。
+
+| 仕組み | 担当 | 一言でいうと |
+| --- | --- | --- |
+| **namespace** | 隔離 | 「何が見えるか」を変える |
+| **cgroup** | 制限 | 「どれだけ使えるか」を決める |
+
+この 2 つを分けて理解しておくと、コンテナのトラブルがどちら側の問題かを即座に切り分けられます。「他のコンテナのプロセスが見えてしまう」は namespace の問題、「メモリ制限で落ちる」は cgroup の問題です。
+
+---
+
+## namespace: 見えるものを変える
+
+namespace は、あるリソースの「見え方」をプロセスごとに切り替える仕組みです。8 種類あります。
+
+| namespace | 隔離する対象 |
+| --- | --- |
+| `mnt` | マウントポイント（ファイルシステムの見え方） |
+| `pid` | プロセス ID 空間。中では自分が PID 1 に見える |
+| `net` | ネットワークインターフェース、ルーティング表、ポート |
+| `uts` | ホスト名、ドメイン名 |
+| `ipc` | System V IPC、POSIX メッセージキュー |
+| `user` | UID / GID の対応。**中の root を外の一般ユーザーに対応付けられる** |
+| `cgroup` | cgroup 階層のルートの見え方 |
+| `time` | システム起動時刻（`CLOCK_MONOTONIC` の基準） |
+
+```bash
+# プロセスが属している namespace を確認する
+ls -l /proc/self/ns/
+# lrwxrwxrwx 1 root root 0 Sep 19 10:00 net -> 'net:[4026531840]'
+# lrwxrwxrwx 1 root root 0 Sep 19 10:00 pid -> 'pid:[4026531836]'
+```
+
+角括弧の中は inode 番号です。**2 つのプロセスでこの番号が一致すれば、同じ namespace にいます。** コンテナが本当に分離されているかを確認する最も確実な方法です。
+
+### 手で作ってみる
+
+コンテナランタイムを使わずに、PID namespace を作れます。
+
+---
+
+<h2 className="slide-cont">namespace: 見えるものを変える（続き）</h2>
+
+```bash
+# PID と mount の namespace を新規作成して bash を起動
+sudo unshare --pid --mount --fork --mount-proc bash
+
+# 中で実行すると…
+ps aux
+# USER  PID %CPU %MEM    VSZ   RSS TTY  STAT START   TIME COMMAND
+# root    1  0.0  0.0  10784  3456 pts/0 S   10:05   0:00 bash
+# root   12  0.0  0.0  11632  3200 pts/0 R+  10:05   0:00 ps aux
+```
+
+**プロセスが 2 つしか見えません。** bash が PID 1 になっています。ホストのプロセスは依然として動いていますが、この namespace からは見えません。
+
+`--mount-proc` が必要な理由も重要です。`/proc` はカーネルがプロセス一覧を見せる擬似ファイルシステムで、`ps` はここを読んでいます。新しい PID namespace 用に `/proc` をマウントし直さないと、古い（ホストの）プロセス一覧が見えたままになります。
+
+```bash
+# ネットワーク namespace を作ると、ループバックすら持たない状態から始まる
+sudo unshare --net bash
+ip addr
+# 1: lo: <LOOPBACK> mtu 65536 qdisc noop state DOWN
+```
+
+<Callout type="field">
+
+障害調査で「コンテナの中からは繋がらないが、ホストからは繋がる」という状況に遭遇したら、それは net namespace が分離されているからです。`nsenter -t <PID> -n ip addr` のように、対象プロセスの namespace に入って確認すると原因が見えます。コンテナに `ip` や `ss` が入っていなくても、ホスト側のツールで中を調べられます。
+
+</Callout>
+
+---
+
+## cgroup: 使える量を決める
+
+cgroup（control group）は、プロセスのグループに対してリソースの上限と配分を設定する仕組みです。現在は **cgroup v2**（統一階層）が主流で、`/sys/fs/cgroup` 以下のディレクトリ構造がそのまま cgroup の階層になっています。
+
+```bash
+# v2 が使われているかの確認（cgroup2fs と出れば v2）
+stat -fc %T /sys/fs/cgroup/
+
+# あるプロセスが属している cgroup
+cat /proc/1234/cgroup
+# 0::/system.slice/nginx.service
+```
+
+主なコントローラは次のとおりです。
+
+| ファイル | 制御内容 |
+| --- | --- |
+| `memory.max` | メモリの**ハードリミット**。超えると cgroup 内で OOM |
+| `memory.high` | ソフトリミット。超えると**強く回収圧をかけて減速させる**（OOM にはしない） |
+| `cpu.max` | CPU 時間の上限。`"<quota> <period>"` 形式 |
+| `io.max` | ブロックデバイスの IOPS / 帯域上限 |
+| `pids.max` | プロセス数の上限（fork 爆弾対策） |
+
+### 手で作ってみる
+
+---
+
+<h2 className="slide-cont">cgroup: 使える量を決める（続き）</h2>
+
+```bash
+# cgroup を作る（ディレクトリを作るだけ）
+sudo mkdir /sys/fs/cgroup/demo
+
+# メモリ上限 100MiB
+echo "100M" | sudo tee /sys/fs/cgroup/demo/memory.max
+
+# CPU は 100ms のうち 20ms まで = 0.2 コア相当
+echo "20000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max
+
+# 現在のシェルをこの cgroup に入れる
+echo $$ | sudo tee /sys/fs/cgroup/demo/cgroup.procs
+
+# ここから先、このシェルとその子プロセスは上限に従う
+cat /sys/fs/cgroup/demo/memory.current   # 現在の使用量
+cat /sys/fs/cgroup/demo/memory.events    # oom / oom_kill の発生回数
+```
+
+`cpu.max` の `"20000 100000"` は「100000 マイクロ秒（100ms）の期間のうち、最大 20000 マイクロ秒だけ CPU を使ってよい」という意味です。コア数ではなく**時間の割合**で指定します。
+
+<Callout type="warning" title="CPU 制限によるスロットリング">
+
+`cpu.max` による制限は、割り当てを使い切った時点でその期間の残り時間まで**完全に実行を止める**方式です。平均使用率が上限を下回っていても、瞬間的に上限に達すればその周期の残りは止まります。
+
+これが「CPU 使用率は 40% なのにレスポンスが遅い」という症状の原因になります。`cpu.stat` の `throttled_usec` が増えていないか確認してください。
+
+```bash
+cat /sys/fs/cgroup/demo/cpu.stat | grep throttled
+```
+
+</Callout>
+
+### memory.max と memory.high の違い
+
+---
+
+<h2 className="slide-cont">cgroup: 使える量を決める（続き）</h2>
+
+コンテナのメモリ制限を理解するうえで重要な区別です。
+
+- **`memory.max`** … 超えた瞬間、その cgroup 内で OOM Killer が動く。プロセスは**即座に殺される**
+- **`memory.high`** … 超えても殺さない。カーネルが強制的にページを回収し、プロセスを**遅くして**抑え込む
+
+Docker や Kubernetes の memory limit は `memory.max` に対応します。つまり上限に触れた瞬間に強制終了です。段階的に減速させたい場合は `memory.high` を併用します。
+
+```bash
+# cgroup 内での OOM 発生を確認する
+cat /sys/fs/cgroup/system.slice/myapp.service/memory.events
+# low 0
+# high 0
+# max 142      ← memory.max に到達した回数
+# oom 3
+# oom_kill 3   ← 実際にプロセスが殺された回数
+```
+
+<Callout type="pitfall">
+
+コンテナが「原因不明で再起動している」場合、ホストの `dmesg` に OOM のログが出ていないことがあります。cgroup 内の OOM はシステム全体のメモリ不足ではないため、現れ方が異なるためです。上記の `memory.events` の `oom_kill` を確認するのが確実です。Kubernetes なら Pod の状態が `OOMKilled` になります。
+
+</Callout>
+
+---
+
+## systemd と cgroup
+
+前のレッスンで触れたとおり、systemd はすべてのサービスを自動的に cgroup に入れています。
+
+```bash
+# cgroup 階層をサービス単位で表示
+systemd-cgls
+
+# リソース使用量をリアルタイムで（top の cgroup 版）
+systemd-cgtop
+```
+
+階層は 3 つの slice に分かれています。
+
+```text
+/sys/fs/cgroup/
+├── system.slice/        systemd が管理するサービス
+│   ├── nginx.service/
+│   └── postgresql.service/
+├── user.slice/          ログインユーザーのセッション
+│   └── user-1000.slice/
+└── machine.slice/       VM とコンテナ
+```
+
+`systemctl set-property` を使えば、再起動せずに上限を変更できます。
+
+```bash
+# 即座に反映され、drop-in ファイルにも永続化される
+systemctl set-property nginx.service MemoryMax=2G CPUQuota=150%
+
+# 一時的な変更（再起動で戻る）
+systemctl set-property --runtime nginx.service MemoryMax=1G
+```
+
+---
+
+## コンテナを組み立て直す
+
+ここまでの要素を並べると、コンテナランタイムがしていることが見えてきます。
+
+<Figure name="container-parts" caption="コンテナという実体はない。普通のプロセスに 4 つの仕組みをかけ合わせている" />
+
+「コンテナは軽量な仮想マシン」という説明は、この構造を見ると誤解を招くと分かります。**動いているのはホストのカーネル上の、ただのプロセスです。** 見える範囲と使える量が制限されているだけで、仮想化は一切行われていません。
+
+---
+
+<h2 className="slide-cont">コンテナを組み立て直す（続き）</h2>
+
+だからこそ、次のことが成り立ちます。
+
+- コンテナのプロセスは、ホストの `ps aux` にそのまま見える
+- ホストのカーネルの脆弱性は、コンテナの中にも影響する
+- コンテナは別のカーネルバージョンでは動かせない（Windows 上の Linux コンテナが VM を必要とするのはこのため）
+- 起動が速いのは、OS を起動していないから
+
+<Callout type="tip">
+
+ここまでの 6 レッスンが繋がります。コンテナの中のプロセスも、レッスン 1 のシステムコールでカーネルを呼び、レッスン 3 の demand paging でメモリを得て、レッスン 4 のページキャッシュ（**ホストと共有**）を使います。コンテナ特有の挙動に見えるものの多くは、実際には通常の Linux の挙動に制限が加わった結果です。
+
+</Callout>
+
+---
+
+## まとめ
+
+- コンテナ = **namespace（隔離）+ cgroup（制限）+ pivot_root + 権限制限**。単一の機能ではない
+- namespace の同一性は `/proc/<pid>/ns/` の inode 番号で判定できる
+- cgroup v2 では `/sys/fs/cgroup` のディレクトリ構造がそのまま階層
+- `memory.max` は即 OOM、`memory.high` は減速。コンテナの limit は前者
+- CPU 制限はスロットリングとして現れる。`cpu.stat` の `throttled_usec` を見る
+- systemd はすべてのサービスを cgroup で管理しており、`systemctl set-property` で制御できる
+
+<Quiz
+  id="q1"
+  question="コンテナのプロセスがホストの ps aux にも表示されます。これはどういう状態ですか。"
+  options={[
+    "コンテナの隔離が破られており、設定ミスの可能性が高い",
+    "正常な状態。コンテナのプロセスはホストのカーネル上で動くただのプロセスであり、ホストの PID namespace からは見える",
+    "コンテナが特権モードで起動されている",
+    "PID namespace が作成されていない"
+  ]}
+  answer={1}
+  explanation="PID namespace は入れ子構造です。コンテナ内のプロセスはコンテナから見れば PID 1 ですが、親である（ホストの）namespace からは別の PID で見えます。これは設計どおりの正常な状態で、だからこそホスト側のツールでコンテナ内を調査できます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="コンテナの CPU 使用率は 40% 程度なのに、レスポンスタイムが断続的に悪化しています。最初に確認すべきものはどれですか。"
+  options={[
+    "memory.events の oom_kill",
+    "cpu.stat の throttled_usec",
+    "pids.max の設定値",
+    "ホストのロードアベレージ"
+  ]}
+  answer={1}
+  explanation="cpu.max による制限は、その周期内の割り当てを使い切った時点で残り時間の実行を完全に停止させます。バースト的な負荷では平均使用率が低くてもスロットリングが発生し、その間の待ちがレスポンス悪化として現れます。cpu.stat の throttled_usec と nr_throttled が増えていれば確定です。"
+/>

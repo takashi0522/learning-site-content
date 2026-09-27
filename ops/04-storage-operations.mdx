@@ -1,0 +1,327 @@
+---
+title: ストレージ運用と容量逼迫の対処
+description: LVM でのオンライン拡張、fstab の安全な書き方、そして「ディスクが満杯」への対処手順をまとめます。
+order: 4
+minutes: 18
+tags: ["LVM", "fstab", "xfs_growfs", "df", "UUID"]
+objectives:
+  - LVM でファイルシステムを無停止で拡張できる
+  - fstab を編集してもサーバーが起動しなくなる事態を避けられる
+  - 容量逼迫時に、消してよいものとそうでないものを判断できる
+references:
+  - label: "lvm(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/lvm.8.html"
+  - label: "fstab(5) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man5/fstab.5.html"
+  - label: "xfs_growfs(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/xfs_growfs.8.html"
+---
+
+## 現状を把握する
+
+作業前に、必ず全体の構造を把握します。
+
+```bash
+# ブロックデバイスの階層（最初に打つべきコマンド）
+lsblk -f
+
+# マウント状況とファイルシステム種別
+findmnt
+
+# 容量と inode
+df -hT
+df -i
+
+# LVM の3階層
+sudo pvs      # 物理ボリューム（PV）
+sudo vgs      # ボリュームグループ（VG）
+sudo lvs      # 論理ボリューム（LV）
+```
+
+```text
+$ lsblk -f
+NAME            FSTYPE      LABEL UUID                                 MOUNTPOINTS
+sda
+├─sda1          xfs               1a2b3c4d-...                         /boot
+└─sda2          LVM2_member       9z8y7x6w-...
+  ├─vg0-root    xfs               5e6f7a8b-...                         /
+  ├─vg0-swap    swap              2c3d4e5f-...                         [SWAP]
+  └─vg0-var     xfs               8h9i0j1k-...                         /var
+```
+
+---
+
+<h2 className="slide-cont">現状を把握する（続き）</h2>
+
+LVM の構造はこの 3 段です。**拡張はこの階層を下から順に確認していく作業**になります。
+
+<Figure name="lvm-stack" caption="LVM の階層。容量拡張は下から順に空きを確認していく作業になる" />
+
+---
+
+## LVM でオンライン拡張する
+
+「`/var` が逼迫してきた」への対処です。**マウントしたまま、無停止で拡張できます。**
+
+### ① VG に空きがあるか確認
+
+```bash
+sudo vgs
+#   VG   #PV #LV #SN Attr   VSize   VFree
+#   vg0    1   3   0 wz--n- 500.00g  120.00g    ← 120GB の空きがある
+```
+
+空きがあれば ③ へ。なければ ② でディスクを足します。
+
+### ② ディスクを追加して VG を広げる
+
+```bash
+# 新しいディスクを認識させる（仮想環境でオンライン追加した場合）
+ls /sys/class/scsi_host/
+for h in /sys/class/scsi_host/host*/scan; do echo "- - -" | sudo tee $h; done
+lsblk    # /dev/sdb が見えるか確認
+
+# PV として初期化し、既存 VG に追加する
+sudo pvcreate /dev/sdb
+sudo vgextend vg0 /dev/sdb
+sudo vgs     # VFree が増える
+```
+
+<Callout type="tip">
+
+**パーティションを切らず、ディスク全体をそのまま PV にする**方が後々楽です（`/dev/sdb1` ではなく `/dev/sdb`）。パーティションテーブルの制約を受けず、拡張時の手順も減ります。
+
+既存の構成に合わせる必要がある場合はこの限りではありませんが、新規に組むなら検討してください。
+
+</Callout>
+
+### ③ LV を拡張し、ファイルシステムを追従させる
+
+---
+
+<h2 className="slide-cont">LVM でオンライン拡張する（続き）</h2>
+
+```bash
+# LV を 50GB 拡張し、同時にファイルシステムも広げる（-r が肝）
+sudo lvextend -L +50G -r /dev/vg0/var
+
+# VG の空きを全部使う場合
+sudo lvextend -l +100%FREE -r /dev/vg0/var
+
+# 確認
+df -h /var
+```
+
+**`-r`（`--resizefs`）を付ければ、ファイルシステムの拡張まで自動**で行われます。付け忘れた場合は手動で行います。
+
+```bash
+# XFS（マウントポイントを指定する。アンマウント不可）
+sudo xfs_growfs /var
+
+# ext4（デバイスを指定する）
+sudo resize2fs /dev/vg0/var
+```
+
+<Callout type="warning" title="XFS は縮小できない">
+
+**XFS にはファイルシステムを縮小する機能がありません。** 一度広げたら戻せません。
+
+ext4 は縮小できますが、**アンマウントが必要**で、失敗するとデータを失います。
+
+つまり実質的に「拡張は簡単、縮小は困難」です。LV のサイズは**小さめに始めて、必要になったら足す**のが安全な運用です。最初から VG の全容量を LV に割り当ててしまうと、後から別の用途に回す余地がなくなります。
+
+</Callout>
+
+---
+
+## fstab: 起動しなくなる編集を避ける
+
+`/etc/fstab` の記述ミスは、**サーバーが起動しなくなる**数少ない設定ミスの一つです。
+
+```text
+UUID=8h9i0j1k-...  /var   xfs   defaults,nofail   0 0
+     ↑デバイス指定  ↑先   ↑種別  ↑オプション        ↑dump ↑fsck順
+```
+
+### デバイス名ではなく UUID を使う
+
+```bash
+# UUID を調べる
+lsblk -f
+sudo blkid /dev/vg0/var
+```
+
+`/dev/sdb` のようなデバイス名は、**ディスクの増設や起動順で変わることがあります**。`/dev/sdb` だったものが再起動後に `/dev/sdc` になると、間違ったデバイスをマウントするか、起動に失敗します。
+
+UUID（または LVM のデバイスパス `/dev/vg0/var`）を使えば、この問題は起きません。
+
+### nofail を付けるか判断する
+
+| オプション | 対象デバイスがマウントできないとき |
+| --- | --- |
+| （なし） | **起動が停止**し、emergency mode に入る |
+| `nofail` | 警告だけ出して**起動を続行** |
+
+---
+
+<h2 className="slide-cont">fstab: 起動しなくなる編集を避ける（続き）</h2>
+
+<Callout type="pitfall">
+
+外付けストレージ、NFS、iSCSI など**常に存在するとは限らないマウント先**に `nofail` を付けていないと、そのストレージの障害でサーバーごと起動しなくなります。
+
+一方、`/var` や `/home` のようにサービスの動作に必須な領域に `nofail` を付けると、マウントされないまま起動してしまい、**ルートファイルシステム上に勝手にデータが書かれ始める**という厄介な状態になります。
+
+必須かどうかで使い分けてください。
+
+NFS の場合は追加で `_netdev` も必要です（ネットワークが上がるまで待たせる指定）。
+
+```text
+nfs.example.com:/export/data  /mnt/data  nfs  defaults,_netdev,nofail  0 0
+```
+
+</Callout>
+
+### 再起動する前に必ず検証する
+
+```bash
+# ① 構文と、fstab に書いた内容で実際にマウントできるか
+sudo mount -a
+
+# ② systemd に fstab を読み直させ、エラーがないか確認
+sudo systemctl daemon-reload
+sudo findmnt --verify --verbose
+```
+
+**`mount -a` がエラーなく通ることを確認してから再起動してください。** これを習慣にするだけで、起動不能の事故はほぼ防げます。
+
+---
+
+## ディスク満杯への対処
+
+### ① どこが食っているかを特定する
+
+```bash
+# ファイルシステム境界を越えない（-x）。/proc や他マウントを数えないため重要
+sudo du -xh --max-depth=1 / 2>/dev/null | sort -rh | head
+
+# 大きい方から辿っていく
+sudo du -xh --max-depth=1 /var 2>/dev/null | sort -rh | head
+
+# 大きいファイルを直接探す
+sudo find /var -xdev -type f -size +500M -exec ls -lh {} \; 2>/dev/null
+```
+
+### ② df と du が食い違う場合
+
+```bash
+# 削除済みだが、プロセスが開いたままのファイル
+sudo lsof +L1
+```
+
+`NLINK` が 0 のファイルが出てきたら、Linux コース レッスン 4 の状態です。プロセスにファイルを開き直させれば解放されます。
+
+```bash
+sudo systemctl reload nginx        # または該当プロセスに適切なシグナル
+```
+
+### ③ inode 枯渇の場合
+
+```bash
+df -i      # IUse% が 100% なら容量ではなく inode が枯渇している
+
+# 小さいファイルが大量にあるディレクトリを探す
+sudo find /var -xdev -type d -exec sh -c 'echo "$(ls -U "$1" | wc -l) $1"' _ {} \; 2>/dev/null \
+  | sort -rn | head
+```
+
+---
+
+<h2 className="slide-cont">ディスク満杯への対処（続き）</h2>
+
+<Callout type="warning" title="消してよいもの・いけないもの">
+
+**消してよい（安全）**
+
+```bash
+sudo journalctl --vacuum-size=200M           # ジャーナルを縮める
+sudo dnf clean all       /  sudo apt clean   # パッケージキャッシュ
+sudo rm -rf /var/tmp/*                       # 一時ファイル（要確認）
+sudo docker system prune -a                  # 未使用のイメージ・コンテナ
+```
+
+**消してはいけない / 慎重に**
+
+- `/var/lib/` 配下 — **データベースの実体**が入っていることが多い
+- `/var/log/` の**アクティブなログファイル** — `rm` すると開いたままになり容量が戻らない。**`: > file` で切り詰める**
+- 意味の分からないファイル全般
+
+```bash
+# ログを消すのではなく、中身を空にする（inode を保つ）
+sudo truncate -s 0 /var/log/huge.log
+# または
+sudo sh -c ': > /var/log/huge.log'
+```
+
+**`rm` ではなく `truncate` を使う。** これがログ対応の原則です。
+
+</Callout>
+
+### ④ 緊急時の一時しのぎ
+
+ルートファイルシステムが 100% になると、ログインすらできなくなることがあります。予備領域を確保しておく手があります。
+
+```bash
+# 事前に 1GB のダミーファイルを置いておく
+sudo fallocate -l 1G /var/emergency-ballast
+
+# 逼迫時に消せば、作業する余地が生まれる
+sudo rm /var/emergency-ballast
+```
+
+---
+
+<h2 className="slide-cont">ディスク満杯への対処（続き）</h2>
+
+作業スペースを確保してから、落ち着いて原因を調べられます。対処が終わったら再作成しておいてください。
+
+---
+
+## まとめ
+
+- 作業前に `lsblk -f` と `findmnt` で構造を把握する
+- LVM の拡張は **`lvextend -r` でファイルシステムまで一度に**、無停止でできる
+- **XFS は縮小できない。** LV は小さく始めて足していく
+- fstab は **UUID で書く**。デバイス名は起動ごとに変わりうる
+- `nofail` は「なくても起動してよい」マウント先にだけ付ける
+- **`mount -a` と `findmnt --verify` を通してから再起動する**
+- `du -x` でファイルシステム境界を越えないようにする
+- **ログは `rm` せず `truncate` で空にする**
+
+<Quiz
+  id="q1"
+  question="/var の空きが逼迫したため、LVM で拡張します。vgs を見ると VFree が 100GB あります。マウントしたまま /var を 50GB 拡張する適切な手順はどれですか。"
+  options={[
+    "umount /var してから lvextend -L +50G /dev/vg0/var を実行し、再マウントする",
+    "lvextend -L +50G -r /dev/vg0/var を実行する（-r でファイルシステムも同時に拡張される）",
+    "pvcreate で新しいディスクを追加する必要がある",
+    "xfs_growfs を先に実行してから lvextend する"
+  ]}
+  answer={1}
+  explanation="VG に空きがあるため新しいディスクの追加は不要です。lvextend の -r（--resizefs）オプションを付けると、論理ボリュームの拡張に続けてファイルシステムの拡張まで自動で行われます。XFS も ext4 もマウントしたまま拡張できるため、アンマウントは不要です。なお -r を付け忘れた場合は、後から xfs_growfs /var や resize2fs を実行して追従させます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="/var/log/app.log が 40GB に膨れ、ディスクを圧迫しています。アプリケーションは稼働中でこのファイルに書き込み続けています。適切な対処はどれですか。"
+  options={[
+    "rm /var/log/app.log で削除する",
+    "truncate -s 0 /var/log/app.log で中身を空にする",
+    "mv /var/log/app.log /tmp/ で移動する",
+    "アプリケーションを停止してから削除する以外に方法はない"
+  ]}
+  answer={1}
+  explanation="rm や mv ではディレクトリエントリが変わるだけで、アプリケーションは同じ inode に書き続けます。rm した場合は「削除済みだが開かれたまま」となり、容量がまったく戻らないうえ du でも見えなくなります。truncate -s 0（または : > file）なら inode を保ったままサイズだけを 0 にできるため、アプリは何事もなく書き込みを続け、容量は即座に解放されます。"
+/>

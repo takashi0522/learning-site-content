@@ -1,0 +1,343 @@
+---
+title: InfiniBand とロスレスファブリック
+description: IB のアドレッシングと Subnet Manager の役割を押さえ、ファブリックの診断コマンドを使えるようにします。
+order: 2
+minutes: 19
+tags: ["InfiniBand", "RDMA", "Subnet Manager", "RoCE", "ibdiagnet", "SHARP"]
+objectives:
+  - InfiniBand が Ethernet と根本的に違う点を説明できる
+  - Subnet Manager の役割と、停止したときに何が起きるかを説明できる
+  - ファブリックの状態を診断コマンドで確認できる
+references:
+  - label: "NVIDIA Networking Documentation (InfiniBand)"
+    url: "https://docs.nvidia.com/networking/"
+  - label: "InfiniBand Trade Association — Specifications"
+    url: "https://www.infinibandta.org/ibta-specification/"
+  - label: "rdma-core — Linux RDMA userspace"
+    url: "https://github.com/linux-rdma/rdma-core"
+---
+
+## Ethernet とは設計思想が違う
+
+InfiniBand は「速い Ethernet」ではありません。**前提そのものが違います。**
+
+| | **Ethernet（従来）** | **InfiniBand** |
+| --- | --- | --- |
+| パケットロス | **前提として起きる**。TCP が再送で吸収 | **起きない前提**（クレジットベースのフロー制御） |
+| フロー制御 | 基本なし（輻輳したら捨てる） | **送信前に受信側のバッファ空きを確認** |
+| 経路制御 | 各スイッチが自律的に判断 | **Subnet Manager が集中管理** |
+| アドレス | MAC / IP | **LID**（ローカル）/ **GUID**（グローバル） |
+| データ転送 | カーネルのプロトコルスタック経由 | **RDMA**（カーネルを通らない） |
+| レイテンシ | 10μs 以上 | **1〜2μs** |
+
+---
+
+### クレジットベースフロー制御
+
+InfiniBand の中核にある考え方です。
+
+<Figure name="ib-credit-flow" caption="Ethernet は溢れてから捨てる。InfiniBand は最初から溢れさせない" />
+
+**受信側に空きがあることを確認してから送る**ため、バッファ溢れによる破棄が原理的に起きません。ネットワークコース レッスン 1 で見たような「リングバッファ溢れでドロップ」という事象が、そもそも発生しない設計です。
+
+これが**再送処理を不要にし**、レイテンシを 1μs 台に抑えている理由です。
+
+---
+
+## Subnet Manager: ファブリックの頭脳
+
+Ethernet のスイッチは各自が MAC アドレスを学習して自律的に動きますが、**InfiniBand には集中管理を行う Subnet Manager（SM）が必須**です。
+
+SM が行うこと。
+
+1. ファブリック全体をスキャンし、**トポロジを把握する**
+2. 各ポートに **LID**（Local Identifier、16 ビットのアドレス）を割り当てる
+3. 全スイッチに**経路表を配布する**
+4. リンクの追加・故障を検知し、**経路を再計算して再配布する**
+
+```bash
+# SM がどこで動いているか（priority が高いものがマスター）
+sminfo
+```
+
+```text
+sminfo: sm lid 1 sm guid 0x506b4b03005a8c40, activity count 1284 priority 15 state 3 SMINFO_MASTER
+```
+
+SM の実装は 2 通りあります。
+
+| 方式 | 内容 |
+| --- | --- |
+| **ソフトウェア SM**（`opensm`） | サーバー上で動かす。小〜中規模向け。無償 |
+| **スイッチ組み込み / 管理ソフト**（UFM など） | スイッチ自身、または専用管理ノードが担う。大規模向け |
+
+---
+
+<h2 className="slide-cont">Subnet Manager: ファブリックの頭脳（続き）</h2>
+
+<Callout type="warning" title="SM が止まるとどうなるか">
+
+**既に確立している通信は、SM が止まっても継続します。** 経路表はスイッチに配布済みだからです。
+
+しかし、次のことができなくなります。
+
+- **新しいノードがファブリックに参加できない**（LID が割り当てられない）
+- **リンク障害時の経路の再計算ができない** → 迂回できず通信断のまま
+- ノードの再起動後、そのノードが復帰できない
+
+つまり「今は動いているが、何かあった瞬間に復旧できない」という危険な状態になります。
+
+**SM は必ず冗長化してください。** `opensm` を複数ノードで動かし、`priority` を設定すればマスター / スタンバイの構成になります。
+
+```bash
+# /etc/opensm/opensm.conf
+# priority が高いほうがマスターになる
+sm_priority 15
+```
+
+構築時に「1 台で動かして、そのまま」になっているクラスタは実際にあります。導入時のチェック項目に入れてください。
+
+</Callout>
+
+---
+
+## リンク速度と世代
+
+IB の速度は**世代名 × レーン数**で表されます。Ethernet（ファシリティコース レッスン 4）と同じ考え方です。
+
+| 世代 | 1 レーン | 4 レーン（`4X`、一般的） | フォームファクタ |
+| --- | --- | --- | --- |
+| FDR | 14G | 56G | QSFP+ |
+| **EDR** | 25G | **100G** | QSFP28 |
+| **HDR** | 50G | **200G** | QSFP56 |
+| **NDR** | 100G | **400G** | **OSFP** |
+| XDR | 200G | 800G | OSFP |
+
+<Callout type="note" title="HDR100 という構成">
+
+HDR（4×50G = 200G）のスイッチポートを、**2 レーンずつに分けて 100G×2 として使う**構成があります。これを **HDR100** と呼びます。
+
+ファシリティコース レッスン 6 で扱ったブレイクアウトと同じ発想で、**ポート単価を下げる**ために使われます。サーバー側が 200G を必要としない場合、1 つのスイッチポートで 2 台のサーバーを収容できます。
+
+NDR でも同様に、1 ポートを 2×200G や 4×100G に分割する構成が使われます。**IB スイッチの「ポート数」も、Ethernet と同様に分割前提で見る必要があります。**
+
+</Callout>
+
+---
+
+## 状態を確認する
+
+IB の診断コマンドは Ethernet のものとまったく別系統です。ここだけは覚える必要があります。
+
+```bash
+# ① 自ノードの HCA とポートの状態（最初に打つ）
+ibstat
+```
+
+```text
+CA 'mlx5_0'
+    CA type: MT4123
+    Firmware version: 20.39.2048
+    Port 1:
+        State: Active                    ← Active なら正常
+        Physical state: LinkUp
+        Rate: 200                        ← 200Gbps でリンクしている
+        Base lid: 12                     ← SM から割り当てられた LID
+        Link layer: InfiniBand           ← RoCE の場合は Ethernet と表示される
+```
+
+| `State` | 意味 |
+| --- | --- |
+| `Active` | 正常 |
+| `Initializing` | **リンクは上がっているが SM から設定を受けていない** → SM を確認 |
+| `Down` | 物理リンクが上がっていない → ケーブル、トランシーバ |
+
+<Callout type="field">
+
+**`Initializing` で止まっているのは、SM が動いていないか到達できていない**ことを示す典型的な症状です。物理層は正常なので、ケーブルを疑って時間を浪費しがちです。
+
+`ibstat` で `Initializing` を見たら、まず `sminfo` で SM の生死を確認してください。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">状態を確認する（続き）</h2>
+
+```bash
+# ② ファブリック全体のトポロジ
+ibnetdiscover | head -40
+
+# ③ 全リンクの速度と状態を一覧（速度が落ちているリンクを発見できる）
+iblinkinfo
+
+# ④ エラーカウンタを読む
+perfquery -a
+
+# ⑤ 総合診断（最も強力。定期的に実行して保存しておく）
+ibdiagnet
+```
+
+`ibdiagnet` は、トポロジ・リンク速度・エラーカウンタ・SM の状態をまとめて検査し、**問題があるリンクを指摘してくれます**。
+
+```text
+-I- Links with symbol errors > threshold:
+    "S-b8599f0300d1c2a4"/P17 <--> "H-0c42a10300a8f2c1"/P1   symbol_error=1834
+```
+
+<Callout type="tip">
+
+**導入時に `ibdiagnet` の結果を保存しておいてください。** 後から劣化を比較する基準になります。
+
+```bash
+# 結果は /var/tmp/ibdiagnet2/ 以下に出力される
+sudo ibdiagnet -o /var/tmp/ibdiag-$(date +%F)
+```
+
+`symbol_error` や `link_downed` が増え続けているリンクは、ケーブルやトランシーバの劣化を示します。ファシリティコース レッスン 3 で扱った清掃や曲げ半径の問題が、ここに数字として現れます。
+
+</Callout>
+
+### IPoIB
+
+IB 上で IP 通信を行う仕組みです。**管理用途では便利ですが、性能は出ません。**
+
+---
+
+<h2 className="slide-cont">状態を確認する（続き）</h2>
+
+```bash
+ip addr show ib0
+```
+
+RDMA の利点（カーネルバイパス）を使わず、通常のプロトコルスタックを通るためです。**NCCL のような性能が必要な通信には、IPoIB ではなく RDMA（verbs）を使わせます**（レッスン 3）。
+
+「IB を入れたのに遅い」というとき、IPoIB 経由になっていることがあります。
+
+---
+
+## RoCE: Ethernet で RDMA をやる
+
+**RoCE v2**（RDMA over Converged Ethernet）は、RDMA を UDP/IP の上に載せた方式です。既存の Ethernet 機器を使える一方、**ロスレスを自分で作る必要があります**。
+
+```text
+InfiniBand : ロスレスがプロトコルに組み込まれている
+RoCE       : Ethernet はロスを前提にしているので、
+             PFC と ECN を設定してロスレスに「する」必要がある
+```
+
+| 仕組み | 役割 |
+| --- | --- |
+| **PFC**（Priority Flow Control, 802.1Qbb） | 特定の優先度クラスの送信を一時停止させ、バッファ溢れを防ぐ |
+| **ECN**（Explicit Congestion Notification） | 輻輳を検知したら、パケットに印を付けて送信元に速度を落とさせる |
+
+<Callout type="warning" title="RoCE の難しさは設定にある">
+
+**機器は安いが、設計と運用の難度は IB より高い**というのが実情です。
+
+- PFC は**経路上のすべてのスイッチで、同じ優先度クラスに対して**設定する必要がある。1 台でも漏れるとそこでロスが発生する
+- PFC の設定を誤ったり機器が故障したりすると、**デッドロック**が起きうる。Microsoft は、NIC に起因する PFC の pause frame storm も運用上の問題として報告している（GPU ネットワークコース レッスン 2）
+- ロスが 1% 未満でも、RDMA の性能は大きく劣化する
+- **問題が「たまに遅い」という形で現れ、切り分けが難しい**
+
+```bash
+# PFC の状態を確認する
+sudo mlnx_qos -i eth0
+ethtool -S eth0 | grep -iE 'pause|pfc'
+```
+
+`rx_pause` / `tx_pause` のカウンタが増えていれば、フロー制御が実際に働いています。適度なら正常ですが、**急増しているなら輻輳が慢性化**しています。
+
+**判断の目安**: 専任でネットワークを見られる体制があるなら RoCE も選択肢になります。そうでなければ、InfiniBand のほうが「動く状態を維持する」コストは低くなります。
+
+</Callout>
+
+### GID とルーティング
+
+---
+
+<h2 className="slide-cont">RoCE: Ethernet で RDMA をやる（続き）</h2>
+
+RoCE では LID ではなく **GID**（Global ID）を使います。NCCL の設定で `NCCL_IB_GID_INDEX` を指定する必要があるのは、このためです。
+
+```bash
+# 利用可能な GID の一覧
+show_gids
+```
+
+```text
+DEV     PORT  INDEX  GID                                      IPv4        VER
+mlx5_0  1     0      fe80:0000:0000:0000:...                              v1
+mlx5_0  1     3      0000:0000:0000:0000:0000:ffff:0a00:0005  10.0.0.5    v2
+                                                                          ↑ RoCE v2 はこれを使う
+```
+
+**`v2` の行のインデックスを `NCCL_IB_GID_INDEX` に設定します。** 間違えると通信が確立しないか、極端に遅くなります。IB では不要な設定なので、RoCE 特有のつまずきポイントです。
+
+---
+
+## SHARP: スイッチで計算する
+
+NVIDIA の IB スイッチには、**集合通信の一部をスイッチ内で実行する**機能があります（SHARP: Scalable Hierarchical Aggregation and Reduction Protocol）。
+
+```text
+通常の All-Reduce:
+  データが全 GPU 間を 2 周する（レッスン 3 の Ring）
+
+SHARP:
+  各ノードがスイッチにデータを送る
+    → スイッチが合計を計算
+    → 結果を全ノードに配る
+  → 転送量が減り、レイテンシも下がる
+```
+
+大規模クラスタでの All-Reduce に効果があります。利用には Aggregation Manager の稼働と、NCCL 側での有効化が必要です。
+
+```bash
+# NCCL から SHARP を使う
+export NCCL_COLLNET_ENABLE=1
+```
+
+---
+
+## まとめ
+
+- IB は「速い Ethernet」ではなく、**ロスが起きない前提**の別系統の技術
+- **クレジットベースフロー制御**により、バッファ溢れが原理的に発生しない
+- **Subnet Manager が必須**。止まると新規参加も経路再計算もできなくなる
+- **SM は必ず冗長化する**。1 台構成のまま運用されているクラスタは実在する
+- `ibstat` の **`Initializing` は SM の問題**。ケーブルではない
+- `ibdiagnet` を導入時に取得し、劣化の比較基準にする
+- **IPoIB では RDMA の利点が得られない**。性能が必要な通信には使わない
+- RoCE は機器が安い代わりに、**PFC / ECN の設定が全経路で必要**
+- RoCE では `NCCL_IB_GID_INDEX` に **v2 の GID** を指定する
+
+---
+
+<Quiz
+  id="q1"
+  question="InfiniBand クラスタで、新しく追加したノードの ibstat が「State: Initializing」のまま Active になりません。物理リンクは LinkUp です。最も疑わしい原因はどれですか。"
+  options={[
+    "ケーブルまたはトランシーバの故障",
+    "Subnet Manager が動作していない、または新ノードから到達できていないため LID が割り当てられていない",
+    "MTU の設定が不一致",
+    "IPoIB のアドレスが設定されていない"
+  ]}
+  answer={1}
+  explanation="Physical state が LinkUp であれば物理層は正常です。InfiniBand では Subnet Manager がポートに LID を割り当てて初めて State が Active になります。SM が停止している、あるいは新ノードが SM のいるサブネットに到達できていないと Initializing で止まります。sminfo で SM の稼働を確認するのが次の一手で、ケーブル交換に走ると時間を浪費します。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="既存の Ethernet スイッチを活用して RoCE v2 で分散学習を行う計画があります。注意すべき最も重要な点はどれですか。"
+  options={[
+    "RoCE v2 は設定不要で、ケーブルを繋げば RDMA が有効になる",
+    "RDMA はパケットロスを前提としないため、経路上のすべてのスイッチで PFC / ECN を正しく設定してロスレスに近い状態を作る必要がある",
+    "RoCE v2 は InfiniBand より常に高速である",
+    "RoCE v2 では Subnet Manager が必要になる"
+  ]}
+  answer={1}
+  explanation="InfiniBand はクレジットベースのフロー制御によりプロトコルレベルでロスレスですが、Ethernet はロスを前提とした設計です。RoCE で RDMA を成立させるには PFC（優先度別のフロー制御）と ECN を経路上の全スイッチに設定する必要があり、1 台でも漏れるとそこでロスが発生して性能が大きく劣化します。設定を誤ると PFC ストームを招く危険もあり、機器コストは下がる代わりに設計・運用の難度は上がります。"
+/>

@@ -1,0 +1,9 @@
+{
+  "title": "ネットワーク",
+  "subtitle": "Network",
+  "description": "パケットが物理層からアプリケーションに届くまでを、Linux の視点で追いかけます。tcpdump の出力を読んで原因を特定できる状態を目標にします。",
+  "order": 5,
+  "accent": "network",
+  "level": "基礎 → 実務",
+  "status": "ready"
+}

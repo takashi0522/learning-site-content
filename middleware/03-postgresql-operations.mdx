@@ -1,0 +1,363 @@
+---
+title: PostgreSQL の運用
+description: 接続数・WAL・autovacuum という3つの勘所を押さえ、放置すると停止に至る XID 周回まで理解します。
+order: 3
+minutes: 19
+tags: ["PostgreSQL", "connection-pool", "WAL", "autovacuum", "replication"]
+objectives:
+  - 接続数の上限をメモリとプロセスモデルから見積もれる
+  - チェックポイントによる I/O スパイクの仕組みを説明できる
+  - XID 周回の危険性を理解し、監視項目に落とせる
+references:
+  - label: "PostgreSQL Documentation — Server Configuration"
+    url: "https://www.postgresql.org/docs/current/runtime-config.html"
+  - label: "PostgreSQL — Routine Vacuuming"
+    url: "https://www.postgresql.org/docs/current/routine-vacuuming.html"
+  - label: "PgBouncer Documentation"
+    url: "https://www.pgbouncer.org/config.html"
+---
+
+## 接続は高価である
+
+PostgreSQL は **1 接続 = 1 OS プロセス**というモデルです。Linux コース レッスン 2 で見たとおり、プロセスの生成には `fork` が伴い、それぞれが `task_struct` とページテーブルを持ちます。
+
+```text
+接続してきたクライアント
+      ↓
+postmaster が fork
+      ↓
+バックエンドプロセスが 1 つ起動（このクライアント専用）
+```
+
+**接続 1 本あたり数 MB〜十数 MB を消費します。** MySQL のスレッドモデルや、レッスン 1 で見たイベント駆動型と比べて、接続そのものが重い設計です。
+
+```sql
+-- 現在の接続数と上限
+SELECT count(*) FROM pg_stat_activity;
+SHOW max_connections;
+
+-- 状態別の内訳（idle が多いならプーリングが効いていない）
+SELECT state, count(*) FROM pg_stat_activity GROUP BY state;
+```
+
+```text
+ state                | count
+----------------------+-------
+ active               |    12
+ idle                 |   380     ← 接続だけ保持して何もしていない
+ idle in transaction  |     7     ← 危険（後述）
+```
+
+---
+
+<h2 className="slide-cont">接続は高価である（続き）</h2>
+
+<Callout type="pitfall" title="work_mem は接続ごとではなく「操作ごと」">
+
+メモリ見積もりで最も誤りやすい点です。
+
+```text
+max_connections = 500
+work_mem        = 64MB
+
+  誤: 500 × 64MB = 32GB
+  実: 1 接続が複数のソート・ハッシュを同時に使うため、さらに掛け算される
+      複雑なクエリなら 1 接続で数倍消費しうる
+```
+
+`work_mem` はソートやハッシュ結合 **1 つあたり**の上限です。並列クエリを使えば、ワーカーごとにも掛かります。
+
+**`max_connections` を大きくしたまま `work_mem` を上げると、簡単に OOM に到達します**（Linux コース レッスン 3）。接続数を絞り、必要なセッションだけ `SET work_mem` で個別に上げるほうが安全です。
+
+</Callout>
+
+### 接続プーリング
+
+アプリ側で大量の接続を張る構成では、**PgBouncer** を挟むのが定石です。
+
+```ini
+[pgbouncer]
+pool_mode = transaction       ; 最も効率が良い
+max_client_conn = 5000        ; アプリからの接続
+default_pool_size = 40        ; 実際に PostgreSQL へ張る接続
+```
+
+| モード | 接続を返すタイミング | 注意 |
+| --- | --- | --- |
+| `session` | クライアントが切断したとき | 効果が薄い |
+| **`transaction`** | **トランザクション終了ごと** | **推奨**。ただしセッション変数や prepared statement が使えない |
+| `statement` | 文ごと | 制約が強い |
+
+---
+
+<h2 className="slide-cont">接続は高価である（続き）</h2>
+
+`transaction` モードでは接続が使い回されるため、`SET` した設定や一時テーブルが次のクライアントに引き継がれません。アプリ側がセッション状態に依存していないことが前提です。
+
+<Callout type="warning" title="idle in transaction が最も危険な状態">
+
+`idle in transaction` は、**トランザクションを開いたままアプリが何もしていない**状態です。
+
+- その間、**VACUUM が古い行を回収できない**（後述の肥大化に直結）
+- ロックを保持していれば、他のクエリが待たされる
+
+```sql
+-- 長時間放置されているトランザクションを探す
+SELECT pid, state, now() - xact_start AS duration, query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND now() - xact_start > interval '5 minutes'
+ORDER BY duration DESC;
+```
+
+```sql
+-- 強制終了の閾値を設定しておく（PG14+）
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '10min';
+```
+
+アプリのバグ（例外時にロールバックし忘れる）で発生することが多く、**設定で自衛しておく**のが実務的です。
+
+</Callout>
+
+---
+
+## メモリの主要パラメータ
+
+```sql
+SHOW shared_buffers;        -- PostgreSQL 自身のキャッシュ
+SHOW effective_cache_size;  -- OS のページキャッシュを含めた「見込み」
+```
+
+| パラメータ | 目安 | 意味 |
+| --- | --- | --- |
+| `shared_buffers` | **RAM の 25%** | 実際に確保される共有メモリ |
+| `effective_cache_size` | RAM の 50〜75% | **メモリを確保しない。プランナへのヒント** |
+| `maintenance_work_mem` | 1〜2GB | VACUUM やインデックス作成に使う |
+
+<Callout type="note">
+
+`effective_cache_size` は**メモリを 1 バイトも確保しません**。「OS のページキャッシュ（Linux コース レッスン 3）を含めて、これくらいはキャッシュに載っているだろう」という見積もりをプランナに伝えるだけの値です。
+
+大きくすればインデックススキャンが選ばれやすくなり、小さくすればシーケンシャルスキャンが選ばれやすくなります。**実メモリとは独立して設定できる**点を押さえておくと、チューニングの見通しが良くなります。
+
+</Callout>
+
+---
+
+## WAL とチェックポイント
+
+PostgreSQL は変更をまず **WAL**（Write Ahead Log）に書き、データファイルへの反映は後回しにします。Linux コース レッスン 4 で見たページキャッシュとライトバックの構図が、DB の内部にもう一段あるイメージです。
+
+<Figure name="wal-checkpoint" caption="コミットで同期するのは WAL だけ。重い書き込みはチェックポイントに逃がしている" />
+
+---
+
+<h2 className="slide-cont">WAL とチェックポイント（続き）</h2>
+
+**チェックポイントは I/O スパイクを生みます。**
+
+```sql
+SHOW checkpoint_timeout;          -- 既定 5min
+SHOW max_wal_size;                -- 既定 1GB
+SHOW checkpoint_completion_target;-- 既定 0.9
+```
+
+```sql
+-- チェックポイントの発生要因を確認する
+SELECT * FROM pg_stat_bgwriter;
+```
+
+```text
+ checkpoints_timed | checkpoints_req
+-------------------+-----------------
+              1240 |             387   ← req が多い = max_wal_size 不足
+```
+
+- **`checkpoints_timed`** … 時間経過による定期チェックポイント（正常）
+- **`checkpoints_req`** … WAL 量が `max_wal_size` に達したことによる強制実行
+
+`checkpoints_req` が多いなら `max_wal_size` を増やします。チェックポイント頻度が下がり、書き出しがならされます。
+
+---
+
+<h2 className="slide-cont">WAL とチェックポイント（続き）</h2>
+
+<Callout type="field">
+
+**「定期的に数秒固まる」という症状は、チェックポイントを疑う価値があります。**
+
+Linux コース レッスン 4 の `vm.dirty_ratio` と同じ構図で、溜め込んだダーティページを一気に吐き出すために I/O が飽和します。
+
+```sql
+-- チェックポイントの所要時間（write_time が長ければ I/O が追いついていない）
+SELECT checkpoint_write_time, checkpoint_sync_time FROM pg_stat_bgwriter;
+```
+
+対策は `max_wal_size` の拡大と、`checkpoint_completion_target` を 0.9 に保って書き出しを時間的に分散させることです。ストレージ側（ハードウェアコース レッスン 4）の見直しが必要な場合もあります。
+
+</Callout>
+
+---
+
+## autovacuum と肥大化
+
+PostgreSQL は **追記型（MVCC）**で、UPDATE や DELETE は古い行を即座に消さず「不要になった」印を付けるだけです。この回収を行うのが VACUUM です。
+
+**回収されないと、テーブルとインデックスが肥大化し続けます。**
+
+```sql
+-- 不要タプルの割合を確認する
+SELECT relname,
+       n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_autovacuum
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC
+LIMIT 10;
+```
+
+```sql
+-- 既定は「テーブルの 20% が不要になったら」なので、大きいテーブルでは遅すぎる
+ALTER TABLE big_table SET (autovacuum_vacuum_scale_factor = 0.02);
+```
+
+1 億行のテーブルでは、既定の 20% は **2000 万行が不要になるまで動かない**ことを意味します。更新の多い大きなテーブルでは、個別に閾値を下げるのが定石です。
+
+---
+
+## XID 周回: 放置すると DB が止まる
+
+**PostgreSQL 運用で最も危険な事象**です。知らないと対処できません。
+
+トランザクション ID は **32 ビット**で、過去と未来に半分ずつ使うため、実質**約 21 億**で一周します。VACUUM は古い行の XID を「凍結」して周回を防ぎますが、**これが間に合わないとデータの可視性が壊れるため、PostgreSQL は自ら停止します**。
+
+```sql
+-- 周回までの余裕を確認する（最重要の監視項目）
+SELECT datname,
+       age(datfrozenxid) AS xid_age,
+       2147483648 - age(datfrozenxid) AS remaining
+FROM pg_database
+ORDER BY xid_age DESC;
+```
+
+| `age(datfrozenxid)` | 状態 |
+| --- | --- |
+| 〜2 億 | 正常 |
+| 2 億超 | **anti-wraparound autovacuum が強制的に走る**（負荷が上がる） |
+| 約 20 億 | 警告が出始める |
+| 約 21 億 | **新規トランザクションを拒否して停止**。単一ユーザーモードで VACUUM が必要 |
+
+---
+
+<h2 className="slide-cont">XID 周回: 放置すると DB が止まる（続き）</h2>
+
+<Callout type="warning" title="止まる前に必ず兆候がある">
+
+XID 周回で停止する事故は、**ほぼ例外なく「VACUUM が動けない理由」が先にあります**。
+
+- **長時間の `idle in transaction`**（前述）— 古い行を消せない
+- **放置されたレプリケーションスロット** — スタンバイが受け取っていない
+- **孤立した prepared transaction**（`PREPARE TRANSACTION` の後始末漏れ）
+- autovacuum を無効化している
+
+```sql
+-- VACUUM を妨げているものを探す
+SELECT slot_name, active, restart_lsn FROM pg_replication_slots WHERE NOT active;
+SELECT gid, prepared FROM pg_prepared_xacts;
+```
+
+**`age(datfrozenxid)` を監視項目に入れ、2 億を超えたらアラート**にしておけば、停止に至る前に必ず気づけます。これは入れておくべき数少ない「必須」の監視項目です。
+
+</Callout>
+
+---
+
+## レプリケーションとバックアップ
+
+```sql
+-- スタンバイの遅延を確認する（プライマリ側で）
+SELECT client_addr, state, sent_lsn, replay_lsn,
+       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_lag_bytes
+FROM pg_stat_replication;
+```
+
+<Callout type="pitfall" title="レプリケーションスロットがディスクを食い潰す">
+
+レプリケーションスロットは「スタンバイがまだ受け取っていない WAL を消さない」ことを保証します。**スタンバイが停止したまま放置すると、WAL が無限に溜まり `pg_wal` がディスクを満杯にします。**
+
+プライマリが停止するため、可用性のための仕組みが可用性を壊す形になります。
+
+```sql
+-- 上限を設定して自衛する（PG13+）
+ALTER SYSTEM SET max_slot_wal_keep_size = '100GB';
+```
+
+上限を超えるとスロットは無効化され、そのスタンバイは作り直しが必要になりますが、**プライマリが落ちるよりはるかにましです。** 運用コース レッスン 4 で扱った容量逼迫の原因としても、これは上位に来ます。
+
+</Callout>
+
+### バックアップ
+
+| 方法 | 内容 | リストア粒度 |
+| --- | --- | --- |
+| `pg_dump` | 論理バックアップ（SQL / アーカイブ） | DB・テーブル単位 |
+| `pg_basebackup` | 物理バックアップ | クラスタ全体 |
+| **PITR** | 物理 + WAL アーカイブ | **任意の時点** |
+
+「誤って DELETE した 10 分前に戻したい」という要件には、**PITR が必須**です。`pg_basebackup` だけでは取得時点にしか戻れません。
+
+---
+
+<h2 className="slide-cont">レプリケーションとバックアップ（続き）</h2>
+
+```bash
+# WAL アーカイブの設定（postgresql.conf）
+# archive_mode = on
+# archive_command = 'test ! -f /mnt/wal/%f && cp %p /mnt/wal/%f'
+```
+
+**バックアップはリストアを試すまで成立しません。** 定期的にリストア訓練を行ってください。
+
+---
+
+## まとめ
+
+- PostgreSQL は **1 接続 = 1 プロセス**。接続は高価。プーリングを前提にする
+- **`work_mem` は操作ごと**に掛かる。`max_connections` との掛け算で OOM になる
+- **`idle in transaction` は VACUUM を妨げる**。タイムアウトを設定して自衛する
+- `effective_cache_size` はメモリを確保しない。プランナへのヒント
+- `checkpoints_req` が多ければ `max_wal_size` 不足。**定期的な固まりはチェックポイント**
+- 大きいテーブルは `autovacuum_vacuum_scale_factor` を個別に下げる
+- **`age(datfrozenxid)` は必須の監視項目**。2 億超でアラート
+- レプリケーションスロットの放置は**プライマリのディスクを食い潰す**
+- 任意の時点に戻すには PITR。**リストア訓練をしていないバックアップは無いのと同じ**
+
+---
+
+<Quiz
+  id="q1"
+  question="監視で age(datfrozenxid) が 15 億まで上昇していることに気づきました。この状態を放置するとどうなりますか。"
+  options={[
+    "性能が徐々に低下するが、機能上の問題は起きない",
+    "約 21 億に達した時点で PostgreSQL が新規トランザクションを拒否して停止し、単一ユーザーモードでの VACUUM が必要になる",
+    "自動的に 64 ビットの XID へ移行する",
+    "古いデータが自動的に削除される"
+  ]}
+  answer={1}
+  explanation="トランザクション ID は 32 ビットで実質約 21 億で一周します。VACUUM による凍結が間に合わないと行の可視性判定が壊れるため、PostgreSQL はデータ破壊を避けて自ら停止します。復旧には単一ユーザーモードでの VACUUM が必要で、その間サービスは停止します。ここまで上昇している場合、長時間の idle in transaction や放置されたレプリケーションスロットなど、VACUUM を妨げている原因が別にあるはずなので、それを先に取り除く必要があります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="max_connections=500、work_mem=64MB と設定したところ、負荷が高い時間帯に OOM Killer が PostgreSQL を終了させました。原因の説明として正しいものはどれですか。"
+  options={[
+    "shared_buffers が大きすぎる",
+    "work_mem はソートやハッシュ結合 1 つあたりの上限で、1 接続が複数同時に使うため、接続数との単純な掛け算を超えるメモリを消費しうる",
+    "effective_cache_size が実メモリを確保している",
+    "max_connections は OOM とは無関係である"
+  ]}
+  answer={1}
+  explanation="work_mem は接続単位ではなく、ソートやハッシュ結合といった操作 1 つあたりに適用される上限です。複雑なクエリでは 1 接続が複数の操作を同時に実行し、並列クエリではワーカーごとにも掛かるため、500×64MB という単純計算を大きく超えることがあります。接続数を絞って PgBouncer でプーリングし、必要なセッションだけ個別に work_mem を上げるほうが安全です。なお effective_cache_size はメモリを確保しません。"
+/>

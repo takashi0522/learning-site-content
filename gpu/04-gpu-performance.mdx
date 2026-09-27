@@ -1,0 +1,329 @@
+---
+title: GPU の性能を測る・共有する
+description: 高価な GPU が遊んでいないかを実測で確かめ、複数ジョブで安全に共有する方法を整理します。
+order: 4
+minutes: 18
+tags: ["profiling", "nsys", "DCGM", "MIG", "MPS", "Kubernetes"]
+objectives:
+  - GPU が本当にボトルネックかを指標から判断できる
+  - 演算・メモリ帯域・データ供給のどこで詰まっているかを切り分けられる
+  - MIG・MPS・time-slicing の違いを理解し、用途に応じて選べる
+references:
+  - label: "NVIDIA Nsight Systems"
+    url: "https://docs.nvidia.com/nsight-systems/"
+  - label: "Multi-Process Service (MPS) — NVIDIA Docs"
+    url: "https://docs.nvidia.com/deploy/mps/"
+  - label: "NVIDIA GPU Operator / device plugin"
+    url: "https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html"
+---
+
+## GPU は本当に働いているか
+
+レッスン 1 で触れたとおり、`nvidia-smi` の `GPU-Util` は**「カーネルが実行されていた時間の割合」**であり、演算器の使用率ではありません。ここを取り違えると、判断がすべてずれます。
+
+まず見るべき指標を整理します。
+
+| 指標 | 何を表すか | 取得方法 |
+| --- | --- | --- |
+| `GPU-Util` | カーネルが動いていた時間の割合 | `nvidia-smi` |
+| **`SM_ACTIVE`** | SM が実際に動作していた割合 | DCGM `DCGM_FI_PROF_SM_ACTIVE` |
+| **`SM_OCCUPANCY`** | SM 上に載っていたスレッドの割合 | DCGM `DCGM_FI_PROF_SM_OCCUPANCY` |
+| **`PIPE_TENSOR_ACTIVE`** | Tensor コアの稼働率 | DCGM `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` |
+| **`DRAM_ACTIVE`** | VRAM 帯域の使用率 | DCGM `DCGM_FI_PROF_DRAM_ACTIVE` |
+| `PCIE_TX/RX_BYTES` | ホスト〜GPU 転送量 | DCGM |
+
+```bash
+# プロファイリング指標をリアルタイムに見る
+dcgmi dmon -e 1002,1003,1004,1005,1009,1010
+# 1002: SM_ACTIVE  1003: SM_OCCUPANCY  1004: PIPE_TENSOR_ACTIVE
+# 1005: DRAM_ACTIVE  1009: PCIE_TX  1010: PCIE_RX
+```
+
+### 読み取りパターン
+
+---
+
+<h2 className="slide-cont">GPU は本当に働いているか（続き）</h2>
+
+```text
+GPU-Util 高 / SM_ACTIVE 低
+  → 小さなカーネルが断続的に動いているだけ。データ供給が追いついていない
+
+SM_ACTIVE 高 / TENSOR_ACTIVE 低
+  → 演算器は動いているが Tensor コアを使えていない
+     （精度設定、行列サイズ、フレームワークの設定を確認）
+
+DRAM_ACTIVE 高 / TENSOR_ACTIVE 低
+  → メモリ帯域律速。演算より転送が支配的
+
+PCIE_RX 高 / SM_ACTIVE 低
+  → ホストからの転送待ち。前処理か I/O がボトルネック
+```
+
+<Callout type="field">
+
+**AI ワークロードで最も多いのは「GPU が遊んでいる」状態です。** `GPU-Util` が 100% でも、`TENSOR_ACTIVE` が数% ということが珍しくありません。
+
+この場合、犯人は GPU の外にいます。
+
+- データローダの前処理が CPU 律速（画像のデコード・変換など）
+- ストレージからの読み込みが遅い（ハードウェアコース レッスン 4 のランダム I/O）
+- ホスト〜GPU 間の転送が同期的に行われている
+
+**GPU を増強しても改善しません。** CPU コア数、データローダのワーカー数、ストレージ、前処理のパイプライン化を先に見てください。
+
+</Callout>
+
+---
+
+## プロファイラで時間の内訳を見る
+
+指標で当たりがついたら、実際のタイムラインを取ります。
+
+### Nsight Systems: 全体の流れを見る
+
+```bash
+# 学習スクリプトをプロファイルする（数十秒分で十分）
+nsys profile -o report --trace=cuda,nvtx,osrt,cudnn \
+  --duration=30 python train.py
+
+# CLI で要約を見る
+nsys stats report.nsys-rep
+```
+
+タイムラインで確認するのは次の点です。
+
+- **GPU の実行区間に隙間がないか** — 隙間があれば、その間 GPU は待っている
+- **`cudaMemcpy` が実行を止めていないか** — 同期転送は GPU を遊ばせる
+- **CPU 側のスレッドが何をしているか** — データローダが詰まっていないか
+
+```python
+# コードに区間名を付けると、タイムラインが格段に読みやすくなる
+import torch
+with torch.profiler.record_function("data_loading"):
+    batch = next(loader)
+with torch.profiler.record_function("forward"):
+    out = model(batch)
+```
+
+### Nsight Compute: 個々のカーネルを見る
+
+```bash
+# 特定のカーネルを詳細に分析する（重い。ピンポイントに使う）
+ncu --set full -o kernel_report python train.py
+```
+
+---
+
+<h2 className="slide-cont">プロファイラで時間の内訳を見る（続き）</h2>
+
+自作の CUDA カーネルを最適化する場面で使います。フレームワークを使っているだけなら、まず Nsight Systems で全体を見るほうが費用対効果が高いです。
+
+<Callout type="tip">
+
+**プロファイルは短時間で十分です。** 学習全体を取る必要はなく、定常状態に入った 30 秒ほどを切り出せば、ボトルネックの構造は見えます。
+
+`nsys profile --duration=30` や、PyTorch のプロファイラで数十イテレーションだけを対象にする方法が実用的です。全体を取ると、ファイルが巨大になり開くだけで苦労します。
+
+</Callout>
+
+---
+
+## VRAM を使い切る
+
+GPU の性能を引き出せないもう一つの理由が、**VRAM の制約でバッチサイズを上げられない**ことです。
+
+```bash
+# 実際の使用量を追う
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv -l 2
+```
+
+VRAM を節約する代表的な手法です。
+
+| 手法 | 内容 | 代償 |
+| --- | --- | --- |
+| **混合精度 (AMP)** | FP16 / BF16 で計算する | ほぼなし。**Tensor コアも効くので速くなる** |
+| 勾配累積 | 小さいバッチを複数回まとめて更新 | 実効バッチサイズを保てる。時間は増える |
+| 勾配チェックポイント | 中間結果を保持せず再計算する | **計算時間が 20–30% 増**、VRAM は大きく減る |
+| ZeRO / FSDP | オプティマイザ状態を GPU 間で分割 | 通信が増える（レッスン 3） |
+
+---
+
+<h2 className="slide-cont">VRAM を使い切る（続き）</h2>
+
+<Callout type="pitfall" title="CUDA out of memory の読み方">
+
+```text
+torch.cuda.OutOfMemoryError: CUDA out of memory.
+Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 79.15 GiB
+of which 1.28 GiB is free. Process 48213 has 77.30 GiB memory in use.
+Of the allocated memory 68.42 GiB is allocated by PyTorch,
+and 7.21 GiB is reserved by PyTorch but unallocated.
+```
+
+最後の 2 行が重要です。
+
+- **`allocated`** … 実際に使っているメモリ
+- **`reserved but unallocated`** … PyTorch がキャッシュとして確保済みだが未使用の領域。**断片化している**
+
+`reserved` と `allocated` の差が大きい場合、容量ではなく**断片化**が原因です。
+
+```bash
+# アロケータの挙動を変えて断片化を緩和する
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+また、**他のプロセスが VRAM を掴んだままになっていないか**も確認してください。異常終了したジョブのプロセスが残っていることがあります。
+
+```bash
+nvidia-smi                        # Processes 欄を確認
+sudo fuser -v /dev/nvidia*
+```
+
+</Callout>
+
+---
+
+## GPU を複数のジョブで共有する
+
+高価な GPU を 1 ジョブが占有するのは、多くの場合もったいない使い方です。共有の方式は 3 つあり、**性質がはっきり違います**。
+
+| | **MIG** | **MPS** | **Time-slicing** |
+| --- | --- | --- | --- |
+| 分割の実体 | **ハードウェア分割** | プロセス統合 | 時分割 |
+| 演算器の分離 | あり（SM/L2/帯域を専有） | なし（共有） | なし |
+| メモリの分離 | **あり** | 限定的 | **なし** |
+| 障害の波及 | **しない** | **する**（1 つが落ちると影響しうる） | する |
+| 性能の予測可能性 | **高い** | 中 | 低い |
+| 対応 GPU | A100 / H100 など | 広い | 広い |
+| 向く用途 | マルチテナント推論 | 同一ユーザーの小さいジョブ群 | 開発・検証環境 |
+
+### MIG
+
+レッスン 1 で触れたハードウェア分割です。**隣のインスタンスの負荷に影響されない**のが最大の利点で、SLA が必要な推論基盤に向きます。
+
+```bash
+sudo nvidia-smi -i 0 -mig 1
+sudo nvidia-smi mig -i 0 -cgi 1g.10gb,1g.10gb,3g.40gb -C
+nvidia-smi -L        # MIG デバイスの UUID が表示される
+```
+
+### MPS
+
+複数プロセスの CUDA コンテキストを 1 つに統合し、カーネルを同時実行させます。小さなカーネルしか出さないジョブを複数走らせるとき、GPU の充填率が上がります。
+
+---
+
+<h2 className="slide-cont">GPU を複数のジョブで共有する（続き）</h2>
+
+```bash
+# MPS デーモンを起動
+export CUDA_VISIBLE_DEVICES=0
+nvidia-cuda-mps-control -d
+
+# 各クライアントが使える SM の割合を制限する
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25
+```
+
+<Callout type="warning">
+
+**MPS ではメモリが分離されません。** 1 つのプロセスが VRAM を使い切れば、他のプロセスも OOM になります。また、1 つのプロセスが異常終了すると、MPS サーバー経由で他のクライアントにも影響することがあります。
+
+**信頼できないジョブ同士の共有には使わないでください。** 同一チーム・同一ユーザーの小さなジョブをまとめる用途に限定するのが安全です。
+
+</Callout>
+
+### Kubernetes での割り当て
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 1          # GPU 単位で排他的に割り当て
+```
+
+既定では **GPU 1 枚が 1 Pod に排他割り当て**されます。分割して使うには、GPU Operator の設定でいずれかの方式を有効にします。
+
+---
+
+<h2 className="slide-cont">GPU を複数のジョブで共有する（続き）</h2>
+
+```yaml
+# MIG を使う場合（MIG プロファイル単位のリソース名になる）
+resources:
+  limits:
+    nvidia.com/mig-1g.10gb: 1
+```
+
+<Callout type="field">
+
+GPU クラスタの運用で効いてくる設定です。
+
+- **`nvidia.com/gpu` は limits にしか書けません**（拡張リソースの仕様）。requests での部分指定はできません
+- ノードのラベル（GPU 種別、MIG プロファイル）で **nodeSelector / affinity を使い、ジョブを適切なノードに寄せる**
+- レッスン 3 で扱ったトポロジの都合上、**マルチ GPU ジョブは NVLink で繋がった GPU に揃えて割り当てる**必要があります。GPU Operator のトポロジ対応機能や、スケジューラの設定で担保します
+
+「空いている GPU に適当に割り当てる」構成だと、通信の遅い組み合わせが選ばれて性能が安定しません。
+
+</Callout>
+
+---
+
+## 定常的に見る指標
+
+GPU クラスタでは、**使われていないことを検知する監視**が重要です。CPU サーバーと違い、遊休は直接コストになります。
+
+| 観点 | 指標 | 閾値の考え方 |
+| --- | --- | --- |
+| 遊休 | `SM_ACTIVE` の平均 | 長時間 10% 未満なら割り当てを見直す |
+| 効率 | `PIPE_TENSOR_ACTIVE` | AI 学習で数% なら供給側を調査 |
+| VRAM | `FB_USED / FB_TOTAL` | 90% 超が続けば OOM の予兆 |
+| 温度・電力 | `GPU_TEMP` / `POWER_USAGE` | スロットリング（レッスン 2） |
+| 障害 | `XID_ERRORS` | **発生時に即通知** |
+
+```bash
+# Prometheus へ取り込む場合
+# dcgm-exporter をデーモンとして動かし、/metrics を収集する
+docker run -d --gpus all -p 9400:9400 nvcr.io/nvidia/k8s/dcgm-exporter:latest
+curl -s localhost:9400/metrics | grep DCGM_FI_PROF_SM_ACTIVE
+```
+
+---
+
+## まとめ
+
+- **`GPU-Util` では判断できない。** `SM_ACTIVE` と `PIPE_TENSOR_ACTIVE` を見る
+- `GPU-Util` 高 × `TENSOR_ACTIVE` 低 は、**GPU の外（前処理・I/O・転送）がボトルネック**
+- プロファイルは Nsight Systems で全体のタイムラインから。短時間で十分
+- OOM メッセージの `reserved but unallocated` が大きければ**断片化**が原因
+- 共有方式は **MIG（ハードウェア分割・分離あり）/ MPS（統合・分離なし）/ time-slicing**
+- **MPS はメモリも障害も分離しない**。信頼できないジョブ同士には使わない
+- マルチ GPU ジョブは、NVLink で繋がった GPU に揃えて割り当てる
+- GPU クラスタでは「**使われていないこと**」の監視がコストに直結する
+
+<Quiz
+  id="q1"
+  question="PyTorch の学習で CUDA out of memory が発生しました。メッセージには allocated 68 GiB、reserved but unallocated 7.2 GiB と表示されています。この情報から読み取れることはどれですか。"
+  options={[
+    "単純に VRAM 容量が不足しているため、より大容量の GPU が必要",
+    "PyTorch がキャッシュとして確保済みだが未使用の領域が 7.2 GiB あり、メモリの断片化が起きている可能性が高い",
+    "他のプロセスが GPU を占有している",
+    "GPU が MIG モードで分割されている"
+  ]}
+  answer={1}
+  explanation="reserved but unallocated は、PyTorch のキャッシングアロケータが確保済みでありながら実際には使われていない領域です。これが大きい場合、連続した空き領域が取れない断片化が起きています。PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True でアロケータの挙動を変えることで緩和できる場合があります。容量そのものが足りないケースとは対処が異なります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="複数の顧客テナントの推論ジョブを 1 枚の H100 で共有させたいと考えています。テナント間で性能の予測可能性と障害の分離が求められる場合、適切な方式はどれですか。"
+  options={[
+    "MPS を使い、CUDA_MPS_ACTIVE_THREAD_PERCENTAGE で SM の割合を制限する",
+    "MIG でハードウェア分割し、各テナントに独立したインスタンスを割り当てる",
+    "Kubernetes の time-slicing を有効にする",
+    "GPU を 1 テナントに占有させる以外に方法はない"
+  ]}
+  answer={1}
+  explanation="MIG は SM・L2・メモリ帯域をハードウェアレベルで分割するため、隣のインスタンスの負荷に影響されず性能が予測可能で、メモリも障害も分離されます。MPS はメモリが分離されず、1 プロセスの異常終了が他に波及しうるため、信頼関係のないテナント間の共有には適しません。time-slicing は分離がさらに弱く、開発・検証用途向けです。"
+/>

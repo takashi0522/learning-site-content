@@ -1,0 +1,254 @@
+---
+title: systemd によるサービス管理
+description: unit の依存関係の書き分けと、起動失敗・再起動ループの調査手順を身につけます。設定は drop-in で安全に上書きします。
+order: 5
+minutes: 16
+tags: ["systemd", "unit", "journald", "drop-in"]
+objectives:
+  - Requires と After の違いを説明し、正しく使い分けられる
+  - 起動失敗の原因を journalctl と systemd-analyze で特定できる
+  - パッケージのファイルを壊さずに drop-in で設定を上書きできる
+references:
+  - label: "systemd.unit — 依存関係の指定"
+    url: "https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html"
+  - label: "systemd.service — Type と Restart"
+    url: "https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html"
+  - label: "systemd.resource-control — cgroup 経由のリソース制限"
+    url: "https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html"
+---
+
+## PID 1 が担うもの
+
+カーネルの起動が終わると、最初のユーザー空間プロセスとして PID 1 が起動されます。現在の主要ディストリビューションではこれが systemd です。
+
+PID 1 には他のプロセスにない責務があります。
+
+- **すべてのプロセスの最終的な親**。親が先に死んだ孤児プロセスは PID 1 に引き取られる
+- **ゾンビの回収**。引き取った子プロセスの終了ステータスを `wait()` し続ける
+- **サービスの起動順序と依存関係の解決**
+
+<Callout type="note" title="コンテナで PID 1 が問題になる理由">
+
+コンテナの中でアプリケーションを PID 1 として直接起動すると、この「ゾンビ回収」を誰もしなくなります。またカーネルは PID 1 に対して既定のシグナルハンドラを適用しないため、`SIGTERM` を明示的に処理していないアプリは `docker stop` で終了せず、タイムアウト後に `SIGKILL` されます。`--init` オプションや `tini` のような軽量 init が使われるのはこのためです。
+
+</Callout>
+
+---
+
+## unit の種類
+
+systemd が管理する対象は unit と呼ばれ、拡張子で種類が決まります。
+
+| 拡張子 | 用途 |
+| --- | --- |
+| `.service` | デーモン・プロセス |
+| `.socket` | ソケットを先に作っておき、接続が来たらサービスを起動する |
+| `.timer` | cron の代替。カレンダー指定や「起動から N 分後」を扱える |
+| `.mount` / `.automount` | マウントポイント（`/etc/fstab` から自動生成される） |
+| `.target` | 複数 unit をまとめた同期点（旧ランレベルに相当） |
+
+```bash
+# 起動しているサービスの一覧
+systemctl list-units --type=service --state=running
+
+# 起動に失敗しているものだけを抽出（障害時に最初に打つ）
+systemctl --failed
+
+# 次に実行されるタイマー
+systemctl list-timers
+```
+
+---
+
+## 依存関係: Requires と After は別の軸
+
+ここが systemd で最も間違えやすい部分です。この 2 つは**まったく別の概念**で、片方だけでは意図した動作になりません。
+
+- **`Requires=` / `Wants=`** … 「一緒に起動するか」という**依存**の指定
+- **`After=` / `Before=`** … 「どちらが先か」という**順序**の指定
+
+```ini
+[Unit]
+# これだけでは「postgresql も起動する」が、同時に起動してしまう
+Requires=postgresql.service
+
+# これだけでは「postgresql が起動しているなら後に起動する」だけで、
+# postgresql が起動していなければ待たずに自分が起動する
+After=postgresql.service
+
+# 正しくは両方を書く
+Requires=postgresql.service
+After=postgresql.service
+```
+
+依存の強さは 3 段階あります。
+
+| 指定 | 相手の起動に失敗したら | 相手が後から停止したら |
+| --- | --- | --- |
+| `Wants=` | 自分は起動する | 影響なし |
+| `Requires=` | 自分も起動しない | 影響なし |
+| `BindsTo=` | 自分も起動しない | **自分も停止する** |
+
+<Callout type="pitfall">
+
+`Requires=` だけを書いて `After=` を忘れると、依存先と同時に起動します。「DB が起動する前にアプリが接続を試みて失敗する」という間欠的な起動失敗の典型的な原因です。しかも手動での `systemctl start` では再現しにくく、再起動時だけ起きるため発見が遅れます。
+
+</Callout>
+
+---
+
+### Type の指定
+
+`Type=` はサービスの「起動完了」をどう判定するかを決めます。ここを誤ると、依存関係を正しく書いても順序が崩れます。
+
+| Type | 起動完了とみなす条件 |
+| --- | --- |
+| `simple` | プロセスを起動した時点（既定。実際の準備完了は待たない） |
+| `forking` | 親プロセスが終了した時点（従来のデーモン向け） |
+| `notify` | プロセスが `sd_notify()` で READY を通知した時点（**最も正確**） |
+| `oneshot` | プロセスが終了した時点（初期化スクリプト向け） |
+
+`Type=simple` は「プロセスが起動した」だけで完了とみなすため、アプリケーションがポートを listen する前に後続のサービスが起動してしまいます。アプリが対応しているなら `Type=notify` が最も確実です。
+
+---
+
+## 起動失敗を調べる
+
+```bash
+# 状態と直近のログをまとめて見る
+systemctl status nginx.service
+
+# そのサービスのログだけを、今回の起動分に絞って追う
+journalctl -u nginx.service -b --no-pager
+
+# 優先度 err 以上に絞る
+journalctl -p err -b
+
+# リアルタイムに追う
+journalctl -u nginx.service -f
+```
+
+`systemctl status` の出力で見るべきは次の 3 点です。
+
+```text
+Active: failed (Result: exit-code) since Fri 2026-09-19 10:12:03 JST; 2min ago
+Process: 4821 ExecStart=/usr/sbin/nginx -g daemon off; (code=exited, status=1/FAILURE)
+   Main PID: 4821 (code=exited, status=1/FAILURE)
+```
+
+- **Result** … `exit-code`（異常終了）、`timeout`（起動が遅すぎ）、`oom-kill`（メモリ不足で強制終了）
+- **status** … 終了コード。`status=203/EXEC` は実行ファイルが見つからない、`status=209/STDOUT` は権限の問題など
+- **Process** … 実際に実行されたコマンドライン。設定ミスがここに現れることが多い
+
+### 再起動ループを止める
+
+---
+
+<h2 className="slide-cont">起動失敗を調べる（続き）</h2>
+
+```ini
+[Service]
+Restart=on-failure
+RestartSec=5s
+# 10秒の間に5回失敗したら、以後は再起動をあきらめる
+StartLimitIntervalSec=10s
+StartLimitBurst=5
+```
+
+制限に達すると unit は `failed` のまま止まります。原因を直したあとは `systemctl reset-failed <unit>` でカウンタを消してから起動します。
+
+<Callout type="field">
+
+`Restart=always` と短い `RestartSec` を組み合わせると、設定ミスで起動できないサービスが延々と再起動を繰り返し、ログを埋め尽くして他の問題を隠します。`Restart=on-failure` と `StartLimitBurst` の組み合わせを既定にしておくほうが、障害対応はしやすくなります。
+
+</Callout>
+
+---
+
+## drop-in で安全に上書きする
+
+パッケージが配置した `/usr/lib/systemd/system/*.service` を直接編集してはいけません。パッケージ更新で上書きされ、変更が消えます。
+
+```bash
+# drop-in ファイルを作成・編集する（エディタが開く）
+systemctl edit nginx.service
+```
+
+これは `/etc/systemd/system/nginx.service.d/override.conf` を作ります。元のファイルには手を触れず、指定した項目だけを上書きできます。
+
+```ini
+[Service]
+# メモリ上限を超えたら、このサービスだけが OOM の対象になる
+MemoryMax=2G
+# CPU 1コア分に制限（200% なら 2 コア分）
+CPUQuota=100%
+# 同時に開けるファイル数
+LimitNOFILE=65536
+```
+
+```bash
+# 最終的に適用されている設定（元ファイル + drop-in の合成結果）を確認
+systemctl cat nginx.service
+systemctl show nginx.service -p MemoryMax -p CPUQuota
+
+# 編集後は必ず
+systemctl daemon-reload
+```
+
+<Callout type="tip">
+
+`MemoryMax=` や `CPUQuota=` は、内部的には cgroup v2 の `memory.max` と `cpu.max` に書き込まれています。systemd は cgroup の管理者でもあり、すべてのサービスは自動的に専用の cgroup に入れられます。次のレッスンでその中身を直接見ます。
+
+</Callout>
+
+### リストと上書きの注意点
+
+---
+
+<h2 className="slide-cont">drop-in で安全に上書きする（続き）</h2>
+
+`ExecStart=` のような「リスト型」の項目は、drop-in で追記すると**元の値に追加される**だけです。置き換えたい場合は、一度空にしてから書きます。
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/nginx -c /etc/nginx/custom.conf
+```
+
+---
+
+## まとめ
+
+- PID 1 は孤児プロセスの引き取りとゾンビ回収も担う。コンテナで init が必要になるのはこのため
+- **`Requires=`（依存）と `After=`（順序）は別の軸**。両方書く
+- `Type=` の選択で「起動完了」の判定が変わる。可能なら `Type=notify`
+- 調査は `systemctl status` の Result / status / Process を見てから `journalctl -u ... -b`
+- 設定変更は `systemctl edit` による drop-in。元ファイルは触らない
+
+<Quiz
+  id="q1"
+  question="アプリのサービスに After=postgresql.service だけを書きました。サーバー再起動時に「DB に接続できない」というエラーで起動に失敗することがあります。原因はどれですか。"
+  options={[
+    "After は順序の指定でしかなく、postgresql.service の起動自体を要求していないため",
+    "After は Before と書き間違えているため",
+    "postgresql.service が Type=oneshot になっているため",
+    "After は同一 target 内でしか効果がないため"
+  ]}
+  answer={0}
+  explanation="After= は「両方が起動する場合の順序」を決めるだけで、依存関係を作りません。postgresql.service が起動対象に含まれていなければ、systemd は待たずにアプリを起動します。Requires=postgresql.service を併記して依存も明示する必要があります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="パッケージ提供の nginx.service にメモリ上限を追加したい場合、最も適切な方法はどれですか。"
+  options={[
+    "/usr/lib/systemd/system/nginx.service を直接編集する",
+    "systemctl edit nginx.service で drop-in を作成し、daemon-reload する",
+    "/etc/nginx/nginx.conf に MemoryMax を書く",
+    "起動スクリプトを ulimit 付きのラッパーに置き換える"
+  ]}
+  answer={1}
+  explanation="/usr/lib/systemd/system 配下はパッケージの管理領域で、更新時に上書きされます。systemctl edit は /etc/systemd/system/<unit>.d/override.conf を作り、元ファイルを保ったまま指定項目だけを上書きします。合成結果は systemctl cat で確認できます。"
+/>

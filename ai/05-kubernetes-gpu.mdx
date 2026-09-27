@@ -1,0 +1,346 @@
+---
+title: Kubernetes での GPU 運用
+description: device plugin と GPU Operator の役割を押さえ、GPU・RDMA・トポロジを正しく Pod へ渡せるようにします。
+order: 5
+minutes: 19
+tags: ["Kubernetes", "GPU Operator", "device-plugin", "MIG", "RDMA", "Topology Manager"]
+objectives:
+  - Kubernetes が GPU を扱う仕組み（拡張リソース）を説明できる
+  - GPU Operator が何を面倒見ているかを整理できる
+  - GPU ジョブで必要な RDMA・共有メモリ・トポロジの設定を判断できる
+references:
+  - label: "NVIDIA GPU Operator Documentation"
+    url: "https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/index.html"
+  - label: "Kubernetes — Schedule GPUs"
+    url: "https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/"
+  - label: "Kubernetes — Topology Manager"
+    url: "https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/"
+---
+
+## Kubernetes は GPU を知らない
+
+まず前提として、**Kubernetes 本体に GPU の概念はありません。** CPU とメモリだけが組み込みのリソースです。
+
+GPU は **拡張リソース（Extended Resource）** という汎用の仕組みで扱われます。
+
+<Figure name="k8s-device-plugin" caption="スケジューラは GPU を数としてしか見ていない。その数を入れているのが device plugin" />
+
+```bash
+# ノードが公開している GPU リソース
+kubectl get nodes -o json \
+  | jq '.items[] | {name:.metadata.name, gpu:.status.allocatable["nvidia.com/gpu"]}'
+```
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 2
+```
+
+---
+
+<h2 className="slide-cont">Kubernetes は GPU を知らない（続き）</h2>
+
+<Callout type="pitfall" title="拡張リソースの制約">
+
+拡張リソースには、CPU / メモリとは違う制約があります。
+
+- **`limits` にしか書けない**（`requests` に書いても `limits` と同じ値になる）
+- **整数のみ。`0.5` のような指定はできない**
+- **オーバーコミットできない**
+
+つまり **1 枚の GPU を 2 つの Pod で分け合う、ということが標準機能ではできません。** 分割したい場合は、GPU コース レッスン 4 で扱った MIG や time-slicing を有効にし、それぞれを別のリソースとして公開させる必要があります。
+
+CPU のつもりで `nvidia.com/gpu: 0.5` と書いてしまうのは、よくある誤りです。
+
+</Callout>
+
+---
+
+## GPU Operator が面倒を見ているもの
+
+GPU ノードを Kubernetes で使えるようにするには、本来これだけのものが必要です。
+
+```text
+・NVIDIA ドライバ（カーネルモジュール）
+・NVIDIA Container Toolkit（GPU コース レッスン 2）
+・device plugin
+・Node Feature Discovery（ノードの性質をラベル化）
+・GPU Feature Discovery（GPU 種別をラベル化）
+・DCGM + dcgm-exporter（監視）
+・MIG Manager（MIG を使う場合）
+```
+
+**GPU Operator は、これらを一括で導入・管理する Operator です。** 各ノードに手で入れる代わりに、Kubernetes のリソースとして宣言的に管理できます。
+
+```bash
+helm install gpu-operator nvidia/gpu-operator -n gpu-operator --create-namespace
+
+# 各コンポーネントの状態
+kubectl get pods -n gpu-operator
+```
+
+---
+
+<h2 className="slide-cont">GPU Operator が面倒を見ているもの（続き）</h2>
+
+<Callout type="field">
+
+**ドライバをコンテナで配るか、ホストに入れるか**は最初に決める判断です。
+
+| | GPU Operator にドライバも任せる | ホストに事前インストール |
+| --- | --- | --- |
+| 管理 | **宣言的。ノード追加が楽** | ノードごとに手当てが必要 |
+| 更新 | Operator の設定変更で一斉更新 | 個別作業 |
+| 前提 | カーネルヘッダ等が必要。**ホストのカーネル更新に追従が必要** | 安定 |
+| 向く環境 | ノードが増減する、クラウド | 固定構成、ベアメタル |
+
+```bash
+# ホストに既にドライバがある場合は、Operator 側で無効化する
+helm install gpu-operator nvidia/gpu-operator --set driver.enabled=false
+```
+
+**既にドライバが入っているノードで `driver.enabled=true` にすると競合します。** 既存クラスタに後から導入する場合は、必ず現状を確認してください。
+
+</Callout>
+
+### ノードラベルを使う
+
+GPU Feature Discovery が、GPU の種別を自動でラベル化します。
+
+```bash
+kubectl get nodes -L nvidia.com/gpu.product,nvidia.com/gpu.count,nvidia.com/gpu.memory
+```
+
+```text
+NAME      GPU.PRODUCT           GPU.COUNT   GPU.MEMORY
+gpu-01    NVIDIA-H100-80GB-HBM3  8          81559
+gpu-09    NVIDIA-A100-SXM4-40GB  8          40960
+```
+
+**混在クラスタでは、これを使ってジョブを適切なノードへ寄せます。**
+
+---
+
+<h2 className="slide-cont">GPU Operator が面倒を見ているもの（続き）</h2>
+
+```yaml
+spec:
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+```
+
+```yaml
+# より柔軟に書く場合
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: nvidia.com/gpu.memory
+            operator: Gt
+            values: ["70000"]     # VRAM 70GB 超のノードのみ
+```
+
+---
+
+## GPU ジョブで必要になる設定
+
+GPU を要求するだけでは足りません。**分散学習で踏みやすい落とし穴が 3 つ**あります。
+
+### ① 共有メモリ（/dev/shm）
+
+```yaml
+spec:
+  containers:
+  - name: trainer
+    volumeMounts:
+    - name: dshm
+      mountPath: /dev/shm
+  volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 32Gi
+```
+
+<Callout type="warning">
+
+**コンテナの `/dev/shm` は既定で 64MB しかありません。**
+
+PyTorch の DataLoader は、ワーカープロセス間のデータ受け渡しに共有メモリを使います（レッスン 4 の `num_workers`）。64MB では、**原因の分かりにくいクラッシュ**や `Bus error` が発生します。
+
+```text
+ERROR: Unexpected bus error encountered in worker.
+This might be caused by insufficient shared memory (shm).
+```
+
+上記の `emptyDir` に `medium: Memory` を指定する方法で拡張します。**GPU ジョブのテンプレートには最初から入れておくべき設定**です。
+
+なお `medium: Memory` の emptyDir は**ノードのメモリを消費します**。`sizeLimit` を必ず指定してください。
+
+</Callout>
+
+### ② RDMA デバイス
+
+InfiniBand を使う分散学習では、**Pod に HCA を渡す必要があります**（レッスン 2、3）。
+
+---
+
+<h2 className="slide-cont">GPU ジョブで必要になる設定（続き）</h2>
+
+```text
+必要なもの:
+  ・RDMA デバイス（/dev/infiniband/*）へのアクセス
+  ・IPC_LOCK ケーパビリティ（メモリのページロックに必要）
+  ・場合によっては hugepages
+```
+
+方式は主に 2 つあります。
+
+| 方式 | 内容 |
+| --- | --- |
+| **共有デバイスプラグイン**（`rdma-shared-device-plugin`） | 1 つの HCA を複数 Pod で共有。設定が簡単 |
+| **SR-IOV**（ハードウェアコース レッスン 5） | VF を Pod に専有割り当て。性能と分離に優れる |
+
+```yaml
+spec:
+  containers:
+  - name: trainer
+    securityContext:
+      capabilities:
+        add: ["IPC_LOCK"]
+    resources:
+      limits:
+        nvidia.com/gpu: 8
+        rdma/rdma_shared_device_a: 1
+```
+
+NVIDIA Network Operator が、これらのコンポーネント（SR-IOV device plugin、RDMA device plugin、Multus）をまとめて管理します。GPU Operator の姉妹プロジェクトです。
+
+---
+
+<h2 className="slide-cont">GPU ジョブで必要になる設定（続き）</h2>
+
+<Callout type="tip">
+
+**RDMA が Pod 内で使えているかの確認**は、レッスン 2・3 のコマンドがそのまま使えます。
+
+```bash
+kubectl exec -it <pod> -- ibstat          # HCA が見えるか
+kubectl exec -it <pod> -- ibv_devinfo     # verbs から使えるか
+kubectl exec -it <pod> -- env | grep NCCL
+```
+
+`ibstat` が何も返さなければ、デバイスが渡っていません。ホスト側で見えているのに Pod で見えない場合は、device plugin の設定を確認します。
+
+</Callout>
+
+### ③ トポロジの整合
+
+GPU コース レッスン 1 で見たとおり、**GPU・NIC・CPU が同じ NUMA ノードに揃っているか**で性能が変わります。
+
+Kubernetes の **Topology Manager** は、これらの割り当てを NUMA ノード単位で揃える機能です。
+
+```yaml
+# kubelet の設定
+topologyManagerPolicy: single-numa-node
+cpuManagerPolicy: static
+```
+
+| ポリシー | 挙動 |
+| --- | --- |
+| `none` | **既定。整合を考慮しない** |
+| `best-effort` | 揃えようとするが、無理でも配置する |
+| `restricted` | 揃わなければ配置を拒否する |
+| `single-numa-node` | **単一 NUMA ノードに収まる場合のみ配置** |
+
+---
+
+<h2 className="slide-cont">GPU ジョブで必要になる設定（続き）</h2>
+
+<Callout type="field">
+
+**既定の `none` では、GPU と NIC が別ソケットに割り当てられることがあります。** 単発の推論なら影響は小さいですが、分散学習では GPU コース レッスン 3 で見た `SYS` 経由の通信が発生し、性能が安定しません。
+
+ただし `single-numa-node` は**配置できる Pod が減る**（条件を満たさないと Pending になる）ため、クラスタの利用率とのトレードオフになります。
+
+- 学習専用クラスタ → `single-numa-node` または `restricted`
+- 汎用・推論混在 → `best-effort`
+
+変更には kubelet の再起動が必要で、ノードごとの設定になります。
+
+</Callout>
+
+---
+
+## 監視
+
+GPU Operator を入れると `dcgm-exporter` が同梱され、GPU コース レッスン 4 の指標が Prometheus 形式で取得できます。
+
+```bash
+kubectl get pods -n gpu-operator -l app=nvidia-dcgm-exporter
+kubectl port-forward -n gpu-operator svc/nvidia-dcgm-exporter 9400:9400
+curl -s localhost:9400/metrics | grep DCGM_FI_PROF_SM_ACTIVE
+```
+
+**Pod 単位でのラベル付けが行われる**ため、「どのジョブがどの GPU をどれだけ使っているか」を紐づけて見られます。
+
+```text
+DCGM_FI_PROF_SM_ACTIVE{gpu="0",pod="train-job-0",namespace="ml"} 0.84
+```
+
+<Callout type="note">
+
+クラスタ全体で見るべきは、GPU コース レッスン 4 で挙げた指標に加えて次の 2 点です。
+
+- **割り当て済みだが使われていない GPU** — `nvidia.com/gpu` が割り当てられているのに `SM_ACTIVE` がほぼ 0 の Pod。開発用 Pod の放置が典型
+- **Pending の GPU Pod** — GPU 不足で待たされているジョブ
+
+この 2 つを並べると、**「空いていないのに使われていない」**という状態が可視化されます。GPU クラスタの利用率改善は、多くの場合ここから始まります。
+
+</Callout>
+
+---
+
+## まとめ
+
+- Kubernetes 本体に GPU の概念はない。**拡張リソース + device plugin** で実現されている
+- 拡張リソースは **`limits` のみ・整数のみ・オーバーコミット不可**。`0.5` は書けない
+- **GPU Operator** がドライバから監視まで一括管理する。既存ドライバとの競合に注意
+- GPU 種別のラベルで、混在クラスタのジョブ配置を制御する
+- **`/dev/shm` は既定 64MB**。DataLoader が落ちる。テンプレートに拡張を入れておく
+- RDMA には**デバイスの受け渡しと `IPC_LOCK`** が必要
+- **Topology Manager の既定は `none`**。分散学習では NUMA 整合を検討する
+- 監視では「**割り当て済みで使われていない GPU**」と「Pending のジョブ」を並べて見る
+
+---
+
+<Quiz
+  id="q1"
+  question="Kubernetes で 1 枚の GPU を 2 つの Pod に半分ずつ割り当てたいと考え、resources.limits に「nvidia.com/gpu: 0.5」と記述しました。この設定はどうなりますか。"
+  options={[
+    "問題なく GPU が半分ずつ割り当てられる",
+    "拡張リソースは整数しか指定できないため、この Pod はスケジュールされない。分割には MIG や time-slicing を有効化し、それぞれを別リソースとして公開する必要がある",
+    "自動的に 1 に切り上げられ、両方の Pod が GPU 全体を共有する",
+    "CPU と同様にオーバーコミットされる"
+  ]}
+  answer={1}
+  explanation="nvidia.com/gpu は Kubernetes の拡張リソースで、limits にしか書けず、整数のみ、オーバーコミット不可という制約があります。小数を指定した Pod は受け付けられません。1 枚を分割するには、GPU Operator の設定で MIG（ハードウェア分割）または time-slicing を有効化し、分割後の単位をリソースとして公開させる必要があります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Kubernetes 上の PyTorch 学習 Pod が「Unexpected bus error encountered in worker」で異常終了します。GPU は正しく割り当てられています。最も可能性が高い原因はどれですか。"
+  options={[
+    "GPU のドライバが古い",
+    "コンテナの /dev/shm が既定の 64MB のままで、DataLoader のワーカー間通信に必要な共有メモリが不足している",
+    "RDMA デバイスが渡されていない",
+    "Topology Manager のポリシーが none になっている"
+  ]}
+  answer={1}
+  explanation="PyTorch の DataLoader は num_workers を使う際、ワーカープロセス間のデータ受け渡しに /dev/shm を使用します。コンテナの既定値は 64MB と小さく、バッチサイズや画像サイズによってはすぐに枯渇して bus error になります。emptyDir に medium: Memory を指定して /dev/shm にマウントし、sizeLimit を設定するのが定石で、GPU ジョブのテンプレートには最初から入れておくべき設定です。"
+/>

@@ -1,0 +1,334 @@
+---
+title: 分散学習ジョブのスケジューリング
+description: 複数 Pod が揃わないと動かないジョブをどう捌くか。Slurm と Kubernetes の違いを含めて整理します。
+order: 6
+minutes: 18
+tags: ["gang-scheduling", "Volcano", "Kueue", "Slurm", "checkpoint", "耐障害性"]
+objectives:
+  - 分散学習に gang scheduling が必要な理由を説明できる
+  - Slurm と Kubernetes のどちらを選ぶかを判断できる
+  - 障害時にジョブを復旧させる仕組みを設計できる
+references:
+  - label: "Kueue — Kubernetes Job Queueing"
+    url: "https://kueue.sigs.k8s.io/docs/"
+  - label: "Volcano — Cloud Native Batch Scheduling"
+    url: "https://volcano.sh/en/docs/"
+  - label: "Kubeflow Training Operator"
+    url: "https://www.kubeflow.org/docs/components/training/"
+---
+
+## 標準スケジューラでは分散学習が動かない
+
+Kubernetes の標準スケジューラは、**Pod を 1 つずつ独立に配置します**。Web アプリのようにレプリカが個別に動くワークロードには適していますが、分散学習では致命的な問題を起こします。
+
+```text
+32 GPU（8 GPU × 4 ノード）を要求するジョブが 2 つ同時に投入された
+
+クラスタの空き: 4 ノード
+
+ジョブA: ノード1, ノード2 を確保 … 残り 2 ノード待ち
+ジョブB: ノード3, ノード4 を確保 … 残り 2 ノード待ち
+                    ↓
+       どちらも起動できないまま、資源を掴んで待ち続ける
+                    ↓
+                  デッドロック
+```
+
+**分散学習は全ランクが揃わないと 1 ステップも進みません。** 半分だけ起動しても、残りを待って集合通信でブロックするだけです（レッスン 3 のタイムアウト）。
+
+### Gang Scheduling
+
+解決策は **「全部揃うか、1 つも起動しないか」** を保証するスケジューリングです。
+
+```text
+Gang Scheduling:
+  必要なリソースがすべて確保できたときにだけ、一斉に起動する
+  確保できなければ、何も起動せず待つ（資源を掴まない）
+```
+
+Kubernetes では、標準機能ではないため追加のスケジューラを入れます。
+
+---
+
+<h2 className="slide-cont">標準スケジューラでは分散学習が動かない（続き）</h2>
+
+| | **Volcano** | **Kueue** |
+| --- | --- | --- |
+| 位置づけ | **独自スケジューラ**（標準を置き換える） | **キュー管理**（標準スケジューラと併用） |
+| Gang | ネイティブ対応（`minAvailable`） | ワークロード単位で確保してから投入 |
+| 機能 | 豊富（公平共有、トポロジ、プリエンプション） | シンプル。Kubernetes の作法に沿う |
+| 導入 | やや重い | **軽い。既存クラスタに足しやすい** |
+
+```yaml
+# Volcano の例: 4 つ揃わなければ起動しない
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: train-70b
+spec:
+  minAvailable: 4          # ここが gang の指定
+  schedulerName: volcano
+  queue: research
+  tasks:
+  - replicas: 4
+    name: worker
+    template:
+      spec:
+        containers:
+        - name: trainer
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+```
+
+---
+
+<h2 className="slide-cont">標準スケジューラでは分散学習が動かない（続き）</h2>
+
+<Callout type="field">
+
+**どちらを選ぶかは、既存の運用方針で決めるのが実際的です。**
+
+- **標準スケジューラの挙動を保ちたい、段階的に導入したい** → Kueue
+- **公平共有やプリエンプションまで本格的に作り込みたい** → Volcano
+
+どちらも入れずに `kubectl apply` で PyTorchJob を投げている環境は、**利用者が増えた瞬間にデッドロックします**。単一チームで手動調整している間は顕在化しないため、気づくのが遅れがちです。
+
+</Callout>
+
+---
+
+## Slurm か Kubernetes か
+
+AI 基盤では、この 2 つが並立しています。**どちらが優れているかではなく、何を重視するかの問題です。**
+
+| | **Slurm** | **Kubernetes** |
+| --- | --- | --- |
+| 出自 | HPC。バッチジョブ実行 | クラウド。サービス運用 |
+| Gang scheduling | **標準機能** | 追加コンポーネントが必要 |
+| キュー・公平共有 | **成熟している** | Kueue / Volcano で実現 |
+| ジョブの投げ方 | `sbatch script.sh` | YAML マニフェスト |
+| コンテナ | Pyxis / Enroot / Singularity で対応 | **ネイティブ** |
+| 推論サービス | **不得意**（常駐サービス向きでない） | **得意** |
+| エコシステム | HPC 系ツール | **CI/CD、監視、CNCF 全般** |
+| 学習コスト | 研究者には馴染みがある | インフラ側には馴染みがある |
+
+<Callout type="tip">
+
+**判断の目安です。**
+
+- **学習だけを大規模に回す研究用クラスタ** → Slurm が素直。HPC の運用ノウハウがそのまま使える
+- **学習と推論を同じ基盤で運用したい、CI/CD と繋げたい** → Kubernetes
+- **両方必要** → 実際、Slurm クラスタと Kubernetes クラスタを併設している組織は多い
+
+「Kubernetes のほうが新しいから」で選ぶと、バッチジョブのキュー管理を自前で作り込むことになります。逆に「HPC は Slurm」と決めつけると、推論サービスの運用で苦労します。**ワークロードの比率で決めてください。**
+
+</Callout>
+
+---
+
+## PyTorchJob と分散の起動
+
+Kubernetes で PyTorch の分散学習を動かす場合、**Kubeflow Training Operator** が標準的な選択肢です。
+
+```yaml
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: train-70b
+spec:
+  runPolicy:
+    schedulingPolicy:
+      minAvailable: 4        # gang scheduling と連携
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      template: *podTemplate
+    Worker:
+      replicas: 3
+      template: *podTemplate
+```
+
+Operator が次を自動で設定します。
+
+```text
+MASTER_ADDR, MASTER_PORT, WORLD_SIZE, RANK
+  → torchrun / torch.distributed が必要とする環境変数
+```
+
+これらを手で管理しなくてよいのが利点です。MPI を使う場合は **MPI Operator** を使います。
+
+---
+
+## 障害への対処
+
+レッスン 1 で触れたとおり、**分散学習は 1 ノードの障害で全体が止まります**。規模が大きいほど、これは「起きるかどうか」ではなく「いつ起きるか」の問題になります。
+
+### ① 壊れたノードを自動で外す
+
+```bash
+# GPU に問題があるノードを手動で隔離する
+kubectl cordon gpu-07              # 新規スケジュールを止める
+kubectl drain gpu-07 --ignore-daemonsets --delete-emptydir-data
+```
+
+自動化するには、**DCGM の Xid 検知とノードの状態を連動させます**。
+
+```text
+dcgm-exporter が Xid 48/79 を検知（GPU コース レッスン 2）
+      ↓
+アラート発火
+      ↓
+Node Problem Detector がノードに condition を付ける
+      ↓
+taint が付き、新規 Pod が配置されなくなる
+```
+
+<Callout type="warning" title="壊れた GPU にジョブが配置され続ける">
+
+**自動隔離の仕組みがないと、最悪のパターンが起きます。**
+
+```text
+ジョブ起動 → 数分後に壊れた GPU で Xid → ジョブ失敗
+  → スケジューラが再投入 → また同じノードへ配置 → また失敗
+  → これが延々と繰り返される
+```
+
+GPU の枚数が多いほど、「たまたま壊れている 1 枚」に当たる確率は上がります。**Node Problem Detector と DCGM の連携は、規模が一定を超えたら必須**と考えてください。
+
+最低限、**Xid のアラートを人に飛ばす**だけでも状況はかなり違います。
+
+</Callout>
+
+---
+
+### ② チェックポイントからの再開
+
+レッスン 4 で扱ったチェックポイントは、ここで効いてきます。
+
+```text
+ジョブ失敗
+  → 最後のチェックポイントから再開
+  → 失うのは「前回保存以降の計算」だけ
+```
+
+**再開が自動で行われるようにしておくこと**が重要です。手動で再投入する運用では、夜間や週末の障害で何時間も空転します。
+
+```yaml
+spec:
+  runPolicy:
+    backoffLimit: 10          # 再試行回数
+    cleanPodPolicy: Running
+```
+
+学習スクリプト側でも、**起動時に既存のチェックポイントを探して自動的に再開する**実装にしておきます。
+
+### ③ Elastic Training
+
+ノード数が変動しても継続できる方式です。
+
+```bash
+torchrun \
+  --nnodes=4:8 \                 # 最小 4、最大 8 ノードで動作する
+  --max-restarts=3 \
+  --rdzv-backend=c10d \
+  --rdzv-endpoint=$MASTER_ADDR:29400 \
+  train.py
+```
+
+1 ノードが落ちても、残りで再構成して継続できます。ただし次の制約があります。
+
+---
+
+<h2 className="slide-cont">障害への対処（続き）</h2>
+
+- **ノード数が変わるとグローバルバッチサイズが変わる**ため、学習の再現性に影響する
+- 再構成のたびに、集合通信のグループを作り直すオーバーヘッドがある
+- フレームワークとコードが対応している必要がある
+
+<Callout type="note">
+
+Elastic は万能ではありません。**厳密な再現性が要る学習では、固定ノード数 + チェックポイント再開のほうが扱いやすい**ことも多くあります。
+
+「ノードが落ちても止まらない」ことの価値と、「学習条件が途中で変わる」ことの影響を天秤にかけて決めてください。
+
+</Callout>
+
+---
+
+## キューと公平性
+
+GPU は希少資源なので、**誰がどれだけ使えるかの管理**が必要になります。
+
+```yaml
+# Kueue の例: チームごとに使える GPU 数を決める
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: research
+spec:
+  resourceGroups:
+  - coveredResources: ["nvidia.com/gpu"]
+    flavors:
+    - name: h100
+      resources:
+      - name: "nvidia.com/gpu"
+        nominalQuota: 64
+        borrowingLimit: 32      # 他キューが空いていれば借りられる
+```
+
+<Callout type="field">
+
+**運用上、効果が大きいのは次の 3 つです。**
+
+1. **借用（borrowing）を許す** — 固定割り当てだけだと、使われていない GPU が遊ぶ。空いていれば借りられる設定にすると利用率が上がる
+2. **優先度とプリエンプション** — 本番の学習ジョブが、開発用の小さいジョブを押しのけられるようにする
+3. **最大実行時間の設定** — 放置された開発用 Pod が GPU を掴み続けるのを防ぐ
+
+レッスン 5 で触れた「割り当て済みで使われていない GPU」の監視と組み合わせると、実際の無駄が見えてきます。**GPU クラスタの利用率が上がらない原因の多くは、技術ではなく運用ルールの不在です。**
+
+</Callout>
+
+---
+
+## まとめ
+
+- 標準スケジューラは Pod を個別に配置するため、**分散学習でデッドロックする**
+- **Gang scheduling が必要**。Kubernetes では Volcano か Kueue を追加する
+- **Slurm と Kubernetes は優劣ではなくワークロードの比率**で選ぶ
+- 学習中心なら Slurm、学習と推論の併用や CI/CD 連携なら Kubernetes
+- PyTorchJob（Training Operator）が `MASTER_ADDR` などを自動設定する
+- **壊れたノードの自動隔離がないと、同じノードで失敗を繰り返す**
+- チェックポイントからの**自動再開**を必ず組み込む。手動運用は夜間に空転する
+- Elastic training は万能ではない。**再現性とのトレードオフ**
+- 利用率は技術より**運用ルール**（借用・優先度・最大実行時間）で決まる
+
+---
+
+<Quiz
+  id="q1"
+  question="Kubernetes の標準スケジューラで、4 ノードを要求する分散学習ジョブを 2 つ同時に投入したところ、どちらも起動しないまま停止しました。原因として正しいものはどれですか。"
+  options={[
+    "GPU のドライバが不足している",
+    "標準スケジューラは Pod を個別に配置するため、両ジョブが部分的にノードを確保し合って互いに残りを待つデッドロックが発生した",
+    "リソース制限の記述が誤っている",
+    "NCCL のタイムアウトが短すぎる"
+  ]}
+  answer={1}
+  explanation="標準スケジューラは Pod を 1 つずつ独立に配置します。分散学習は全ランクが揃わないと進まないため、複数ジョブが部分的にリソースを確保したまま互いに待ち続ける古典的なデッドロックが起きます。「全部揃うか、1 つも起動しないか」を保証する gang scheduling が必要で、Kubernetes では Volcano や Kueue を追加して実現します。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="数百 GPU の学習クラスタで、あるジョブが起動しては数分で失敗することを繰り返しています。調べると特定ノードの GPU が Xid を出していました。恒久的な対策として最も適切なものはどれですか。"
+  options={[
+    "NCCL のタイムアウトを延ばす",
+    "ジョブの再試行回数を増やす",
+    "DCGM の Xid 検知と Node Problem Detector を連携させ、問題のあるノードに自動で taint を付けて新規スケジュールから除外する",
+    "チェックポイント間隔を短くする"
+  ]}
+  answer={2}
+  explanation="壊れた GPU を持つノードが正常として扱われ続けると、スケジューラが再投入のたびに同じノードへ配置し、失敗を繰り返します。根本的な対策は、DCGM が検知した Xid をノードの状態に反映させ、taint によって新規スケジュール対象から自動的に外すことです。タイムアウト延長や再試行回数の増加は症状を長引かせるだけで、チェックポイント間隔の短縮は別の問題への対策です。"
+/>

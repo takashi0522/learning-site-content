@@ -1,0 +1,273 @@
+---
+title: CPU の構造と周波数の実際
+description: コアとスレッドの違い、ターボブーストが効かなくなる条件、省電力機能がレイテンシに与える影響を押さえます。
+order: 2
+minutes: 17
+tags: ["CPU", "SMT", "turbo", "C-state", "governor"]
+objectives:
+  - 物理コアと論理スレッド（SMT）の違いを説明し、lscpu から読み取れる
+  - 全コア負荷時に周波数が下がる理由を説明できる
+  - 省電力機能がレイテンシに与える影響を理解し、必要に応じて調整できる
+references:
+  - label: "lscpu(1) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man1/lscpu.1.html"
+  - label: "CPU Performance Scaling — kernel admin-guide"
+    url: "https://docs.kernel.org/admin-guide/pm/cpufreq.html"
+  - label: "intel_pstate CPU Performance Scaling Driver"
+    url: "https://docs.kernel.org/admin-guide/pm/intel_pstate.html"
+---
+
+## lscpu を読む
+
+サーバーの CPU 構成を把握する出発点は `lscpu` です。
+
+```bash
+lscpu
+```
+
+```text
+Architecture:            x86_64
+CPU(s):                  64            ← OS から見える論理 CPU の総数
+  Thread(s) per core:    2             ← SMT が有効（1コアが2スレッドに見える）
+  Core(s) per socket:    16            ← 1ソケットあたりの物理コア数
+  Socket(s):             2             ← 物理 CPU の個数
+Model name:              Intel(R) Xeon(R) Gold 6326 CPU @ 2.90GHz
+    CPU max MHz:         3500.0000     ← ターボ時の上限
+    CPU min MHz:         800.0000
+Caches (sum of all):
+  L1d:                   1.5 MiB (32 instances)
+  L2:                    40 MiB (32 instances)
+  L3:                    48 MiB (2 instances)  ← ソケットごとに1つ、コア間で共有
+NUMA node(s):            2
+NUMA node0 CPU(s):       0-15,32-47
+NUMA node1 CPU(s):       16-31,48-63
+```
+
+掛け算で検算できます。`2 ソケット × 16 コア × 2 スレッド = 64 論理 CPU`。
+
+**`CPU(s): 64` は「64 個分の処理能力がある」という意味ではありません。** 物理コアは 32 個です。
+
+---
+
+<h2 className="slide-cont">lscpu を読む（続き）</h2>
+
+<Callout type="note" title="NUMA node の CPU 番号が飛んでいる理由">
+
+`NUMA node0 CPU(s): 0-15,32-47` のように番号が連続していないのは、`0-15` が物理コア、`32-47` がその SMT ペアだからです。つまり CPU 0 と CPU 32 は**同じ物理コア**を共有しています。
+
+ベンチマークでプロセスを CPU に固定するとき、これを知らずに `0` と `32` に割り当てると、2 コア使っているつもりで 1 コアを取り合うことになります。ペアの確認は次のとおりです。
+
+```bash
+cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
+# 0,32
+```
+
+</Callout>
+
+---
+
+## SMT（Hyper-Threading）は 2 倍にならない
+
+SMT は、1 つの物理コアに 2 セット分のレジスタと命令ポインタを持たせ、OS からは 2 つの CPU に見せる技術です。しかし**実際に計算を行う実行ユニットは 1 セットしかありません**。
+
+```text
+物理コア
+├── スレッド0 のレジスタ・状態 ┐
+├── スレッド1 のレジスタ・状態 ┘ 共有 → 実行ユニット・L1/L2キャッシュ
+```
+
+片方のスレッドがメモリ待ちで止まっている間、もう片方が実行ユニットを使えます。**待ち時間を埋めるための技術**であって、演算能力を増やすものではありません。
+
+| ワークロード | SMT の効果 |
+| --- | --- |
+| メモリ待ちが多い（Web、DB、一般的なサーバー用途） | **+20〜30%** |
+| 演算ユニットを使い切る（科学計算、暗号処理） | **±0%、場合によってマイナス** |
+| レイテンシが最重要（低遅延取引など） | ばらつきが増えるため無効化されることが多い |
+
+```bash
+# SMT の状態確認と、実行中の無効化
+cat /sys/devices/system/cpu/smt/control    # on / off / forceoff
+echo off | sudo tee /sys/devices/system/cpu/smt/control
+```
+
+<Callout type="pitfall">
+
+ライセンスがコア数課金のミドルウェア（一部の商用 DB など）では、論理 CPU 数で課金されるのか物理コア数なのかで費用が倍違います。`CPU(s)` の値をそのまま申告しないよう注意してください。
+
+</Callout>
+
+---
+
+## 周波数は固定ではない
+
+カタログの「2.90GHz」は基本周波数（ベースクロック）で、実際の動作周波数は常に変動しています。
+
+### ターボブースト
+
+熱と電力に余裕があるとき、CPU は基本周波数を超えて動作します。ただし**上限は同時に動いているコア数に依存します**。
+
+```text
+1〜2 コアだけ稼働   → 3.5 GHz まで上昇
+全 16 コア稼働      → 3.0 GHz 程度に制限
+全コア + AVX-512    → 2.4 GHz 程度まで低下
+```
+
+シングルスレッドのベンチマークが速いのに、本番の全コア負荷では期待したほど伸びない、という現象の主因です。
+
+さらに AVX-512 のような広い SIMD 命令は消費電力が大きく、実行中は周波数が追加で下げられます（**周波数オフセット**）。一部の処理を高速化したつもりが、同じ CPU 上の他のプロセスまで遅くなることがあります。
+
+```bash
+# 実際の動作周波数・消費電力・C-state 滞在率をまとめて見る
+sudo turbostat --interval 1
+
+# 現在の周波数だけを見る
+grep MHz /proc/cpuinfo | head
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+```
+
+### ガバナ（周波数制御ポリシー）
+
+---
+
+<h2 className="slide-cont">周波数は固定ではない（続き）</h2>
+
+```bash
+# 現在のドライバとガバナ
+cpupower frequency-info
+
+# 全コアを performance に固定する
+sudo cpupower frequency-set -g performance
+```
+
+| ガバナ | 挙動 | 向き |
+| --- | --- | --- |
+| `performance` | 常に高い周波数を維持 | レイテンシ重視のサーバー |
+| `powersave` | 負荷に応じて動的に調整（`intel_pstate` では実質これが標準動作） | 一般用途 |
+| `schedutil` | スケジューラの負荷情報を直接使って調整 | 新しめのカーネルの既定 |
+
+<Callout type="field">
+
+「たまにレスポンスが遅い」という症状で、アプリケーション側に原因が見つからない場合、周波数の立ち上がり遅延を疑う価値があります。アイドル状態から負荷がかかった瞬間、周波数が上がるまでに数十マイクロ秒〜ミリ秒かかります。
+
+リクエストが散発的に来るサーバーは、常にこの「立ち上がり」を踏み続けることになります。`performance` ガバナへの固定で改善することがあります。
+
+</Callout>
+
+---
+
+## C-state: アイドル時の落とし穴
+
+周波数（P-state）とは別に、アイドル時にどれだけ深く眠るかを決める **C-state** があります。
+
+| C-state | 状態 | 復帰にかかる時間 |
+| --- | --- | --- |
+| C0 | 実行中 | — |
+| C1 | クロック停止 | 約 1 μs |
+| C3 | L1/L2 キャッシュをフラッシュ | 約 50 μs |
+| C6 | コアの電源を落とす | **約 100 μs 以上** |
+
+深い C-state から復帰するには時間がかかり、しかも**キャッシュが失われている**ため、復帰直後はメモリアクセスが遅くなります。
+
+```bash
+# 各 C-state への滞在時間と回数
+cpupower idle-info
+turbostat --interval 5    # CPU%c1, CPU%c6 の列
+
+# 深い C-state を禁止する（レイテンシ 50μs 以下の状態のみ許可）
+# ※ 消費電力と発熱が増える
+sudo cpupower idle-set -D 50
+```
+
+ネットワーク経由のリクエストを μs 単位のレイテンシで処理したいシステムでは、C-state の制限が効きます。一方で消費電力は目に見えて増えるため、要件がない限り既定のままで構いません。
+
+---
+
+## キャッシュ構造とソケット内の distance
+
+レッスン 1 で NUMA（ソケット間のメモリ距離）を扱いましたが、**ソケット内部にも距離があります**。
+
+Intel の多くは L3 をソケット内の全コアで共有しますが、AMD EPYC はコアを **CCD / CCX** という小さな塊に分け、**L3 を CCX 単位で分割**しています。
+
+```text
+AMD EPYC の例
+Socket
+├── CCD0 ── CCX(8コア) ── L3 32MB   ← この8コア間は速い
+├── CCD1 ── CCX(8コア) ── L3 32MB   ← CCD0 とはデータを直接共有しない
+└── ...
+```
+
+別の CCD 上のコアとデータを共有すると、L3 を経由できずメモリコントローラまで往復します。スレッド間で頻繁にデータをやり取りするアプリケーションでは、**同じ CCD 内にスレッドを固める**ほうが速くなります。
+
+```bash
+# キャッシュの共有範囲を確認する（この CPU と L3 を共有するコア一覧）
+cat /sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list
+
+# NUMA の距離行列（10 がローカル、それ以上がリモート）
+numactl --hardware | tail -5
+```
+
+---
+
+## 脆弱性緩和の性能コスト
+
+Spectre / Meltdown 以降、多数の投機実行に関する脆弱性が見つかり、その緩和策がカーネルとマイクロコードに入っています。
+
+```bash
+# この環境で何が有効になっているかの一覧
+grep . /sys/devices/system/cpu/vulnerabilities/*
+```
+
+```text
+/sys/devices/system/cpu/vulnerabilities/meltdown:Mitigation: PTI
+/sys/devices/system/cpu/vulnerabilities/spectre_v2:Mitigation: Retpolines, IBPB
+/sys/devices/system/cpu/vulnerabilities/mds:Mitigation: Clear CPU buffers
+```
+
+Linux コースのレッスン 1 で触れた KPTI（= `Mitigation: PTI`）もここに現れます。システムコールやコンテキストスイッチの多いワークロードでは、これらの合計で数% 〜 数十% の性能差が出ることがあります。
+
+<Callout type="warning">
+
+`mitigations=off` というカーネルパラメータで一括無効化できますが、**これは脆弱性をそのまま受け入れる設定です。** 複数テナントが同居する環境や、信頼できないコードを実行する環境では絶対に使ってはいけません。
+
+単一用途の専有物理サーバーで、かつ性能差を実測して必要性を確認した場合にのみ検討する選択肢です。判断の根拠を残しておいてください。
+
+</Callout>
+
+---
+
+## まとめ
+
+- `CPU(s)` は論理 CPU 数。物理コア数は `ソケット × コア/ソケット`
+- SMT は待ち時間を埋める技術で、性能は +20〜30%。2 倍にはならない
+- ターボの上限は**稼働コア数に依存**する。全コア負荷では基本周波数付近まで落ちる
+- 深い C-state からの復帰は 100μs 以上かかり、キャッシュも失われる
+- AMD EPYC では L3 が CCX 単位。ソケット内にも「距離」がある
+- 脆弱性緩和には実測できる性能コストがあるが、無効化はセキュリティ上の判断を伴う
+
+<Quiz
+  id="q1"
+  question="lscpu の出力が「Socket(s): 2 / Core(s) per socket: 16 / Thread(s) per core: 2」でした。このサーバーの物理コア数はいくつですか。"
+  options={[
+    "16",
+    "32",
+    "64",
+    "128"
+  ]}
+  answer={1}
+  explanation="物理コア数は ソケット数 × ソケットあたりのコア数 = 2 × 16 = 32 です。CPU(s) に表示される 64 は SMT による論理 CPU 数で、実行ユニットは 32 コア分しかありません。コア数課金のライセンスでは、この区別が費用に直結します。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="シングルスレッドのベンチマークでは 3.5GHz で動作していたのに、本番で全コアに負荷がかかると 3.0GHz 前後までしか上がりません。この挙動の説明として正しいものはどれですか。"
+  options={[
+    "CPU の故障または冷却不良",
+    "ターボブーストの上限は同時稼働コア数に依存するため、全コア負荷では上限が下がる（正常な動作）",
+    "ガバナが powersave になっている",
+    "SMT が無効になっている"
+  ]}
+  answer={1}
+  explanation="ターボブーストは電力と熱の余裕を使って周波数を上げる仕組みで、稼働コア数が増えるほど 1 コアあたりに回せる余裕が減ります。全コア稼働時の上限が基本周波数付近になるのは仕様どおりです。AVX-512 などの広い SIMD 命令を使うと、さらに周波数オフセットが加わります。"
+/>

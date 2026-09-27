@@ -1,0 +1,289 @@
+---
+title: L2 スイッチングと VLAN・ボンディング
+description: MAC 学習・VLAN・MTU 不一致・リンク束ねの挙動を押さえ、L2 起因の障害を切り分けられるようにします。
+order: 2
+minutes: 17
+tags: ["Ethernet", "ARP", "VLAN", "MTU", "bonding", "LACP"]
+objectives:
+  - ARP テーブルと MAC 学習の関係を説明できる
+  - MTU 不一致で起きる「小さい通信は通るが大きい通信が止まる」症状を診断できる
+  - ボンディングで単一フローの速度が上がらない理由を説明できる
+references:
+  - label: "ip-link(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/ip-link.8.html"
+  - label: "Linux Ethernet Bonding Driver HOWTO — kernel docs"
+    url: "https://docs.kernel.org/networking/bonding.html"
+  - label: "ethtool(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/ethtool.8.html"
+---
+
+## 同一セグメント内での通信
+
+IP アドレスを指定して通信するとき、実際にフレームを届けるには**相手の MAC アドレス**が必要です。その対応を解決するのが ARP です。
+
+```text
+1. 送信元が「10.0.0.20 の MAC を教えて」をブロードキャストで投げる
+2. 該当ホストが「それは私。MAC は aa:bb:cc:dd:ee:ff」とユニキャストで返す
+3. 送信元は対応を ARP テーブルにキャッシュする
+4. 以降はそのキャッシュを使ってフレームを送る
+```
+
+```bash
+# ARP テーブル（近隣テーブル）
+ip neigh show
+
+# 状態つきで読む
+ip -s neigh show dev eth0
+```
+
+```text
+10.0.0.1   dev eth0 lladdr 00:1b:21:3a:4c:5d REACHABLE
+10.0.0.20  dev eth0 lladdr aa:bb:cc:dd:ee:ff STALE
+10.0.0.99  dev eth0  FAILED                    ← 応答がない
+```
+
+| 状態 | 意味 |
+| --- | --- |
+| `REACHABLE` | 最近確認済み。有効 |
+| `STALE` | 期限切れ。次の通信時に再確認する（通信自体は行われる） |
+| `FAILED` | ARP に応答がない。**相手が落ちているか、そもそも同一セグメントにいない** |
+| `INCOMPLETE` | 解決中 |
+
+---
+
+<h2 className="slide-cont">同一セグメント内での通信（続き）</h2>
+
+<Callout type="field">
+
+「疎通しない」調査の最初の分岐点がここです。
+
+- `ip neigh` が `FAILED` → **L2 の問題**。相手がダウン、VLAN 違い、ケーブル、スイッチポート設定
+- MAC は解決できているのに通信できない → **L3 以上の問題**。ルーティング、ファイアウォール、アプリ
+
+`ping` の結果だけで判断せず、`ip neigh` を挟むと切り分けが一段速くなります。
+
+</Callout>
+
+### スイッチ側の MAC 学習
+
+スイッチは、受信したフレームの**送信元 MAC** とポート番号の対応を学習し、MAC アドレステーブルに記録します。宛先 MAC が未学習の場合は全ポートへ転送（フラッディング）します。
+
+Linux でブリッジを作っている場合（コンテナや VM のホスト）、同じテーブルを確認できます。
+
+```bash
+bridge fdb show br0
+bridge link show
+```
+
+---
+
+## VLAN: 1 本の線に複数のセグメント
+
+**VLAN**（IEEE 802.1Q）は、イーサネットフレームに 4 バイトのタグを挿入して、論理的にネットワークを分割する仕組みです。
+
+| ポートの種別 | 動作 |
+| --- | --- |
+| **アクセスポート** | タグなしフレームを扱う。特定の 1 VLAN に固定 |
+| **トランクポート** | タグ付きフレームを扱う。複数 VLAN を 1 本で通す |
+
+Linux 側で VLAN インターフェースを作ると、トランクで来たタグ付きフレームを受けられます。
+
+```bash
+# eth0 上に VLAN 100 のインターフェースを作る
+sudo ip link add link eth0 name eth0.100 type vlan id 100
+sudo ip addr add 192.168.100.10/24 dev eth0.100
+sudo ip link set eth0.100 up
+
+# 確認
+ip -d link show eth0.100 | grep vlan
+```
+
+<Callout type="pitfall" title="ネイティブ VLAN のずれ">
+
+トランクポートでは、タグなしで届いたフレームを特定の VLAN として扱う「ネイティブ VLAN」が設定されています。スイッチ側とサーバー側で**この認識がずれると、タグなし通信だけが意図しない VLAN に流れます**。
+
+症状は「VLAN 100 と 200 は通るのに、タグなしの通信だけおかしい」という分かりにくいものになります。スイッチのポート設定（`switchport trunk native vlan`）と、サーバー側でどのインターフェースに IP を振っているかを突き合わせてください。
+
+</Callout>
+
+---
+
+## MTU 不一致: 最も紛らわしい障害
+
+**MTU**（Maximum Transmission Unit）は、1 フレームで運べるペイロードの最大長です。イーサネットの標準は **1500 バイト**、ジャンボフレームは通常 **9000 バイト**です。
+
+ジャンボフレームは、大きなデータ転送時のフレーム数と CPU 処理を減らせるため、ストレージネットワーク（iSCSI、NFS）でよく使われます。
+
+**ただし、経路上のすべての機器で設定が揃っている必要があります。**
+
+<Callout type="warning" title="小さい通信は通るのに、大きい通信だけ止まる">
+
+MTU 不一致の典型的な症状です。
+
+- `ping` は通る（デフォルト 56 バイト）
+- SSH でログインできる（対話は小さいパケット）
+- **`ls` した瞬間、あるいは大きなファイル転送で固まる**
+
+原因は、経路のどこかに小さい MTU の区間があり、大きいフレームだけが捨てられているためです。
+
+```bash
+# 分割禁止ビットを立てて、実際に通るサイズを二分探索する
+# -M do = 分割禁止, -s = ペイロードサイズ（IP/ICMP ヘッダ 28 バイトを引いた値を指定）
+ping -M do -s 8972 -c 2 10.0.0.20     # MTU 9000 を試す
+ping -M do -s 1472 -c 2 10.0.0.20     # MTU 1500 を試す
+```
+
+`Frag needed and DF set (mtu = 1500)` と返れば、そこが上限です。無応答の場合は、途中の機器が ICMP を返さずに黙って捨てています（より厄介なケース）。
+
+</Callout>
+
+```bash
+# インターフェースの MTU を確認・変更
+ip link show eth0 | grep mtu
+sudo ip link set eth0 mtu 9000
+
+# 恒久化はディストリの設定（NetworkManager / netplan など）で行う
+```
+
+MTU を 9000 にする場合、**サーバー・スイッチ・相手サーバーのすべて**を揃えます。スイッチ側は「ポート MTU」ではなく「システム MTU」として設定する機種もあり、再起動が必要な場合もあります。
+
+---
+
+## ボンディング: リンクを束ねる
+
+複数の物理 NIC を 1 つの論理インターフェースにまとめ、冗長性と帯域を得る仕組みです。
+
+| モード | 名称 | 特徴 | スイッチ側の設定 |
+| --- | --- | --- | --- |
+| 1 | `active-backup` | 1 本だけ使い、故障時に切り替え | **不要**。最も安全 |
+| 4 | `802.3ad` (LACP) | 複数本を同時利用。標準プロトコルで折衝 | **必要**（ポートチャネル） |
+| 0 | `balance-rr` | パケット単位で順に振り分け | 必要。順序入れ替わりの副作用あり |
+| 6 | `balance-alb` | 受信も含めて負荷分散 | 不要 |
+
+```bash
+# 状態の確認
+cat /proc/net/bonding/bond0
+```
+
+```text
+Bonding Mode: IEEE 802.3ad Dynamic link aggregation
+Transmit Hash Policy: layer2 (0)
+802.3ad info
+  Aggregator ID: 1
+  Number of ports: 2          ← 2本とも参加できているか
+Slave Interface: eth0
+  MII Status: up
+Slave Interface: eth1
+  MII Status: up
+```
+
+---
+
+<h2 className="slide-cont">ボンディング: リンクを束ねる（続き）</h2>
+
+<Callout type="pitfall" title="2本束ねても1本分の速度しか出ない">
+
+**これは仕様どおりの動作です。**
+
+LACP は、パケットの順序が入れ替わらないよう、**同じ通信（フロー）は必ず同じ物理リンクを通します**。どのリンクを使うかはヘッダ情報のハッシュで決まります。
+
+```text
+Transmit Hash Policy = layer2      → 送信元/宛先 MAC のみで決定
+                       layer3+4    → IP とポート番号も使う
+```
+
+つまり **1 本の TCP コネクションは、絶対に 1 リンク分の速度を超えません。** 10GbE を 2 本束ねても、単一の転送は 10Gbps が上限です。
+
+多数のクライアントがいる環境では合計で 20Gbps を使えますが、バックアップ転送のような「大きな単一フロー」では効果がありません。
+
+```bash
+# ハッシュポリシーを layer3+4 にすると、同じ相手でもポート番号で分散される
+# ※ スイッチ側も対応する設定にする必要がある
+sudo ip link set bond0 type bond xmit_hash_policy layer3+4
+```
+
+`layer2` のままだと、**相手が 1 台の場合は MAC が固定なので常に同じリンクに寄ります**。サーバー間の 1 対 1 通信で分散が効かない原因はこれです。
+
+</Callout>
+
+---
+
+## 物理層のエラーを見る
+
+L2 より下で問題が起きていることもあります。ケーブル、トランシーバ、ポートの劣化です。
+
+```bash
+# リンク速度とデュプレックス
+ethtool eth0 | grep -E 'Speed|Duplex|Link detected'
+
+# エラーカウンタ（ここが増え続けていたら物理層を疑う）
+ethtool -S eth0 | grep -iE 'err|drop|crc|discard'
+
+# インターフェース統計
+ip -s link show eth0
+```
+
+```text
+RX: bytes  packets  errors  dropped  missed   mcast
+    9.8e12  7.2e9      0      1423      0     12043
+TX: bytes  packets  errors  dropped  carrier collsns
+    4.1e12  3.1e9      0        0        0       0
+```
+
+| カウンタ | 示すもの |
+| --- | --- |
+| `rx_crc_errors` | **フレームが壊れて届いた**。ケーブル、コネクタ、トランシーバ、電磁ノイズ |
+| `rx_missed_errors` | NIC のリングバッファ溢れ（レッスン 1 参照） |
+| `carrier` | リンクの断続。ポートやケーブルの接触不良 |
+| `collsns` | 半二重での衝突。現代の環境で出ていたら**デュプレックス不一致** |
+
+---
+
+<h2 className="slide-cont">物理層のエラーを見る（続き）</h2>
+
+<Callout type="tip">
+
+`Speed: 1000Mb/s` のはずが `100Mb/s` でリンクしている、というのは意外とよくあります。ケーブルの芯線不良（8 芯のうち一部が断線）でギガビットのオートネゴシエーションが成立せず、100Mbps に落ちるためです。
+
+「なぜか遅い」の調査では、`ethtool` でリンク速度を確認するのを最初の一手にしてください。ハードウェアコースのレッスン 5 で扱った PCIe のリンク確認と、発想は同じです。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 疎通調査は `ip neigh` で **L2 か L3 以上かを最初に切り分ける**
+- VLAN のネイティブ VLAN のずれは、タグなし通信だけがおかしくなる分かりにくい障害を生む
+- **MTU 不一致は「ping は通るが大きい転送が止まる」**。`ping -M do -s` で経路の上限を測る
+- LACP は同一フローを同一リンクに固定するため、**単一 TCP 接続の速度は 1 本分が上限**
+- 相手が 1 台の場合、`xmit_hash_policy` が `layer2` だと分散しない
+- `ethtool` のリンク速度とエラーカウンタは、物理層を疑うときの一次情報
+
+<Quiz
+  id="q1"
+  question="サーバー A から B へ、ping も SSH ログインも成功しますが、大きなファイルを転送すると途中で固まります。最も疑わしい原因はどれですか。"
+  options={[
+    "ARP テーブルが FAILED になっている",
+    "経路上に MTU の小さい区間があり、大きいフレームだけが破棄されている",
+    "ルーティングテーブルの設定ミス",
+    "DNS の名前解決に失敗している"
+  ]}
+  answer={1}
+  explanation="ping（既定 56 バイト）や SSH の対話は小さいパケットなので通りますが、大きな転送では MTU いっぱいのフレームが使われます。経路のどこかに小さい MTU の区間があると、そのフレームだけが破棄されて転送が止まります。ping -M do -s <サイズ> で分割禁止ビットを立てながらサイズを変え、どこで通らなくなるかを特定します。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="10GbE を 2 本、LACP で束ねた bond0 を作りました。しかしバックアップサーバーへの単一のファイル転送は 10Gbps 止まりです。この理由として正しいものはどれですか。"
+  options={[
+    "LACP の設定に誤りがあり、1本しか参加していない",
+    "LACP は順序保証のため同一フローを同一リンクに固定するので、単一の TCP 接続は 1 本分の帯域が上限になる",
+    "MTU が 1500 のままだから",
+    "スイッチ側がポートチャネルに対応していない"
+  ]}
+  answer={1}
+  explanation="LACP はパケットの並び替えを避けるため、ヘッダ情報のハッシュで送出リンクを決め、同じフローは常に同じリンクを通します。したがって 1 本の TCP 接続が複数リンクにまたがることはなく、単一転送の上限は 1 リンク分です。多数のフローがあれば合計で帯域を使えます。単一相手への分散を改善したい場合は xmit_hash_policy を layer3+4 にする方法がありますが、それでも 1 接続は 1 リンクのままです。"
+/>

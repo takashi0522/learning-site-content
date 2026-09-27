@@ -1,0 +1,205 @@
+---
+title: パケットが NIC からアプリに届くまで
+description: 受信パケットがカーネル内で辿る経路を追い、どこでドロップしているのかをカウンタから特定できるようにします。
+order: 1
+minutes: 15
+tags: ["NIC", "NAPI", "softirq", "socket", "tcpdump"]
+objectives:
+  - 受信パケットが通る主要な段階を順に説明できる
+  - パケットロスが発生している層をカウンタから特定できる
+  - ソケットバッファと輻輳ウィンドウの関係を説明できる
+references:
+  - label: "Linux Networking Documentation — kernel docs"
+    url: "https://docs.kernel.org/networking/index.html"
+  - label: "ss(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/ss.8.html"
+  - label: "RFC 9293 — Transmission Control Protocol"
+    url: "https://www.rfc-editor.org/rfc/rfc9293.html"
+---
+
+## 受信経路の全体像
+
+「パケットが届かない」という問題を切り分けるには、パケットがどこを通るかを知っている必要があります。受信側の経路は次のとおりです。
+
+<Figure name="rx-packet-path" caption="受信パケットが通る 7 段。ハードウェア / カーネル / ユーザー空間の境界に注目する" />
+
+**各段階にそれぞれ独立したドロップ要因があります。** どこで落ちているかを特定するのが調査の要点です。
+
+---
+
+## 割り込みと NAPI
+
+10 Gbps の回線では、最小サイズのパケットが毎秒 1,400 万個到着しえます。1 パケットごとにハードウェア割り込みを発生させると、CPU は割り込み処理だけで飽和します（**割り込みライブロック**）。
+
+これを避けるのが **NAPI** です。
+
+1. 最初のパケットで割り込みが発生する
+2. カーネルは**その NIC の割り込みを一旦無効化**する
+3. 以降は softirq がポーリングでまとめてパケットを回収する
+4. キューが空になったら割り込みを再度有効化する
+
+低負荷時は割り込み駆動で低レイテンシ、高負荷時はポーリングで高スループットという、両方の利点を取る仕組みです。
+
+```bash
+# softirq の処理状況（CPUごと）
+cat /proc/net/softnet_stat
+# 列の意味（16進）: 1列目=処理したパケット数
+#                   2列目=バックログ溢れによるドロップ ← ここが増えていたら問題
+#                   3列目=budget/time を使い切って処理を打ち切った回数
+
+# CPUごとの softirq 回数
+watch -n1 'grep NET_RX /proc/softirqs'
+```
+
+<Callout type="pitfall">
+
+`/proc/net/softnet_stat` の **2 列目が 0 以外**なら、カーネルが受信処理に追いつかずパケットを捨てています。NIC のカウンタ（`ethtool -S`）には現れないため、NIC 側だけを見ていると見逃します。
+
+多くの場合、原因は割り込みが 1 つの CPU に集中していることです。`RSS`（NIC 側でのハードウェア分散）や `RPS`（ソフトウェアでの分散）が有効か確認してください。
+
+</Callout>
+
+---
+
+## どこで落ちているかを切り分ける
+
+層ごとに見るカウンタが違います。上から順に確認します。
+
+```bash
+# ① NIC / ドライバ層 — rx_dropped, rx_missed_errors, rx_no_buffer_count
+ethtool -S eth0 | grep -iE 'drop|err|miss|discard'
+
+# リングバッファのサイズ（Current が Max より小さければ拡張の余地）
+ethtool -g eth0
+
+# ② カーネルの受信処理層
+cat /proc/net/softnet_stat
+
+# ③ プロトコル層 — 全体の統計
+nstat -az | grep -iE 'drop|prune|collapse|retrans|listendrop'
+
+# ④ ソケット層 — アプリが取り出せずに溢れていないか
+ss -tmi state established
+```
+
+代表的なカウンタと意味を対応させます。
+
+| カウンタ | 発生場所 | 意味と対処 |
+| --- | --- | --- |
+| `rx_missed_errors` | NIC | リングバッファが満杯。`ethtool -G` で拡張、または受信処理の並列化 |
+| `softnet_stat` 2列目 | カーネル | バックログ溢れ。`net.core.netdev_max_backlog` 拡大、RPS 検討 |
+| `TcpExtListenOverflows` | TCP | **accept キュー溢れ**。アプリが `accept()` を呼べていない |
+| `TcpExtListenDrops` | TCP | 同上に伴うドロップ |
+| `RcvbufErrors` (UDP) | ソケット | 受信バッファ溢れ。アプリの読み出しが遅い |
+
+---
+
+<h2 className="slide-cont">どこで落ちているかを切り分ける（続き）</h2>
+
+<Callout type="field">
+
+`TcpExtListenOverflows` が増えている場合、ネットワークではなく**アプリケーション側の問題**です。接続は届いているのに、アプリが `accept()` して処理する速度が追いついていません。
+
+```bash
+# accept キューの現状（Recv-Q が溜まっていたら詰まっている）
+ss -ltn
+# State   Recv-Q  Send-Q  Local Address:Port
+# LISTEN  128     128     0.0.0.0:80        ← Recv-Q が Send-Q(=backlog上限) に到達
+
+sysctl net.core.somaxconn   # backlog の上限（既定 4096、古い環境では 128）
+```
+
+`somaxconn` を上げるのは応急処置で、根本原因はアプリのスループット不足です。キューを伸ばすと待ち時間が伸びるだけ、という場合もあります。
+
+</Callout>
+
+---
+
+## ソケットバッファと帯域遅延積
+
+TCP のスループットは、帯域だけでは決まりません。
+
+> 理論最大スループット = ウィンドウサイズ ÷ RTT
+
+往復に時間がかかるほど、「送ったが ACK が返ってきていないデータ」を多く保持できないと帯域が埋まりません。これが **BDP**（Bandwidth-Delay Product、帯域遅延積）です。
+
+```text
+例: 1 Gbps、RTT 30ms（東京 — シンガポール相当）
+
+必要なウィンドウサイズ = 1 Gbps × 0.03 s ÷ 8 = 3.75 MB
+
+ソケットバッファが 256 KB しかない場合:
+  実効スループット = 256 KB ÷ 0.03 s ≒ 68 Mbps  （1 Gbps の 7%）
+```
+
+**回線が 1 Gbps あっても、バッファが小さければ 68 Mbps しか出ません。** 長距離転送が遅い原因の多くはこれです。
+
+```bash
+# 自動チューニングの範囲（最小 / 既定 / 最大）
+sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+
+# 実際のコネクションの状態を見る
+ss -tmi dst 203.0.113.10
+# cwnd:10 ssthresh:7 rtt:31.2/1.5 retrans:0/3 ...
+```
+
+`ss -tmi` の出力で見るべき点です。
+
+- **`cwnd`**（輻輳ウィンドウ）が小さいまま伸びない → 経路でパケットロスが起きている
+- **`retrans`** が増える → 再送が発生している。ロスの証拠
+- **`rtt`** の変動が大きい → 経路のどこかでバッファリングが起きている
+
+---
+
+<h2 className="slide-cont">ソケットバッファと帯域遅延積（続き）</h2>
+
+<Callout type="tip">
+
+輻輳制御アルゴリズムの変更も選択肢です。既定の CUBIC はパケットロスを輻輳の信号とするため、ロスの多い長距離経路では性能が出ません。BBR は帯域と RTT の実測に基づくため、そうした経路で有利なことがあります。
+
+```bash
+sysctl net.ipv4.tcp_congestion_control
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+```
+
+ただし万能ではなく、経路の特性によっては CUBIC のほうが良い場合もあります。必ず実測で比較してください。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 受信経路は **NIC → リングバッファ → 割り込み → softirq/NAPI → プロトコルスタック → ソケット → アプリ**
+- 各層にドロップ要因があり、見るべきカウンタが異なる
+- `softnet_stat` の 2 列目は NIC のカウンタに現れない。単独で確認する
+- `ListenOverflows` はネットワークではなくアプリの処理能力の問題
+- 長距離転送の速度はバッファサイズ ÷ RTT で頭打ちになる（BDP）
+
+<Quiz
+  id="q1"
+  question="Web サーバーへの接続が断続的にタイムアウトします。nstat で TcpExtListenOverflows が毎秒増加していました。最も妥当な解釈はどれですか。"
+  options={[
+    "NIC のリングバッファが不足している",
+    "接続自体は到達しているが、アプリケーションが accept() で処理しきれず accept キューが溢れている",
+    "経路上でパケットロスが発生している",
+    "MTU の設定が不適切である"
+  ]}
+  answer={1}
+  explanation="ListenOverflows は accept キュー（完了した3ウェイハンドシェイクを保持するキュー）が満杯で新規接続を捨てたことを示します。パケットはサーバーまで届いているので、ネットワーク層ではなくアプリケーションの処理能力が問題です。ss -ltn の Recv-Q でも確認できます。somaxconn の拡大は時間稼ぎにしかなりません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="RTT 30ms の経路で 1Gbps の回線を使っていますが、単一の TCP 接続では 70Mbps 程度しか出ません。最も可能性が高い原因はどれですか。"
+  options={[
+    "NIC が 100Mbps でリンクアップしている",
+    "ソケットバッファ（ウィンドウサイズ）が帯域遅延積に対して小さい",
+    "MTU が小さすぎる",
+    "CPU が飽和している"
+  ]}
+  answer={1}
+  explanation="TCP のスループットはウィンドウサイズ ÷ RTT が上限です。1Gbps × 30ms を埋めるには約 3.75MB のウィンドウが必要ですが、バッファが 256KB 程度だと 256KB ÷ 30ms ≒ 68Mbps で頭打ちになります。net.ipv4.tcp_rmem / tcp_wmem の最大値を確認してください。"
+/>

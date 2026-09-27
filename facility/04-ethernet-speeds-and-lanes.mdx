@@ -1,0 +1,293 @@
+---
+title: イーサネットの速度規格とレーン
+description: 100GBASE-SR4 のような型番の読み方と、速度がレーンの組み合わせで作られる仕組みを整理します。
+order: 4
+minutes: 18
+tags: ["Ethernet", "100G", "400G", "PAM4", "FEC", "IEEE802.3"]
+objectives:
+  - 規格名（100GBASE-SR4 など）を分解して意味を読み取れる
+  - 速度がレーン数 × レーン速度で構成されることを説明できる
+  - FEC の不一致がリンク障害を起こす仕組みを理解できる
+references:
+  - label: "IEEE 802.3 Ethernet Working Group"
+    url: "https://www.ieee802.org/3/"
+  - label: "Ethernet Alliance — Technology Overview"
+    url: "https://ethernetalliance.org/technology/"
+  - label: "ethtool(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/ethtool.8.html"
+---
+
+## 規格名は 3 つの部分でできている
+
+`100GBASE-SR4` のような名前は、暗号ではなく**分解できる構造**を持っています。これを読めるようになると、機器選定の大半が自力で判断できます。
+
+<Figure name="ethernet-naming" caption="規格名は分解できる。読めれば距離とレーン構成が型番から分かる" />
+
+---
+
+### 距離を表す記号
+
+**ここを覚えるのが最も費用対効果が高い**部分です。
+
+| 記号 | 意味 | 媒体 | 到達距離の目安 |
+| --- | --- | --- | --- |
+| **`SR`** | Short Reach | **マルチモード (MMF)** | 70–100m |
+| `DR` | (500m) Reach | シングルモード (SMF) | **500m** |
+| `FR` | Far Reach | SMF | **2km** |
+| `LR` | Long Reach | SMF | **10km** |
+| `ER` | Extended Reach | SMF | 40km |
+| `ZR` | — | SMF | 80km 以上 |
+| `CR` | Copper Reach | **銅線（DAC）** | 3–5m |
+| `T` | Twisted pair | **より対線（RJ45）** | 30–100m |
+
+---
+
+<h2 className="slide-cont">規格名は 3 つの部分でできている（続き）</h2>
+
+<Callout type="tip">
+
+**最初に覚えるべきは `SR` / `LR` / `CR` の 3 つ**です。
+
+- **`SR`** … ラック間・フロア内。**マルチモードファイバ（水色や紫のケーブル）**
+- **`LR`** … 建物間・拠点間。**シングルモードファイバ（黄色のケーブル）**
+- **`CR`** … ラック内。**銅の DAC ケーブル**（レッスン 5）
+
+この 3 つで、データセンター内の配線の大半が説明できます。`DR` / `FR` は、SMF を使いつつ距離が短い中間的な選択肢として最近増えてきたものです。
+
+</Callout>
+
+### 末尾の数字 = レーン数
+
+`SR4` の `4` は、**4 本のレーンを束ねている**ことを意味します。
+
+```text
+100GBASE-SR4  = 25G のレーン × 4 = 100G
+                → 送信 4 芯 + 受信 4 芯 = 計 8 芯のファイバが必要（MPO コネクタ）
+
+100GBASE-LR4  = 25G の波長 × 4 = 100G
+                → 4 波長を 1 芯に多重（WDM）
+                → 送受信で 2 芯のみ（LC コネクタ）
+```
+
+**同じ 100G でも、必要なファイバの本数とコネクタが違います。** これが配線設計に直結します。
+
+数字がない場合（`100GBASE-DR` など）は 1 レーンです。
+
+---
+
+## 速度はレーンの組み合わせで作られる
+
+イーサネットの高速化は、**「1 レーンを速くする」と「レーンを増やす」の組み合わせ**で進んできました。
+
+| 速度 | 代表的な構成 | 1 レーン速度 | 変調方式 |
+| --- | --- | --- | --- |
+| 10G | 1 × 10G | 10G | NRZ |
+| **25G** | 1 × 25G | 25G | NRZ |
+| 40G | **4 × 10G** | 10G | NRZ |
+| 50G | 2 × 25G / **1 × 50G** | 25G / 50G | NRZ / **PAM4** |
+| **100G** | **4 × 25G** / 2 × 50G / **1 × 100G** | 25G / 50G / 100G | NRZ / PAM4 |
+| 200G | **4 × 50G** | 50G | PAM4 |
+| **400G** | **8 × 50G** / **4 × 100G** | 50G / 100G | PAM4 |
+| 800G | 8 × 100G | 100G | PAM4 |
+
+<Callout type="pitfall" title="40G は 100G より「古い」技術">
+
+`40GBASE-SR4` は **10G のレーンを 4 本**束ねたものです。一方 `100GBASE-SR4` は **25G のレーンを 4 本**です。
+
+つまり **40G と 100G はレーン速度が違う**ため、40G のポートに 100G のトランシーバを挿しても動きませんし、ブレイクアウト（レッスン 6）の組み合わせも異なります。
+
+40G は 25G 世代の登場後に急速に使われなくなりました。**新規設計で 40G を選ぶ理由はほぼありません。** 既設の 40G 環境を扱う場合のみ知っていれば十分です。
+
+</Callout>
+
+### NRZ と PAM4
+
+1 レーンの速度を上げるために、**信号の載せ方**が変わりました。
+
+---
+
+<h2 className="slide-cont">速度はレーンの組み合わせで作られる（続き）</h2>
+
+```text
+NRZ (Non-Return-to-Zero): 1 回の信号で 1 ビット
+    電圧  ┌─┐   ┌─┐
+          │ │   │ │        High = 1, Low = 0
+     ─────┘ └───┘ └────
+
+PAM4 (4-level Pulse Amplitude Modulation): 1 回の信号で 2 ビット
+    電圧  ─── レベル3 = 11
+          ─── レベル2 = 10
+          ─── レベル1 = 01
+          ─── レベル0 = 00
+```
+
+PAM4 は同じ信号速度で **2 倍のデータ**を運べます。50G 以上のレーンはすべて PAM4 です。
+
+代償として、**電圧レベルの間隔が 1/3 になる**ためノイズに弱くなります。結果として、PAM4 では **FEC（誤り訂正）が必須**になりました。
+
+---
+
+## FEC: 設定の不一致がリンクを止める
+
+**FEC**（Forward Error Correction）は、送信時に冗長な情報を付加して、受信側で誤りを訂正する仕組みです。
+
+| FEC | 規格 | 用途 |
+| --- | --- | --- |
+| なし | — | 10G、短距離の 25G |
+| **BASE-R FEC (FireCode)** | Clause 74 | 25G の一部。訂正能力は低いが遅延が小さい |
+| **RS-FEC** | Clause 91 / 108 | **100G 以降は必須**。PAM4 では必ず使う |
+
+<Callout type="warning" title="25G のリンクが上がらない代表的な原因">
+
+25G には **FEC なし / CL74 / CL91 の 3 通り**があり、**両端の設定が一致しないとリンクが上がりません**。
+
+これは 25G が標準化される過程で複数の仕様が並立した経緯によるもので、**機器のベンダーが違うと既定値が異なる**ことがあります。
+
+```bash
+# 現在の FEC 設定を確認する
+ethtool --show-fec eth0
+```
+
+```text
+FEC parameters for eth0:
+Supported/Configured FEC encodings: None RS BaseR
+Active FEC encoding: RS
+```
+
+```bash
+# 明示的に設定する（相手側に合わせる）
+sudo ethtool --set-fec eth0 encoding rs
+sudo ethtool --set-fec eth0 encoding baser
+sudo ethtool --set-fec eth0 encoding off
+```
+
+**「ケーブルもトランシーバも正しいのにリンクが上がらない」「リンクは上がるがエラーが多い」場合、FEC の不一致を疑ってください。** スイッチ側の設定も併せて確認します。
+
+</Callout>
+
+---
+
+## リンクの状態を Linux から確認する
+
+```bash
+# 速度・デュプレックス・リンク状態
+ethtool eth0
+```
+
+```text
+Settings for eth0:
+    Supported ports: [ FIBRE ]
+    Supported link modes:   100000baseSR4/Full
+    Speed: 100000Mb/s                        ← 100G でリンクしている
+    Duplex: Full
+    Port: FIBRE
+    Link detected: yes
+```
+
+```bash
+# 挿さっているトランシーバの素性を読む（極めて有用）
+sudo ethtool -m eth0
+```
+
+```text
+Identifier                                : 0x11 (QSFP28)
+Vendor name                               : FS
+Vendor PN                                 : QSFP28-SR4-100G
+Transceiver type                          : 100G Ethernet: 100G Base-SR4
+Length (OM4)                              : 100m
+Module temperature                        : 34.52 degrees C
+Laser tx bias current (Channel 1)         : 7.500 mA
+Laser output power (Channel 1)            : 0.7523 mW / -1.24 dBm
+Receiver signal average optical power (Ch1): 0.6201 mW / -2.07 dBm
+```
+
+---
+
+<h2 className="slide-cont">リンクの状態を Linux から確認する（続き）</h2>
+
+<Callout type="field">
+
+**`ethtool -m` は、現地に行かずに「何が挿さっているか」を確認できる**数少ない手段です。設計と現物の食い違いを机上で見つけられます。
+
+特に見るべきは受信光レベル（`Receiver signal average optical power`）です。
+
+| 受信レベル | 判断 |
+| --- | --- |
+| -1 〜 -5 dBm | 正常 |
+| -6 〜 -9 dBm | やや弱い。要観察 |
+| **-10 dBm 以下** | **異常。清掃、接続点、ケーブル長を確認** |
+| `-40 dBm` / `-inf` | 光が来ていない。断線、反対側の停止、TX/RX 逆 |
+
+レッスン 3 で触れたコネクタの汚れや曲げ半径の問題は、**この数値の低下として現れます**。導入直後の値を記録しておくと、劣化を検知できます。
+
+エラーカウンタも併せて確認します。
+
+```bash
+ethtool -S eth0 | grep -iE 'fec|crc|symbol_err|corrected'
+```
+
+`fec_corrected_blocks` が増え続けているなら、FEC で訂正はできているが物理層に問題があります。放置すると `fec_uncorrected` に進行します。
+
+</Callout>
+
+---
+
+## 銅線という選択肢
+
+短距離では、光より銅のほうが安価で消費電力も小さくなります。
+
+| 規格 | 媒体 | 距離 | 用途 |
+| --- | --- | --- | --- |
+| `10GBASE-T` / `25GBASE-T` | **RJ45 より対線 (Cat6A 以上)** | 30–100m | 管理ネットワーク、既設流用 |
+| `*BASE-CR*` | **DAC（直付け銅ケーブル）** | 3–5m | **ラック内のサーバー〜ToR** |
+
+<Callout type="note" title="BASE-T は高速化に向かない">
+
+`10GBASE-T`（RJ45）は既設の配線を流用できるのが利点ですが、**消費電力が大きい**（ポートあたり数 W）という欠点があります。SFP+ の光や DAC が 1W 前後であることと比べると差が大きく、ポート数が多い環境では無視できません。
+
+また 25G を超える BASE-T はほとんど普及しませんでした。**データセンターのサーバー接続は DAC か光が標準**で、BASE-T は BMC の管理ポートなどに残るという役割分担になっています。
+
+次のレッスンで DAC と光モジュールの選び方を詳しく扱います。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 規格名は **速度 + BASE + 距離記号 + レーン数**に分解できる
+- まず覚えるのは **`SR`（MMF・100m）/ `LR`（SMF・10km）/ `CR`（DAC・3m）**
+- 末尾の数字はレーン数。**`SR4` は 8 芯（MPO）、`LR4` は 2 芯（LC）**と必要な配線が違う
+- 速度は**レーン数 × レーン速度**。40G(4×10G) と 100G(4×25G) はレーン速度が別物
+- 50G 以上のレーンは **PAM4**。ノイズに弱く **FEC が必須**
+- **25G の FEC（なし / CL74 / CL91）の不一致はリンク障害の代表的な原因**
+- **`ethtool -m` で挿さっているモジュールと受信光レベルを確認できる**
+- 受信光レベル -10 dBm 以下は異常。導入時の値を記録しておく
+
+<Quiz
+  id="q1"
+  question="100GBASE-SR4 と 100GBASE-LR4 の違いとして正しいものはどれですか。"
+  options={[
+    "SR4 のほうが速度が速い",
+    "SR4 はマルチモードファイバで 4 レーンを並列伝送するため 8 芯（MPO コネクタ）が必要、LR4 はシングルモードファイバに 4 波長を多重するため 2 芯（LC コネクタ）で済む",
+    "SR4 は銅線、LR4 は光ファイバを使う",
+    "SR4 は FEC が不要、LR4 は FEC が必須"
+  ]}
+  answer={1}
+  explanation="どちらも 100G ですが、SR4 は 25G のレーンを 4 本、マルチモードファイバ上で物理的に並列伝送するため、送信 4 芯 + 受信 4 芯の計 8 芯を MPO コネクタで接続します。一方 LR4 は 4 つの波長をシングルモードファイバ 1 芯に多重するため、送受信で 2 芯の LC コネクタで済みます。到達距離も SR4 が 100m 程度、LR4 が 10km と大きく異なり、必要な配線設備がまったく違います。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="25G のリンクで、ケーブルとトランシーバは仕様どおりなのにリンクアップしません。最も疑わしい原因はどれですか。"
+  options={[
+    "MTU の設定が異なる",
+    "両端の FEC 設定（なし / CL74 / CL91）が一致していない",
+    "VLAN の設定が異なる",
+    "IP アドレスが同一セグメントにない"
+  ]}
+  answer={1}
+  explanation="25G には標準化の経緯から FEC なし・CL74（BASE-R）・CL91（RS-FEC）の3通りがあり、両端の設定が一致していないと物理層でリンクが確立しません。ベンダーによって既定値が異なるため、異機種間の接続で顕在化しやすい問題です。ethtool --show-fec で現在の設定を確認し、--set-fec で相手側に合わせます。MTU・VLAN・IP はいずれもリンクアップ後の上位層の話であり、リンクが上がらない原因にはなりません。"
+/>

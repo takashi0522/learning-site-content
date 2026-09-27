@@ -1,0 +1,9 @@
+{
+  "title": "GPU 基盤の導入",
+  "subtitle": "AI Factory Buildout",
+  "description": "NVIDIA のリファレンスアーキテクチャを読み解き、GPU クラスタを設計・設置・構築・検証して運用へ引き渡すまでを順に扱います。他コースが部品の仕組みを説明するのに対し、こちらは「何を順番に決めて、どう確かめるか」を扱います。",
+  "order": 9,
+  "accent": "buildout",
+  "level": "実務",
+  "status": "ready"
+}

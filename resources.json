@@ -1,0 +1,227 @@
+{
+  "note": "外部リンク集。URL は変わることがあるので、リンク切れを見つけたらこのファイルを直してください。",
+  "groups": [
+    {
+      "id": "os",
+      "title": "OS / Linux",
+      "description": "挙動の根拠を確認するときに最初に当たる場所。man と kernel docs で大半は解決します。",
+      "links": [
+        {
+          "label": "Linux man-pages (man7.org)",
+          "url": "https://man7.org/linux/man-pages/",
+          "note": "システムコールと libc 関数の一次情報。セクション2/3を読む癖をつけると理解が速くなります。"
+        },
+        {
+          "label": "The Linux Kernel documentation",
+          "url": "https://docs.kernel.org/",
+          "note": "admin-guide 配下に sysctl・cgroup・メモリ管理のチューニング項目が揃っています。"
+        },
+        {
+          "label": "systemd man pages",
+          "url": "https://www.freedesktop.org/software/systemd/man/latest/",
+          "note": "unit ファイルの書式と systemd-analyze の使い方はここが正。"
+        },
+        {
+          "label": "Arch Wiki",
+          "url": "https://wiki.archlinux.org/",
+          "note": "ディストリ非依存で通用する設定解説が多く、実務の調べものに強い。"
+        },
+        {
+          "label": "OSTEP — Operating Systems: Three Easy Pieces",
+          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/",
+          "note": "無償公開のOS教科書。仮想化・並行性・永続性の3部構成で、仕組みの理解に最適。"
+        },
+        {
+          "label": "Brendan Gregg — Linux Performance",
+          "url": "https://www.brendangregg.com/linuxperf.html",
+          "note": "性能問題をどのツールで切り分けるかの地図。USEメソッドは現場でそのまま使えます。"
+        }
+      ]
+    },
+    {
+      "id": "network",
+      "title": "ネットワーク",
+      "description": "「仕様ではどうなっているか」を確認する先。RFC は索引から辿るのが早いです。",
+      "links": [
+        {
+          "label": "RFC Editor",
+          "url": "https://www.rfc-editor.org/",
+          "note": "TCP は RFC 9293、HTTP/1.1 は RFC 9110-9112 に再編されています。"
+        },
+        {
+          "label": "IETF Datatracker",
+          "url": "https://datatracker.ietf.org/",
+          "note": "その RFC が現役か廃止済みか、更新版があるかを確認できます。"
+        },
+        {
+          "label": "High Performance Browser Networking",
+          "url": "https://hpbn.co/",
+          "note": "TCP/TLS/HTTP の遅延要因を体系的に解説した書籍の全文無償公開版。"
+        },
+        {
+          "label": "Cloudflare Learning Center",
+          "url": "https://www.cloudflare.com/learning/",
+          "note": "DNS・TLS・DDoS まわりの概念整理に。図が分かりやすい。"
+        },
+        {
+          "label": "Wireshark Documentation",
+          "url": "https://www.wireshark.org/docs/",
+          "note": "パケットを自分で見る習慣がつくと、推測でのトラブルシュートが減ります。"
+        }
+      ]
+    },
+    {
+      "id": "hardware",
+      "title": "サーバー / ハードウェア",
+      "description": "仕様書は分厚いですが、章立てを知っておくと必要な時に引けます。",
+      "links": [
+        {
+          "label": "Intel 64 and IA-32 Architectures Software Developer Manuals",
+          "url": "https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html",
+          "note": "Volume 3 (System Programming Guide) がページング・割り込み・特権レベルの一次情報。"
+        },
+        {
+          "label": "NVM Express Specifications",
+          "url": "https://nvmexpress.org/specifications/",
+          "note": "キュー構造を知ると、NVMe が SATA より速い理由がプロトコル面から分かります。"
+        },
+        {
+          "label": "PCI-SIG Specifications",
+          "url": "https://pcisig.com/specifications",
+          "note": "レーン数と世代から実効帯域を見積もる際の根拠。"
+        },
+        {
+          "label": "DMTF Redfish",
+          "url": "https://www.dmtf.org/standards/redfish",
+          "note": "IPMI の後継にあたる、HTTP/JSON ベースのサーバー管理インターフェース標準。"
+        },
+        {
+          "label": "JEDEC Standards",
+          "url": "https://www.jedec.org/standards-documents",
+          "note": "DDR / ECC メモリのタイミング仕様。"
+        }
+      ]
+    },
+    {
+      "id": "facility",
+      "title": "データセンター / ファシリティ",
+      "description": "電力・冷却・配線の体系。この分野は標準が有償のものが多く、社内に 1 冊あるかどうかで知識が流通するかが決まる。無料で読めるものから当たるとよい。",
+      "links": [
+        {
+          "label": "ANSI/BICSI 002 — The Standard for Data Center Design",
+          "url": "https://www.bicsi.org/standards/available-standards-store/single-purchase/ansi-bicsi-002-the-standard-for-data-center-design",
+          "note": "教科書に一番近い 1 冊。2024 年版で 575 ページあり、設計方法論から立地選定、エネルギー効率までを 1 冊で扱う。有償。"
+        },
+        {
+          "label": "ASHRAE TC 9.9 — Mission Critical Facilities",
+          "url": "https://tpc.ashrae.org/?cmtKey=fd4a4ee6-96a3-4f61-8b85-43418dfa988d",
+          "note": "Thermal Guidelines の発行元。吸気温度の A1〜A4 クラスはここが出どころ。現行は第 5 版 (2021)。AI の高密度を織り込む第 6 版は 2026〜27 年見込み。"
+        },
+        {
+          "label": "Uptime Institute — Resources",
+          "url": "https://uptimeinstitute.com/resources",
+          "note": "Tier の定義元。年次の障害分析レポートが無料で読め、「実際に何で落ちたか」の統計はここが一番まとまっている。"
+        },
+        {
+          "label": "日本データセンター協会 (JDCC)",
+          "url": "https://www.jdcc.or.jp/",
+          "note": "日本の事情に寄ったファシリティスタンダード。耐震、電気事業法まわりは海外標準では埋まらないので、国内案件ではこちらを見る。"
+        },
+        {
+          "label": "The Green Grid",
+          "url": "https://www.thegreengrid.org/",
+          "note": "PUE の定義元。数字の意味と測定条件を確認するときに。"
+        },
+        {
+          "label": "Open Compute Project",
+          "url": "https://www.opencompute.org/projects",
+          "note": "ラック・電源・冷却のオープン仕様 (Open Rack, ORV3)。有償標準を買う前に、考え方を掴むのに使える。"
+        },
+        {
+          "label": "TIA",
+          "url": "https://tiaonline.org/",
+          "note": "TIA-942 (データセンターのインフラ規格) の発行元。Rated 1〜4 の出どころ。"
+        }
+      ]
+    },
+    {
+      "id": "gpu-ai",
+      "title": "GPU / AI 基盤",
+      "description": "製品仕様はベンダー資料が唯一の正だが、運用の実態はハイパースケーラの論文のほうが近い。「本番で何が壊れたか」が書いてあるため。",
+      "links": [
+        {
+          "label": "NVIDIA Enterprise Reference Architectures",
+          "url": "https://www.nvidia.com/en-us/technologies/enterprise-reference-architecture/",
+          "note": "OEM の認証サーバーで組む場合の RA。DGX 前提の BasePOD / SuperPOD とは別系列で、Dell・HPE・Supermicro などで組むならこちら。"
+        },
+        {
+          "label": "NVIDIA Networking Documentation",
+          "url": "https://docs.nvidia.com/networking/",
+          "note": "InfiniBand と Spectrum、ConnectX / BlueField の一次情報。RoCE の QoS 設定もここ。"
+        },
+        {
+          "label": "NVIDIA NCCL Documentation",
+          "url": "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html",
+          "note": "集合通信の環境変数と経路選択。NCCL_DEBUG=INFO のログを読むときの対応表として使う。"
+        },
+        {
+          "label": "MLCommons / MLPerf",
+          "url": "https://mlcommons.org/benchmarks/",
+          "note": "性能の測り方の体系。自分の実測値を他と比べたいときに、測定条件まで揃えられる。"
+        },
+        {
+          "label": "Alibaba HPN — A Data Center Network for LLM Training (SIGCOMM 2024)",
+          "url": "https://ennanzhai.github.io/pub/sigcomm24-hpn.pdf",
+          "note": "15,000 GPU を 2 階層・デュアルプレーンで収容した実例。従来の 3 階層 Clos をなぜ使わなかったかが書いてある。"
+        },
+        {
+          "label": "MegaScale — Scaling LLM Training to More Than 10,000 GPUs (NSDI 2024)",
+          "url": "https://www.usenix.org/system/files/nsdi24-jiang-ziheng.pdf",
+          "note": "ByteDance の本番運用。障害の検知と復旧、性能が出ないときの切り分けに紙幅を割いていて、運用側の読み物として価値が高い。"
+        },
+        {
+          "label": "Ultra Ethernet Consortium",
+          "url": "https://ultraethernet.org/",
+          "note": "RoCE の課題 (経路の偏り、順序崩れ、go-back-N) を標準の側から解こうとしている団体。1.0 仕様は 2025 年 6 月公開。"
+        }
+      ]
+    },
+    {
+      "id": "middleware",
+      "title": "ミドルウェア / 運用",
+      "description": "設定値の意味は公式ドキュメントに戻って確認するのが結局いちばん速い。",
+      "links": [
+        {
+          "label": "nginx documentation",
+          "url": "https://nginx.org/en/docs/",
+          "note": "ディレクティブごとにコンテキストと既定値が明記されています。"
+        },
+        {
+          "label": "PostgreSQL Documentation",
+          "url": "https://www.postgresql.org/docs/",
+          "note": "データベース一般の教科書としても質が高い。"
+        },
+        {
+          "label": "Prometheus Documentation",
+          "url": "https://prometheus.io/docs/",
+          "note": "メトリクスの型とクエリの考え方。監視設計の土台になります。"
+        },
+        {
+          "label": "Zabbix Documentation",
+          "url": "https://www.zabbix.com/documentation/current/en",
+          "note": "エージェント方式の監視を運用する場合の一次情報。"
+        },
+        {
+          "label": "Kubernetes Documentation",
+          "url": "https://kubernetes.io/docs/",
+          "note": "Concepts セクションは、cgroup/namespace の知識があると一気に読みやすくなります。"
+        },
+        {
+          "label": "Google SRE Books",
+          "url": "https://sre.google/books/",
+          "note": "SLO・アラート設計・ポストモーテムの考え方。全文無償公開。"
+        }
+      ]
+    }
+  ]
+}

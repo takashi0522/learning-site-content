@@ -1,0 +1,358 @@
+---
+title: NVIDIA GPU の構造とドライバスタック
+description: GPU がなぜ特定の処理だけ速いのかを構造から理解し、ドライバと CUDA のバージョン関係を整理します。
+order: 1
+minutes: 19
+tags: ["GPU", "NVIDIA", "CUDA", "HBM", "nvidia-smi", "NVLink"]
+objectives:
+  - CPU と GPU の設計思想の違いを説明し、GPU が向く処理を判断できる
+  - nvidia-smi の CUDA Version 表示が何を意味するかを説明できる
+  - ドライバ・CUDA・ライブラリの階層とバージョン互換の考え方を整理できる
+references:
+  - label: "NVIDIA CUDA Toolkit Documentation"
+    url: "https://docs.nvidia.com/cuda/"
+  - label: "NVIDIA Datacenter Driver Documentation"
+    url: "https://docs.nvidia.com/datacenter/tesla/index.html"
+  - label: "CUDA Compatibility — NVIDIA Docs"
+    url: "https://docs.nvidia.com/deploy/cuda-compatibility/"
+---
+
+## CPU と GPU は設計思想が逆
+
+同じ「プロセッサ」でも、CPU と GPU は最適化している対象が正反対です。
+
+| | CPU | GPU |
+| --- | --- | --- |
+| 設計目標 | **1 つの処理を速く終わらせる**（レイテンシ） | **大量の処理をまとめて捌く**（スループット） |
+| コア数 | 数十 | **数千〜数万**（CUDA コア） |
+| 1 コアの賢さ | 高い（分岐予測、アウトオブオーダ実行、大きなキャッシュ） | 低い（単純な演算器） |
+| 得意 | 分岐の多い逐次処理 | 同じ演算を大量データに一斉適用 |
+| メモリ帯域 | 200–400 GB/s | **2,000–4,800 GB/s** |
+
+ハードウェアコース レッスン 2 で見たように、CPU は「待ち時間をいかに減らすか」に膨大な回路を割いています。GPU は逆に、**待ちが発生したら別のスレッドに切り替えて演算器を埋める**という方針を取ります。だから 1 スレッドあたりは遅くても、全体では圧倒的な処理量になります。
+
+### 内部構造
+
+```text
+GPU
+├── SM (Streaming Multiprocessor) × 数十〜百数十
+│   ├── CUDA コア        … 汎用の浮動小数点/整数演算
+│   ├── Tensor コア      … 行列積和に特化（AI 用途の主役）
+│   ├── レジスタファイル
+│   └── 共有メモリ / L1
+├── L2 キャッシュ（全 SM で共有）
+└── VRAM (HBM3 など)
+```
+
+**Tensor コア**が AI で決定的な役割を果たします。ディープラーニングの計算はほぼ行列の積和なので、それを 1 命令で塊として処理する専用回路を載せることで、CUDA コアで計算するより桁違いに速くなります。FP16、BF16、FP8 といった低精度の形式が使われるのも、Tensor コアがそれらに最適化されているからです。
+
+---
+
+<h2 className="slide-cont">CPU と GPU は設計思想が逆（続き）</h2>
+
+<Callout type="note" title="データセンター GPU のメモリは HBM">
+
+ハードウェアコース レッスン 3 で扱った DDR とは別系統の、**HBM**（High Bandwidth Memory）が使われます。メモリチップを積層して GPU ダイのすぐ隣に配置し、非常に幅の広いバスで繋ぐ構造です。
+
+| GPU | メモリ | 容量 | 帯域（概算） |
+| --- | --- | --- | --- |
+| A100 SXM | HBM2e | 80 GB | 約 2,000 GB/s |
+| H100 SXM | HBM3 | 80 GB | 約 3,350 GB/s |
+| H200 SXM | HBM3e | 141 GB | 約 4,800 GB/s |
+
+8 チャネル DDR5 のサーバーが約 300 GB/s であることと比べると、**10 倍以上**です。AI の学習・推論はメモリ帯域で律速されることが多く、この差がそのまま性能差になります。
+
+一方で**容量は CPU 側のメモリよりはるかに小さい**点が重要です。モデルが VRAM に載るかどうかが、動くかどうかを決めます。
+
+</Callout>
+
+---
+
+## フォームファクタ: PCIe と SXM
+
+同じ世代の GPU でも、2 つの形態があります。**性能が違うので、型番だけで判断しないでください。**
+
+| | PCIe 版 | SXM 版 |
+| --- | --- | --- |
+| 接続 | 標準の PCIe スロット | 専用基板 (HGX/DGX) に直付け |
+| 消費電力 | 300–350W 程度 | **400–700W** |
+| GPU 間接続 | PCIe 経由（または限定的な NVLink ブリッジ） | **NVLink / NVSwitch で全対全** |
+| 導入 | 一般的なサーバーに挿せる | 専用システムが必要 |
+| 性能 | 低め（電力制限による） | 高い |
+
+### NVLink: GPU 同士を直結する
+
+複数 GPU で 1 つのモデルを学習させる場合、**GPU 間のデータ交換が支配的なコスト**になります。
+
+```text
+PCIe Gen5 x16 経由   : 約 64 GB/s（双方向合計）
+NVLink (H100 世代)   : 約 900 GB/s（双方向合計）
+```
+
+一桁以上違います。NVSwitch を備えたシステムでは、**どの GPU 同士でもこの帯域で通信できます**（全対全）。大規模な分散学習で SXM システムが選ばれるのは、この差が学習時間に直結するためです。
+
+```bash
+# GPU 間がどう繋がっているかを見る（極めて重要）
+nvidia-smi topo -m
+```
+
+```text
+        GPU0  GPU1  GPU2  GPU3  CPU Affinity  NUMA Affinity
+GPU0     X    NV18  NV18  NV18   0-31             0
+GPU1   NV18    X    NV18  NV18   0-31             0
+GPU2   NV18  NV18    X    NV18   32-63            1
+GPU3   NV18  NV18  NV18    X     32-63            1
+```
+
+---
+
+<h2 className="slide-cont">フォームファクタ: PCIe と SXM（続き）</h2>
+
+| 表記 | 意味 | 速さ |
+| --- | --- | --- |
+| `NV#` | NVLink（数字はリンク本数） | **最速** |
+| `PIX` | 同一 PCIe スイッチ配下 | 速い |
+| `PXB` | 複数の PCIe スイッチを経由 | やや遅い |
+| `NODE` | 同一 NUMA ノード内、ホストブリッジ経由 | 遅い |
+| `SYS` | **NUMA ノードをまたぐ**（ソケット間接続経由） | **最も遅い** |
+
+<Callout type="field">
+
+`SYS` が出ている GPU の組み合わせでデータをやり取りすると、ハードウェアコース レッスン 5 で扱ったソケット間接続を通ることになり、著しく遅くなります。
+
+`CPU Affinity` 列も重要です。**GPU0 を使うプロセスは CPU 0-31 に固定する**ことで、ホスト〜GPU 間の転送もローカル NUMA で完結します。
+
+```bash
+numactl --cpunodebind=0 --membind=0 python train.py
+```
+
+マルチ GPU のジョブ配置を決めるとき、`nvidia-smi topo -m` は最初に見るべき情報です。
+
+</Callout>
+
+---
+
+## ソフトウェアスタックの階層
+
+GPU 周りのトラブルの大半は、**この階層のどこかでバージョンが噛み合っていない**ことが原因です。構造を正確に押さえてください。
+
+<Figure name="cuda-stack" caption="GPU のソフトウェアスタック。Runtime と Driver の境界が、バージョン不整合の起点になる" />
+
+**重要な区別は次の 2 つです。**
+
+- **ドライバ** … OS のカーネルモジュールと `libcuda.so`。ホストに 1 つだけインストールされる
+- **CUDA Toolkit** … `nvcc` や `libcudart`。**複数バージョンを共存させられる**し、コンテナやライブラリに同梱されることも多い
+
+---
+
+<h2 className="slide-cont">ソフトウェアスタックの階層（続き）</h2>
+
+<Callout type="pitfall" title="nvidia-smi の CUDA Version は Toolkit のバージョンではない">
+
+最も誤解されるポイントです。
+
+```text
+$ nvidia-smi
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 550.90.07    Driver Version: 550.90.07    CUDA Version: 12.4      |
++-----------------------------------------------------------------------------+
+                                                       ↑
+              これは「このドライバが対応できる CUDA の最大バージョン」であって、
+              インストール済みの CUDA Toolkit のバージョンではない
+```
+
+実際にインストールされている Toolkit は別のコマンドで確認します。
+
+```bash
+nvcc --version                    # インストール済み Toolkit のバージョン
+python -c "import torch; print(torch.version.cuda)"   # PyTorch が同梱する CUDA のバージョン
+```
+
+**`nvidia-smi` が 12.4 と表示していても、`nvcc` が 11.8 ということは普通にあります。** 「CUDA 12.4 が入っている」と早合点すると、ビルドやライブラリ選択を誤ります。
+
+</Callout>
+
+### 互換性の考え方
+
+原則は **「ドライバは新しく、CUDA は古くてよい」** です。
+
+```text
+ドライバが対応する CUDA バージョン  ≧  アプリが要求する CUDA バージョン   → 動く
+ドライバが対応する CUDA バージョン  <   アプリが要求する CUDA バージョン   → 動かない
+```
+
+NVIDIA は後方互換を保証しているため、**新しいドライバは古い CUDA で作られたアプリを動かせます**。逆はできません。
+
+---
+
+<h2 className="slide-cont">ソフトウェアスタックの階層（続き）</h2>
+
+```text
+ドライバ 550 (CUDA 12.4 対応)
+  ├── CUDA 11.8 のアプリ  → 動く
+  ├── CUDA 12.1 のアプリ  → 動く
+  └── CUDA 12.6 のアプリ  → 動かない（ドライバ更新が必要）
+```
+
+<Callout type="tip">
+
+この性質があるため、**ホストにはできるだけ新しいドライバだけを入れ、CUDA Toolkit はコンテナ側に持たせる**構成が実務では圧倒的に扱いやすくなります。
+
+```text
+ホスト   : NVIDIA ドライバのみ
+コンテナ : CUDA Toolkit + cuDNN + フレームワーク
+```
+
+複数のプロジェクトが別々の CUDA バージョンを要求しても、ホストに手を入れずに共存できます。次のレッスンで具体的な構成を扱います。
+
+</Callout>
+
+---
+
+## nvidia-smi の基本
+
+```bash
+nvidia-smi
+```
+
+```text
++---------------------------------------------------------------------------------------+
+| GPU  Name              Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC     |
+| Fan  Temp  Perf        Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M.     |
+|=======================================+======================+======================|
+|   0  NVIDIA H100 80GB HBM3        On | 00000000:41:00.0 Off |                    0     |
+| N/A   38C    P0          98W / 700W |  41234MiB / 81559MiB |     87%      Default     |
++---------------------------------------------------------------------------------------+
+
+| Processes:                                                                             |
+|  GPU   GI   CI        PID   Type   Process name                          GPU Memory    |
+|    0   N/A  N/A     48213      C   python                                 41220MiB     |
+```
+
+| 項目 | 見方 |
+| --- | --- |
+| `Persistence-M` | 永続モード。**Off だと初期化のたびに数秒待つ**（次レッスン） |
+| `Pwr:Usage/Cap` | 消費電力 / 上限。上限に張り付いていれば電力制限で頭打ち |
+| `Memory-Usage` | **VRAM の使用量**。これが上限に達すると OOM でジョブが落ちる |
+| `GPU-Util` | 後述。**使用率ではない** |
+| `Volatile Uncorr. ECC` | 訂正不能 ECC エラー数。0 以外なら要調査 |
+
+---
+
+<h2 className="slide-cont">nvidia-smi の基本（続き）</h2>
+
+<Callout type="warning" title="GPU-Util は「使用率」ではない">
+
+`GPU-Util` は **「直前のサンプリング期間に、1 つ以上のカーネルが実行されていた時間の割合」**です。
+
+つまり、**GPU の 1% しか使わない小さなカーネルが動き続けていても 100% と表示されます。** 「GPU 使用率 100% だから GPU がボトルネック」という判断は、この指標からはできません。
+
+実際の演算器の使用状況を知るには DCGM の指標が必要です（次のレッスン）。
+
+- `SM Active` … SM が実際に動いていた割合
+- `SM Occupancy` … SM 上に載っていたスレッドの割合
+- `Tensor Core Active` … Tensor コアの稼働率
+
+AI ワークロードでは、`GPU-Util` が 100% でも `Tensor Core Active` が数% ということが珍しくありません。データ供給が追いついていない（CPU 側の前処理や I/O がボトルネック）状態です。
+
+</Callout>
+
+```bash
+# 定期サンプリング（監視やログ取りに）
+nvidia-smi dmon -s pucvmet -d 1
+
+# 全情報（ECC の詳細、クロック、電力、スロットリング理由）
+nvidia-smi -q
+
+# 特定項目だけ CSV で（スクリプト向け）
+nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw \
+  --format=csv,noheader,nounits -l 5
+```
+
+---
+
+## MIG: 1 枚の GPU を分割する
+
+A100 / H100 などは、**ハードウェアレベルで最大 7 個の独立したインスタンス**に分割できます（Multi-Instance GPU）。
+
+```text
+H100 80GB
+├── MIG 1g.10gb  ← SM 1/7、VRAM 10GB、独立した L2 とメモリ帯域
+├── MIG 1g.10gb
+├── MIG 2g.20gb
+└── MIG 3g.40gb
+```
+
+重要なのは、これが**時間分割ではなくハードウェアの物理的な分割**である点です。各インスタンスは SM・L2・メモリ帯域が分離されているため、**隣のインスタンスの負荷に影響されません**（性能の予測可能性が高い）。
+
+推論ワークロードを多数のユーザーで共有する場合や、小さいジョブで高価な GPU を占有させたくない場合に有効です。逆に、**1 つの大きな学習ジョブには向きません**（分割すると使える演算器が減るだけ)。
+
+```bash
+# MIG 対応状況と現在のモード
+nvidia-smi -q | grep -i mig
+
+# 有効化（GPU 0 に対して。GPU のリセットが必要）
+sudo nvidia-smi -i 0 -mig 1
+
+# 作成可能なプロファイル一覧
+sudo nvidia-smi mig -lgip
+
+# インスタンスを作る
+sudo nvidia-smi mig -i 0 -cgi 1g.10gb,1g.10gb,3g.40gb -C
+```
+
+---
+
+<h2 className="slide-cont">MIG: 1 枚の GPU を分割する（続き）</h2>
+
+<Callout type="note">
+
+MIG を有効にすると、**その GPU は分割された形でしか見えなくなります**。既存のジョブが GPU 全体を期待している場合は動かなくなるため、切り替えはメンテナンス時間を取って行ってください。
+
+また MIG インスタンス間では **NVLink 経由の通信ができません**。分散学習には使えない点に注意してください。
+
+</Callout>
+
+---
+
+## まとめ
+
+- CPU はレイテンシ最適化、**GPU はスループット最適化**。設計思想が逆
+- AI 性能の主役は **Tensor コア**。低精度形式が使われるのはそのため
+- データセンター GPU は **HBM** で 2,000–4,800 GB/s。DDR の 10 倍以上だが容量は小さい
+- **SXM 版は NVLink で GPU 間 900GB/s**。PCIe 版とは別物として扱う
+- `nvidia-smi topo -m` で接続形態を確認する。`SYS` は最も遅い
+- **`nvidia-smi` の CUDA Version はドライバの対応上限**。Toolkit のバージョンではない
+- 互換性は「**ドライバは新しく、CUDA は古くてよい**」。逆は動かない
+- **`GPU-Util` は使用率ではない**。カーネルが動いていた時間の割合
+- MIG はハードウェア分割。推論の共有には有効、大規模学習には不向き
+
+---
+
+<Quiz
+  id="q1"
+  question="nvidia-smi の出力ヘッダに「CUDA Version: 12.4」と表示されています。この意味として正しいものはどれですか。"
+  options={[
+    "CUDA Toolkit 12.4 がインストールされている",
+    "インストールされているドライバが対応できる CUDA の最大バージョンが 12.4 である（Toolkit のバージョンとは無関係）",
+    "GPU が CUDA 12.4 専用である",
+    "PyTorch が CUDA 12.4 でビルドされている"
+  ]}
+  answer={1}
+  explanation="nvidia-smi が表示する CUDA Version は、そのドライバがサポートする CUDA の最大バージョンです。実際にインストールされている CUDA Toolkit のバージョンは nvcc --version で、フレームワークが同梱する CUDA は torch.version.cuda などで確認します。ドライバが 12.4 対応でも Toolkit は 11.8 ということは普通にあり、この混同がビルドエラーやライブラリ選択のミスにつながります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="AI 学習ジョブの nvidia-smi を見ると GPU-Util が常時 98% です。しかし想定より学習が遅く、DCGM で確認すると Tensor Core Active は 4% でした。最も妥当な解釈はどれですか。"
+  options={[
+    "GPU が完全に飽和しており、より高性能な GPU が必要",
+    "GPU-Util は「カーネルが実行されていた時間の割合」に過ぎず演算器の使用率ではない。実際には演算器が遊んでおり、データ供給側（CPU の前処理や I/O）がボトルネックの可能性が高い",
+    "Tensor コアが故障している",
+    "ECC エラーにより性能が低下している"
+  ]}
+  answer={1}
+  explanation="GPU-Util はサンプリング期間中に1つ以上のカーネルが動いていた時間の割合であり、演算器がどれだけ埋まっていたかを示しません。ごく小さなカーネルが動き続けるだけでも 100% になります。Tensor Core Active が 4% ということは演算器がほぼ遊んでいる状態で、典型的にはデータローダの前処理、ストレージからの読み込み、あるいは CPU〜GPU 間の転送が追いついていません。GPU を増強しても改善しません。"
+/>

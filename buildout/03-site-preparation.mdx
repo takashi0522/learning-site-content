@@ -1,0 +1,222 @@
+---
+title: 設置前に決めること
+description: 電力・冷却・床荷重・搬入経路。GPU ラックが一般的なラックと何が違うかを、設置の前に確認します。
+order: 3
+minutes: 18
+tags: ["三相電力", "液冷", "床荷重", "搬入", "ホットアイル"]
+objectives:
+  - GPU ラックに必要な給電容量を三相で見積もれる
+  - 空冷で行けるか液冷が要るかを判断できる
+  - 床荷重と搬入経路を設置前に確認できる
+references:
+  - label: "NVIDIA DGX SuperPOD — Architecture (B200)"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/dgx-superpod-architecture.html"
+  - label: "NVIDIA Enterprise Reference Architectures"
+    url: "https://www.nvidia.com/en-us/technologies/enterprise-reference-architecture/"
+  - label: "ASHRAE Thermal Guidelines for Data Processing Environments"
+    url: "https://www.ashrae.org/technical-resources/bookstore/datacom-series"
+  - label: "NVIDIA DGX SuperPOD Data Center Design (H100) — Planning (DGX H100 は 8U・最大 10.2kW、空冷)"
+    url: "https://docs.nvidia.com/dgx-superpod/design-guides/dgx-superpod-data-center-design-h100/latest/planning.html"
+  - label: "NVIDIA DGX SuperPOD Data Center Design (H100) — Electrical (80% と 100%、力率 0.95)"
+    url: "https://docs.nvidia.com/dgx-superpod/design-guides/dgx-superpod-data-center-design-h100/latest/electrical.html"
+  - label: "NVIDIA DGX SuperPOD Data Center Design (H100) — Cooling (封じ込めとブランクパネル)"
+    url: "https://docs.nvidia.com/dgx-superpod/design-guides/dgx-superpod-data-center-design-h100/latest/cooling.html"
+  - label: "NVIDIA DGX SuperPOD Data Center Design (H100) — Infrastructure (搬入経路の耐荷重)"
+    url: "https://docs.nvidia.com/dgx-superpod/design-guides/dgx-superpod-data-center-design-h100/latest/infrastructure.html"
+  - label: "NVIDIA DGX B200 User Guide — Introduction (10U、最大 14.3kW)"
+    url: "https://docs.nvidia.com/dgx/dgxb200-user-guide/introduction-to-dgxb200.html"
+  - label: "Schneider Electric FAQ FA156194 (三相の √3、UL の 80%)"
+    url: "https://www.se.com/us/en/faqs/FA156194/"
+  - label: "Uptime Institute Journal — Implementing Data Center Cooling Best Practices (冷却能力は必要量の 2.6 倍)"
+    url: "https://journal.uptimeinstitute.com/implementing-data-center-cooling-best-practices/"
+  - label: "Vertiv — How rear door heat exchangers support high-density rack cooling"
+    url: "https://www.vertiv.com/en-asia/insights/articles/educational-articles/how-rear-door-heat-exchangers-rdhx-support-high-density-rack-cooling/"
+---
+
+## 電力から決まる
+
+ファシリティコース レッスン 1 で「ラックに何台載るかを決めるのは U 数ではなく電力」と書きました。GPU ラックではこれが極端な形で現れます。
+
+```text
+例のラック : 単相 200V 30A × 2 系統（ファシリティコース レッスン 1 の例）
+             6.0 kVA × 0.8 = 4.8 kW（連続負荷を 80% までとする場合）
+
+GPU ラック : SuperPOD B200 の RA のレイアウト例では 1 ラック 25 kW 超
+```
+
+**単相 200V 30A では、DGX H100（最大 10.2kW）も DGX B200（最大 14.3kW）も 1 台も載りません。** 給電そのものを変える必要があります。
+
+このレッスンの計算は、**連続負荷を定格の 80% までとし、kVA と kW を同じとみなす**単純化をしています。80% は米国の UL が定めたルールで、NVIDIA の DGX H100 世代の設計ガイドの表にも、回路によって 80% の行と 100% の行があり、力率は 0.95 で計算しています。自分の設備がどちらの前提かは、設備側の規定で確かめてください。
+
+### 三相にすると何が変わるか
+
+三相は線間電圧なので、容量に √3 が掛かります。
+
+```text
+単相 200V 30A : 200 × 30           =  6.0 kVA  → 80% で 4.8 kW
+三相 200V 60A : √3 × 200 × 60      = 20.8 kVA  → 80% で 16.6 kW
+三相 200V 100A: √3 × 200 × 100     = 34.6 kVA  → 80% で 27.7 kW
+```
+
+---
+
+<h2 className="slide-cont">電力から決まる（続き）</h2>
+
+<Callout type="warning" title="冗長にすると容量は半分になる">
+
+ファシリティコース レッスン 1 で扱った話が、そのままここに効きます。
+
+ここでは、電源ユニットを A 系統と B 系統に振り分け、**片系統が止まっても残りの系統だけで全負荷を引き受けられる**機器を前提に考えます。この前提なら、「合計負荷が 1 系統の上限を超えていないか」が条件です。
+
+```text
+三相 200V 60A × 2 系統（1 系統 16.6 kW）
+
+GPU ノード（最大 10kW として）1 台 + ToR 2 台 = 10.3 kW  → 片系統停止に耐える
+GPU ノード（最大 10kW として）2 台 + ToR 2 台 = 20.3 kW  → 通常時は通るが、片系統停止で連続負荷の上限を超える
+```
+
+**通常時のメーターに余裕があっても、冗長ではないことがあります。** 見るべきは片系統停止時の数字です。
+
+ただし、この前提が機種によって成り立たないこともあります。NVIDIA の DGX H100 世代の設計ガイドは、DGX H100 は 6 基の電源のうち 4 基に給電されていないと動かないとしています。そのうえで、可用性が最優先で処理を取り戻せない環境では、**3 つ以上の電源による N+1**（各電源が総ピーク負荷の 50% を支えられる容量）で組むことを求めています。**冗長の組み方は、機種の資料で確かめてください。**
+
+</Callout>
+
+<Callout type="field">
+
+**この確認はラボで手を動かすのが早いです。**
+
+「[GPU ラックに電源を引く](/labs/rack-gpu/)」で、給電を変えながら何台載るかを実際に試せます。数字を動かすと、冗長を取るか台数を取るかの判断が具体的になります。
+
+</Callout>
+
+---
+
+## 空冷で行けるか
+
+ファシリティコース レッスン 2 で、ホットアイル / コールドアイルと空冷の限界を扱いました。**どこまで空冷で行けるかの境目は、出典によって違います。**
+
+| 出典 | 書いていること |
+| --- | --- |
+| Vertiv（リアドア熱交換器の解説） | 20 kW あたりで、通常の空冷は実用上の限界に近づく。リアドア熱交換器は 20〜80 kW のラックに対応する |
+| NVIDIA（DGX SuperPOD の H100 世代の設計ガイド） | DGX H100 を 1 ラック 4 台、40.8 kW の構成を空冷で設計している。通路の封じ込めは、特に高密度のラックで多くのデータセンターが採用している |
+
+液冷を前提にするかどうかは、機種の冷却方式と設備で決まります。
+
+NVIDIA の設計ガイドは、ホットアイルの熱い空気がコールドアイルに回り込むと、**サーバーの吸気温度が上がり、熱交換の余力が大きく下がる**と書いています。封じ込めやブランクパネルは、この回り込みを防ぐためのものです。
+
+<Callout type="pitfall">
+
+**「冷却能力の合計は足りている」は答えになりません。**
+
+データセンター全体の冷却容量が足りていても、**そのラックの前に冷気が届いているか**は別の問題です。Uptime Institute は、調べた多数のデータセンターで、動いている冷却装置の能力が IT の必要量の 2.6 倍あったと報告しています（2004 年の、既存のデータセンターの調査）。**容量があっても、冷気がラックに届かなければ意味がありません。**
+
+NVIDIA の設計ガイドは、封じ込めを有効にするには空気の通り道を塞ぐ必要があるとしています。たとえば次の箇所です。
+
+- 空き U がブランクパネルで塞がれているか
+- ケーブルを通す開口部がブラシグロメットで塞がれているか
+
+
+</Callout>
+
+---
+
+## 床が持つか
+
+GPU ノードは重い機材です。ここもラボ「[重さと配線で詰まる](/labs/rack-cabling/)」で扱ったとおり、**U に収まることと床が耐えられることは別の話**です。
+
+確認する項目は次のとおりです。
+
+1. **ラック 1 本あたりの合計質量**（機材 + ラック本体 + PDU + ケーブル）
+2. **床の耐荷重**（床下の構造やスラブを含めて）
+3. **搬入経路の耐荷重**（運搬具を含めた重量に耐えるか）
+
+<Callout type="warning" title="搬入できないと始まらない">
+
+NVIDIA の DGX H100 世代の設計ガイドは、搬入について次のような項目を挙げています。
+
+- 機材はパレットで届く
+- 荷降ろし場が無ければ、油圧リフトかスロープが要る
+- 受け入れ室からデータホールまで運ぶ運搬具が要る
+- DGX H100 はサーバーリフトで設置する
+
+設置場所に着く前の経路も、設置の前に確認してください。
+
+</Callout>
+
+---
+
+## 前提条件をチェックリストにする
+
+設置の前に、次を紙の上で確定させてから発注します。
+
+---
+
+<h2 className="slide-cont">前提条件をチェックリストにする（続き）</h2>
+
+```text
+電力
+  □ ラックあたりの給電方式（単相 / 三相、電圧、アンペア）
+  □ 系統数と冗長方式（A/B、片系統停止時の負荷）
+  □ PDU の形（縦型 0U / 横型 1U）と必要な口数
+  □ 上流（分電盤、UPS、発電機）の容量に余裕があるか
+
+冷却
+  □ ラックあたりの発熱（kW）
+  □ 冷却方式（通常空冷 / 封じ込め / リアドア / 液冷）
+  □ 液冷なら、配管・冷却水の供給経路
+```
+
+---
+
+<h2 className="slide-cont">前提条件をチェックリストにする（続き）</h2>
+
+```text
+物理
+  □ ラック 1 本あたりの質量と、床の耐荷重
+  □ 搬入経路（荷降ろし、運搬具、経路の耐荷重）
+  □ ラック間の距離と、必要なケーブル長
+
+ネットワーク
+  □ 4 系統ぶんの配線経路（レッスン 2）
+  □ ラック間の距離に対して選ぶケーブル種別（ファシリティ レッスン 5）
+```
+
+<Callout type="note">
+
+**このリストは SuperPOD の RA の本文には入っていません。**
+
+RA が定義するのは「どう組むか」であって、「あなたのデータセンターに入るか」ではありません。RA のラックレイアウトを調整してよいと書かれているのは、ここが現場ごとに違うためです。NVIDIA は RA とは別に、データセンターの設計ガイド（DGX SuperPOD の H100 世代など）を出していて、電力・冷却・床荷重・搬入経路はそちらで扱っています。
+
+調整した場合は、**変更点をネットワーク設計に戻して確認してください。** ラックの台数を減らすとラック間の距離が伸び、伸びた先でケーブル長の制約に当たることがあります。
+
+</Callout>
+
+---
+
+<Quiz
+  id="q1"
+  question="GPU ラック 1 本に、最大 10kW の GPU ノードを 2 台載せたいと考えています。給電は三相 200V 60A を A / B の 2 系統で引く予定です。連続負荷は定格の 80% まで（kVA と kW は同じとみなす）とします。この構成の評価として正しいものはどれですか。"
+  options={[
+    "問題ない。1 系統 16.6kW に対して通常時は 10.15kW なので余裕がある",
+    "通常時は収まるが、片系統が停止すると残りに 20.3kW がかかり上限 16.6kW を超えるため、冗長構成として成立していない",
+    "三相では GPU ノードを動かせないため、単相に変更する必要がある",
+    "U 数が足りないので載らない"
+  ]}
+  answer={1}
+  explanation="三相 200V 60A は √3 × 200 × 60 = 20.8 kVA、連続負荷 80% で 16.6 kW が 1 系統の上限です。GPU ノード 2 台 + ToR で約 20.3 kW なので、A/B で分担する通常時は 1 系統あたり約 10.15 kW に収まります。しかし片系統が停止すると残った系統が 20.3 kW すべてを引き受け、連続負荷の上限を超えます。冗長を保ったまま 2 台載せるには給電容量を上げる必要があります。この計算は、片系統だけで全負荷を引き受けられる機器を前提にしています。冗長の組み方は機種で違うので、実機では機種の資料で確かめます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="ラックあたり 28kW の GPU ラックを、既存のサーバールームに設置します。サーバールーム全体の冷却容量の合計は足りていることを確認しました。冷却について、ほかに確認すべきことはどれですか。"
+  options={[
+    "もう確認することはない。全体の容量が足りていれば冷える",
+    "そのラックの前面に十分な冷気が届く構成になっているか（封じ込め、ブランクパネル、ケーブルの開口部）",
+    "サーバーの動作保証温度の上限だけ",
+    "外気温だけ"
+  ]}
+  answer={1}
+  explanation="全体の冷却容量が足りていても、そのラックの吸気に冷気が届いていなければ意味がありません。NVIDIA の H100 世代の設計ガイドは、ホットアイルの熱い空気がコールドアイルに回り込むとサーバーの吸気温度が上がり、熱交換の余力が大きく下がると書いています。回り込みを防ぐのが通路の封じ込めで、封じ込めを有効にするには、空き U をブランクパネルで、ケーブルの開口部をブラシグロメットで塞ぐ必要があるとしています。封じ込めは、特に高密度のラックで多くのデータセンターが採用しているとしています。"
+/>

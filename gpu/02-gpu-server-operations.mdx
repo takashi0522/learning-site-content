@@ -1,0 +1,398 @@
+---
+title: GPU サーバーの運用
+description: Xid エラーの読み方、永続モード、コンテナからの GPU 利用、電力と冷却の前提を運用の観点でまとめます。
+order: 2
+minutes: 19
+tags: ["nvidia-smi", "Xid", "DCGM", "container-toolkit", "ECC", "power"]
+objectives:
+  - Xid エラーからハードウェア障害とソフトウェア起因を切り分けられる
+  - コンテナから GPU を使う構成を説明し、トラブルの切り分けができる
+  - GPU サーバー特有の電力・冷却要件を設置前に判断できる
+references:
+  - label: "XID Errors — NVIDIA Documentation"
+    url: "https://docs.nvidia.com/deploy/xid-errors/"
+  - label: "NVIDIA Data Center GPU Manager (DCGM)"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/"
+  - label: "NVIDIA Container Toolkit Documentation"
+    url: "https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/"
+---
+
+## 日常の確認項目
+
+GPU サーバーで定期的に見るべきものは、CPU サーバーとは少し違います。
+
+```bash
+# 基本状態
+nvidia-smi
+
+# 全 GPU の要約を CSV で（監視スクリプト向け）
+nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,power.limit,\
+memory.used,memory.total,utilization.gpu,ecc.errors.uncorrected.volatile.total \
+  --format=csv
+
+# スロットリングが起きているか（最重要項目のひとつ）
+nvidia-smi -q -d PERFORMANCE | grep -A12 "Clocks Event Reasons"
+```
+
+```text
+Clocks Event Reasons
+    Idle                              : Not Active
+    Applications Clocks Setting       : Not Active
+    SW Power Cap                      : Active      ← 電力上限で制限されている
+    HW Slowdown                       : Not Active
+      HW Thermal Slowdown             : Not Active
+      HW Power Brake Slowdown         : Not Active
+    Sync Boost                        : Not Active
+    SW Thermal Slowdown               : Not Active
+```
+
+| 理由 | 意味 | 対処 |
+| --- | --- | --- |
+| `SW Power Cap` | 設定された電力上限に到達 | 上限設定を確認。ワークロードとして正常なことも多い |
+| `HW Thermal Slowdown` | **温度が危険域**。ハードウェアが強制的に減速 | **冷却の問題**。直ちに調査 |
+| `HW Power Brake` | 電源側からの要求で減速 | 給電容量、PSU の状態を確認 |
+| `SW Thermal Slowdown` | ドライバが温度を見て減速 | 冷却の問題 |
+
+---
+
+<h2 className="slide-cont">日常の確認項目（続き）</h2>
+
+<Callout type="field">
+
+**「GPU が遅い」の相当数は、故障ではなくスロットリングです。** ハードウェアコース レッスン 6 で扱った CPU のサーマルスロットリングと同じ構図が、より激しく起きます。
+
+H100 SXM は 1 枚 700W です。8 枚積んだノードは GPU だけで 5.6kW、システム全体では 10kW を超えます。**冷却が設計どおりに効いていないと、すぐ温度上限に当たります。**
+
+```bash
+# 温度と電力を並べて継続監視
+nvidia-smi dmon -s puct -d 2
+```
+
+`HW Thermal Slowdown` が `Active` になっているなら、GPU の問題ではなく設置環境の問題です。吸気温度、ファン、エアフローの経路、ブランクパネルを確認してください。
+
+</Callout>
+
+---
+
+## 永続モード
+
+**設定していないと、ジョブの起動が毎回数秒遅くなります。**
+
+GPU を使うプロセスが 1 つもなくなると、ドライバは GPU の状態を破棄します。次にプロセスが GPU を使うとき、初期化からやり直すため数秒かかります。永続モードは、この状態を保持し続ける設定です。
+
+```bash
+# 現在の状態（nvidia-smi の Persistence-M 列）
+nvidia-smi --query-gpu=index,persistence_mode --format=csv
+
+# 有効化（再起動で戻る）
+sudo nvidia-smi -pm 1
+
+# 恒久化: systemd サービスとして常駐させる（推奨）
+sudo systemctl enable --now nvidia-persistenced
+```
+
+短いジョブを大量に流す推論サーバーでは、この数秒が積み上がって無視できない差になります。**GPU サーバーの構築時に必ず有効化してください。**
+
+```bash
+# 電力上限を下げる（発熱・電力を抑えたい場合）
+sudo nvidia-smi -pl 500        # W 単位。恒久化には systemd unit を書く
+
+# 現在の設定可能範囲
+nvidia-smi -q -d POWER | grep -E "Power Limit|Min|Max"
+```
+
+---
+
+## Xid エラー: ハードウェア障害の一次情報
+
+GPU の異常は、カーネルログに **Xid** という番号付きのメッセージとして記録されます。ハードウェアコース レッスン 6 の SEL に相当する、GPU 側の一次情報です。
+
+```bash
+# Xid の確認
+sudo dmesg -T | grep -i xid
+sudo journalctl -k -g Xid --since "1 day ago"
+```
+
+```text
+NVRM: Xid (PCI:0000:41:00): 48, pid=48213, An uncorrectable double bit error detected
+NVRM: Xid (PCI:0000:c1:00): 79, GPU has fallen off the bus.
+```
+
+主要な Xid です。**切り分けの起点になるので、この表は覚える価値があります。**
+
+| Xid | 内容 | 原因の傾向 |
+| --- | --- | --- |
+| 13 | Graphics Engine Exception | **アプリのバグ**（不正なメモリアクセス等）が多い |
+| 31 | GPU memory page fault | **アプリのバグ**。カーネル内の不正アクセス |
+| 43 | GPU stopped processing | アプリ起因が多い |
+| 48 | **Double Bit ECC Error** | **ハードウェア**。訂正不能なメモリエラー |
+| 63 / 64 | Row remapping event | **ハードウェア**。不良行の代替処理が発生 |
+| 74 | NVLink error | **ハードウェア / 接続**。NVLink 経路の異常 |
+| **79** | **GPU has fallen off the bus** | **重大なハードウェア障害**。GPU が PCIe から消えた |
+| 94 / 95 | Contained / Uncontained ECC error | **ハードウェア**。95 は影響が封じ込められていない |
+
+---
+
+<h2 className="slide-cont">Xid エラー: ハードウェア障害の一次情報（続き）</h2>
+
+<Callout type="warning" title="Xid 79 は即対応">
+
+`GPU has fallen off the bus` は、**GPU が PCIe バスから応答しなくなった**状態です。OS からはデバイスが消えて見えます。
+
+```bash
+# デバイスがまだ見えているか
+lspci | grep -i nvidia
+nvidia-smi        # 「No devices were found」や「Unable to determine the device handle」になる
+```
+
+原因は電源の不安定、温度、物理的な接触、GPU 本体の故障、まれにライザーカードや PCIe リンクの問題です（ハードウェアコース レッスン 5 の `LnkSta` 確認が効きます）。
+
+**多くの場合、サーバーの再起動でしか復旧しません。** 繰り返し発生する GPU は交換対象です。発生時刻・頻度・該当 GPU の Bus-Id を記録して、ベンダーに上げてください。
+
+</Callout>
+
+<Callout type="pitfall">
+
+**Xid 13 / 31 / 43 が出たからといって、ハードウェアが壊れているとは限りません。** これらはアプリケーションが不正なメモリアクセスをした結果として出ることが多く、CPU でいうセグメンテーション違反に近いものです。
+
+特定のジョブを流したときだけ再現するなら、まずアプリケーション側（カーネルコードやフレームワークのバージョン）を疑ってください。**複数の異なるジョブで同じ GPU にだけ出るなら**、ハードウェアの可能性が上がります。
+
+</Callout>
+
+### ECC と行再マッピング
+
+データセンター GPU には ECC があります（ハードウェアコース レッスン 3 の DIMM と同じ考え方）。
+
+---
+
+<h2 className="slide-cont">Xid エラー: ハードウェア障害の一次情報（続き）</h2>
+
+```bash
+# ECC エラーの集計
+nvidia-smi -q -d ECC | grep -A8 "Aggregate"
+
+# 行再マッピングの状態（Ampere 以降）
+nvidia-smi -q -d ROW_REMAPPER
+```
+
+```text
+Remapped Rows
+    Correctable Error                 : 0
+    Uncorrectable Error               : 2      ← 不良行が代替された
+    Pending                           : Yes    ← 反映に GPU リセットが必要
+    Remapping Failure Occurred        : No     ← Yes なら予備枯渇。交換対象
+```
+
+- `Pending: Yes` … 再マッピングは決まったが、**GPU のリセット（または再起動）で反映される**
+- `Remapping Failure Occurred: Yes` … **予備行を使い切った。交換が必要**
+
+DIMM の CE と同様、**Uncorrectable の増加は予兆**として扱ってください。
+
+---
+
+## コンテナから GPU を使う
+
+前レッスンで触れた「ホストはドライバのみ、CUDA はコンテナ側」という構成の実装です。
+
+<Figure name="gpu-container-stack" caption="ホストに置くのはドライバだけ。CUDA はコンテナ側にある" />
+
+```bash
+# 動作確認
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+
+# 特定の GPU だけ渡す
+docker run --rm --gpus '"device=0,1"' ...
+
+# Kubernetes では device plugin 経由でリソースとして要求する
+#   resources:
+#     limits:
+#       nvidia.com/gpu: 2
+```
+
+---
+
+<h2 className="slide-cont">コンテナから GPU を使う（続き）</h2>
+
+<Callout type="field">
+
+**コンテナ内で `nvidia-smi` が動かないときの切り分け順序**です。
+
+```bash
+# ① ホストで GPU が見えているか（ここが NG ならコンテナ以前の問題）
+nvidia-smi
+
+# ② Container Toolkit が入っているか
+nvidia-ctk --version
+dpkg -l | grep nvidia-container    # または rpm -qa | grep nvidia-container
+
+# ③ コンテナランタイムに登録されているか
+cat /etc/docker/daemon.json | grep -A5 runtimes
+nvidia-ctk runtime configure --runtime=docker --dry-run
+
+# ④ 最小構成のコンテナで確認
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+④ が通ってアプリのコンテナで通らないなら、**コンテナ内の CUDA バージョンがホストのドライバの対応上限を超えている**可能性が高いです。前レッスンの互換性の原則（ドライバは新しく、CUDA は古くてよい）に戻って確認してください。
+
+</Callout>
+
+<Callout type="note" title="共有メモリの上限">
+
+PyTorch の DataLoader を複数ワーカーで使うと、`/dev/shm` を消費します。**Docker の既定は 64MB しかなく**、学習中に原因の分かりにくいクラッシュを起こします。
+
+```bash
+docker run --gpus all --shm-size=16g ...
+```
+
+Kubernetes では `emptyDir` に `medium: Memory` を指定したボリュームを `/dev/shm` にマウントします。GPU ジョブでは定番の設定です。
+
+</Callout>
+
+---
+
+## 監視: DCGM
+
+`nvidia-smi` をスクリプトでポーリングするより、**DCGM**（Data Center GPU Manager）を使うほうが、取れる指標も運用性も上です。
+
+```bash
+# サービス
+sudo systemctl enable --now nvidia-dcgm
+
+# 指標の確認
+dcgmi discovery -l
+dcgmi dmon -e 203,204,1004,1005    # GPU 利用率、メモリ、Tensor コア稼働など
+
+# ヘルスチェック（ハードウェア診断）
+dcgmi health -g 0 -c
+dcgmi diag -r 1        # 短時間の診断。-r 3 は長時間で本格的
+```
+
+`dcgm-exporter` を使えば Prometheus に取り込めます。
+
+<Callout type="tip">
+
+監視項目として最低限これらを入れてください。
+
+| 指標 | 意味 |
+| --- | --- |
+| `DCGM_FI_DEV_GPU_TEMP` | 温度。スロットリングの前兆 |
+| `DCGM_FI_DEV_POWER_USAGE` | 消費電力。上限張り付きの検知 |
+| `DCGM_FI_DEV_FB_USED` / `FB_FREE` | **VRAM 使用量。OOM の予兆** |
+| `DCGM_FI_PROF_SM_ACTIVE` | SM 稼働率。**`GPU-Util` より実態に近い** |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | Tensor コア稼働率。AI 効率の実測 |
+| `DCGM_FI_DEV_XID_ERRORS` | **Xid の発生。障害検知の要** |
+| `DCGM_FI_DEV_ECC_DBE_AGG_TOTAL` | 訂正不能 ECC の累計 |
+
+前レッスンで触れたとおり `GPU-Util` は実態を表さないため、**`SM_ACTIVE` と `PIPE_TENSOR_ACTIVE` を併せて見る**のが要点です。
+
+</Callout>
+
+---
+
+## 電力と冷却は設置の前提条件
+
+GPU サーバーは、一般的なサーバーとは電力密度が 1 桁違います。
+
+```text
+一般的な 2U サーバー      : 400–800W
+8 GPU (H100 SXM) ノード   : 10,000W 超
+
+通常のラック給電上限が 6kW 前後の場合、
+  → 1 ラックに 1 ノードも入らない、あるいは 1 台で上限
+```
+
+<Callout type="warning" title="導入前に確認すべき項目">
+
+GPU サーバーの導入は、**サーバーを買う前にファシリティ側の確認が必要**です。データセンター・ファシリティコースの内容が、ここでは必須の検討事項になります。
+
+- **ラックあたりの給電容量** — 何 kW まで引けるか。A/B 系統それぞれの容量
+- **電源コンセントの規格** — 200V 対応か、必要なアンペア数と形状
+- **冷却能力** — 空冷で排熱しきれるか。**H100 SXM の高密度構成は液冷が前提のことも多い**
+- **ラックの耐荷重** — GPU ノードは非常に重い（1 台 100kg を超えることがある）
+- **設置奥行き** — 一般的なサーバーより深い筐体が多い
+
+```bash
+# 実際の消費電力を計測する（ハードウェアコース レッスン6）
+ipmitool sensor get 'Pwr Consumption'
+nvidia-smi --query-gpu=power.draw --format=csv -l 5
+```
+
+**「サーバーは届いたがラックに載せられない・電源が足りない」は実際に起きます。** 発注前に確認してください。
+
+</Callout>
+
+---
+
+## GPU のリセット
+
+ジョブが異常終了して GPU が解放されない、`Pending` の行再マッピングを反映したい、といった場合に使います。
+
+```bash
+# まず GPU を使っているプロセスを確認して止める
+nvidia-smi
+sudo fuser -v /dev/nvidia*
+
+# GPU をリセット（そのGPUを使うプロセスが0である必要がある）
+sudo nvidia-smi -r -i 0
+```
+
+<Callout type="pitfall">
+
+**リセットは無停止の万能薬ではありません。**
+
+- 対象 GPU を使っているプロセスが 1 つでも残っていると失敗する
+- **NVSwitch を使うシステム（DGX/HGX）では、単独 GPU のリセットができないことがある**。Fabric Manager の再起動やシステム再起動が必要
+- Xid 79 の後は、リセットでは復旧せずサーバー再起動が必要なことが多い
+
+また、NVSwitch システムでは `nvidia-fabricmanager` サービスが動いていないと GPU が正しく初期化されません。GPU が見えない・NVLink が使えない場合は、このサービスの状態も確認してください。
+
+```bash
+systemctl status nvidia-fabricmanager
+journalctl -u nvidia-fabricmanager -e
+```
+
+</Callout>
+
+---
+
+## まとめ
+
+- **`Clocks Event Reasons` でスロットリングを確認する**。「遅い」の多くは故障ではなくこれ
+- **永続モードを必ず有効化する**（`nvidia-persistenced`）。ジョブ起動の数秒が消える
+- **Xid はハードウェア障害の一次情報**。13/31/43 はアプリ起因、48/63/94/95 はハードウェア
+- **Xid 79（fallen off the bus）は重大**。繰り返すなら交換対象
+- 行再マッピングの `Remapping Failure Occurred: Yes` は予備枯渇。交換が必要
+- コンテナは「ホスト＝ドライバ、コンテナ＝CUDA」。`--shm-size` の指定を忘れない
+- 監視は DCGM。**`GPU-Util` ではなく `SM_ACTIVE` と `TENSOR_ACTIVE`**、そして Xid
+- **電力・冷却・耐荷重は発注前に確認する**。8 GPU ノードは 10kW を超える
+
+---
+
+<Quiz
+  id="q1"
+  question="カーネルログに「NVRM: Xid (PCI:0000:c1:00): 79, GPU has fallen off the bus」が記録され、nvidia-smi でその GPU が見えなくなりました。適切な初動はどれですか。"
+  options={[
+    "アプリケーションのコードを修正する",
+    "重大なハードウェア／接続系の障害を示すため、発生時刻と該当 GPU の Bus-Id を記録し、サーバー再起動で復旧を試みたうえで、再発するなら交換を前提にベンダーへ上げる",
+    "nvidia-smi -r でリセットすれば必ず復旧する",
+    "CUDA Toolkit のバージョンを上げる"
+  ]}
+  answer={1}
+  explanation="Xid 79 は GPU が PCIe バスから応答しなくなった状態で、電源の不安定、温度、物理的接触、GPU 本体の故障などが原因です。アプリケーション起因の Xid 13/31/43 とは性質が異なります。GPU リセットでは復旧しないことが多く、通常はサーバー再起動が必要です。繰り返し発生する GPU は交換対象として扱い、記録を添えてベンダーに上げます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="ホストでは nvidia-smi が正常に動作し、nvidia/cuda:12.4 のベースイメージでも nvidia-smi が動きます。しかし自社アプリのコンテナだけ CUDA の初期化に失敗します。最も疑わしい原因はどれですか。"
+  options={[
+    "NVIDIA Container Toolkit がインストールされていない",
+    "アプリのコンテナが要求する CUDA バージョンが、ホストのドライバの対応上限を超えている",
+    "GPU が MIG モードになっている",
+    "永続モードが無効になっている"
+  ]}
+  answer={1}
+  explanation="ベースイメージで nvidia-smi が動く以上、Container Toolkit とランタイム設定は正常です。切り分けの残りはバージョン互換で、CUDA は「ドライバが対応する上限 ≧ アプリが要求するバージョン」でなければ動きません。ホストのドライバが対応する CUDA の上限（nvidia-smi のヘッダ表示）と、アプリコンテナが同梱する CUDA バージョンを突き合わせ、必要ならホストのドライバを更新します。"
+/>

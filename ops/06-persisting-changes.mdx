@@ -1,0 +1,371 @@
+---
+title: 設定変更を安全に・確実に残す
+description: 「再起動したら設定が消えた」を防ぐ恒久化の作法と、変更作業そのものの進め方をまとめます。
+order: 6
+minutes: 17
+tags: ["sysctl", "nmcli", "systemd", "rollback", "change-management"]
+objectives:
+  - 一時的な変更と恒久的な変更を区別し、両方を確実に適用できる
+  - ネットワーク設定を管理ツール経由で正しく永続化できる
+  - 変更作業に戻し手順を組み込める
+references:
+  - label: "sysctl.d(5) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man5/sysctl.d.5.html"
+  - label: "nmcli(1) — Linux manual page"
+    url: "https://manpages.debian.org/stable/network-manager/nmcli.1.en.html"
+  - label: "systemd.unit(5) — drop-in ディレクトリ"
+    url: "https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html"
+---
+
+## 「一時」と「恒久」は別の操作
+
+Linux の設定変更のほとんどは、**実行中に反映する操作**と**再起動後も残す操作**が分かれています。片方だけ行うのが、最も多い失敗です。
+
+| 対象 | 一時的な適用（今すぐ効く） | 恒久化（再起動後も残る） |
+| --- | --- | --- |
+| カーネルパラメータ | `sysctl -w` | `/etc/sysctl.d/*.conf` |
+| ネットワーク | `ip addr add` | NetworkManager / netplan の設定 |
+| サービス設定 | `systemctl set-property --runtime` | `systemctl edit`（drop-in） |
+| 自動起動 | `systemctl start` | `systemctl enable` |
+| ファイアウォール | `firewall-cmd`（そのまま） | `firewall-cmd --permanent` |
+| マウント | `mount` | `/etc/fstab` |
+| カーネルモジュール | `modprobe` | `/etc/modules-load.d/*.conf` |
+
+<Callout type="pitfall">
+
+**逆のパターンもあります。** 設定ファイルだけ書いて、反映コマンドを打たないケースです。
+
+「`/etc/sysctl.d/` に書いたのに効いていない」「`firewall-cmd --permanent` で開けたのに繋がらない」— どちらも反映操作が抜けています。
+
+```bash
+sudo sysctl --system            # sysctl.d を読み直す
+sudo firewall-cmd --reload      # permanent 設定を実行中の設定に反映
+sudo systemctl daemon-reload    # unit / fstab の変更を systemd に再読込させる
+```
+
+**「今の状態」と「次回起動時の状態」の両方を確認する**のが確実です。
+
+</Callout>
+
+---
+
+## カーネルパラメータ (sysctl)
+
+```bash
+# 現在値の確認
+sysctl net.ipv4.tcp_keepalive_time
+sysctl -a | grep somaxconn
+
+# 一時変更（再起動で消える）
+sudo sysctl -w net.core.somaxconn=8192
+```
+
+恒久化は `/etc/sysctl.d/` にファイルを置きます。**`/etc/sysctl.conf` を直接編集するより、目的別のファイルに分けるほうが管理しやすい**です。
+
+```bash
+sudo tee /etc/sysctl.d/90-webserver.conf > /dev/null <<'EOF'
+# accept キューの上限（ミドルウェアコース レッスン1 参照）
+net.core.somaxconn = 8192
+# 接続数が多いサーバーでのエフェメラルポート拡張
+net.ipv4.ip_local_port_range = 10240 65535
+# TCP keepalive を中継機器のタイムアウトより短くする
+net.ipv4.tcp_keepalive_time = 600
+EOF
+
+# 反映して確認
+sudo sysctl --system
+sysctl net.core.somaxconn
+```
+
+---
+
+<h2 className="slide-cont">カーネルパラメータ (sysctl)（続き）</h2>
+
+<Callout type="note" title="ファイル名の数字が優先度">
+
+`/etc/sysctl.d/` のファイルは**名前順に読まれ、後勝ち**です。`99-` で始まるファイルが最後に読まれるため最も強く効きます。
+
+ディストリビューションが `/usr/lib/sysctl.d/` に既定値を置いていることがあり、それを上書きしたい場合は `/etc/sysctl.d/` に同名または後ろの番号のファイルを置きます。
+
+```bash
+# どのファイルがどの値を設定しているかを追う
+sudo sysctl --system 2>&1 | grep -B1 somaxconn
+grep -r somaxconn /etc/sysctl.d/ /usr/lib/sysctl.d/ /etc/sysctl.conf 2>/dev/null
+```
+
+</Callout>
+
+---
+
+## ネットワーク設定
+
+**設定ファイルを直接編集しない**のが現代のディストリビューションの原則です。管理ツールが別途ファイルを持っており、上書きされます。
+
+### NetworkManager (RHEL 系、多くの Ubuntu Desktop)
+
+```bash
+# 現在の接続一覧
+nmcli connection show
+nmcli device status
+
+# 設定内容を見る
+nmcli connection show "System eth0"
+
+# 固定 IP に変更する（この時点ではまだ反映されない）
+sudo nmcli connection modify "System eth0" \
+  ipv4.method manual \
+  ipv4.addresses 10.0.0.15/24 \
+  ipv4.gateway 10.0.0.1 \
+  ipv4.dns "10.0.0.53,10.0.0.54"
+
+# 反映（接続が一度切れる点に注意）
+sudo nmcli connection up "System eth0"
+```
+
+`nmcli connection modify` は**設定ファイルに即座に書き込む**ため、これだけで恒久化されます。
+
+### netplan (Ubuntu Server)
+
+```bash
+sudo vi /etc/netplan/50-cloud-init.yaml
+```
+
+---
+
+<h2 className="slide-cont">ネットワーク設定（続き）</h2>
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses: [10.0.0.15/24]
+      routes:
+        - to: default
+          via: 10.0.0.1
+      nameservers:
+        addresses: [10.0.0.53, 10.0.0.54]
+```
+
+```bash
+# 構文チェックと、生成される設定の確認
+sudo netplan get
+sudo netplan generate
+
+# 120秒後に自動で元に戻る形で適用（リモート作業では必ずこれ）
+sudo netplan try
+
+# 問題なければ確定
+sudo netplan apply
+```
+
+---
+
+<h2 className="slide-cont">ネットワーク設定（続き）</h2>
+
+<Callout type="warning" title="リモートでのネットワーク変更は戻し手段を用意する">
+
+**ネットワーク設定の変更は、失敗するとその場でサーバーに入れなくなります。** SSH の設定変更と違い、既存セッションも切れます。
+
+安全にするための手段です。
+
+**① `netplan try` を使う（Ubuntu）**
+適用後 120 秒以内に確認応答がなければ自動で元に戻ります。
+
+**② 自動ロールバックを仕込む（汎用）**
+```bash
+# 10分後に元の設定へ戻すジョブを先に仕掛けてから変更する
+sudo bash -c 'echo "nmcli connection up \"System eth0-backup\"" | at now + 10 minutes'
+# 変更後、問題なければ atq / atrm でジョブを取り消す
+```
+
+**③ コンソールを確保しておく**
+BMC の仮想コンソール（ハードウェアコース レッスン 6）や、クラウドのシリアルコンソールに**接続できることを事前に確認**しておきます。これが最も確実な保険です。
+
+</Callout>
+
+---
+
+## サービス設定 (systemd)
+
+Linux コース レッスン 5 で扱った drop-in が、ここでも基本です。
+
+```bash
+# 恒久的な設定変更（drop-in ファイルを作る）
+sudo systemctl edit nginx.service
+
+# 実行中のみの変更（再起動で戻る）
+sudo systemctl set-property --runtime nginx.service MemoryMax=1G
+
+# 恒久＋即時
+sudo systemctl set-property nginx.service MemoryMax=2G
+```
+
+```bash
+# 最終的に適用されている設定を確認する（元ファイル + drop-in の合成結果）
+systemctl cat nginx.service
+systemctl show nginx.service -p MemoryMax -p CPUQuota -p LimitNOFILE
+
+# 自動起動の状態（これと「今動いているか」は別）
+systemctl is-enabled nginx.service
+systemctl is-active nginx.service
+```
+
+<Callout type="pitfall">
+
+**`systemctl start` は再起動で消えます。** `enable` を忘れると、次のメンテナンス再起動でサービスが上がってきません。
+
+```bash
+# 両方を一度に
+sudo systemctl enable --now nginx.service
+```
+
+逆に `disable` だけして `stop` を忘れると、止めたつもりのサービスが動き続けます。`--now` を付ける習慣にしてください。
+
+</Callout>
+
+---
+
+## 変更作業の進め方
+
+設定変更そのものより、**進め方**が事故を防ぎます。
+
+### ① 変更前の状態を保存する
+
+```bash
+# 設定ファイルは必ずタイムスタンプ付きで退避
+sudo cp -a /etc/nginx/nginx.conf /etc/nginx/nginx.conf.$(date +%Y%m%d-%H%M%S)
+
+# 現在値をテキストで残す（sysctl の場合）
+sysctl -a > /var/tmp/sysctl-before-$(date +%Y%m%d).txt
+```
+
+<Callout type="tip">
+
+設定ファイル群を Git で管理すると、退避も差分確認もロールバックも一度に解決します。`/etc` 全体をリポジトリにする `etckeeper` という道具もあります。
+
+```bash
+cd /etc && sudo git init && sudo git add -A && sudo git commit -m "initial"
+# 以後、変更のたびに
+sudo git -C /etc diff
+```
+
+サーバー台数が増えたら構成管理ツール（Ansible など）へ移す前提でも、**まず差分が見える状態にする**価値は大きいです。
+
+</Callout>
+
+### ② 構文チェックを挟む
+
+適用前に検証できるものは、必ず検証します。
+
+---
+
+<h2 className="slide-cont">変更作業の進め方（続き）</h2>
+
+```bash
+sudo nginx -t                      # nginx
+sudo sshd -t                       # sshd
+sudo visudo -c                     # sudoers
+sudo named-checkconf               # BIND
+sudo mount -a                      # fstab（前のレッスン）
+sudo netplan generate              # netplan
+sudo systemd-analyze verify /etc/systemd/system/myapp.service
+```
+
+### ③ reload と restart を使い分ける
+
+| | 挙動 | 影響 |
+| --- | --- | --- |
+| `reload` | 設定を読み直す。**プロセスは生きたまま** | 既存接続は維持される |
+| `restart` | プロセスを停止して起動 | **既存接続がすべて切れる** |
+
+```bash
+sudo systemctl reload nginx     # 設定変更だけならこちら
+sudo systemctl restart nginx    # バイナリ更新時などはこちら
+```
+
+`reload` に対応しているかは unit の `ExecReload=` の有無で分かります。
+
+```bash
+systemctl cat nginx.service | grep ExecReload
+```
+
+### ④ 戻し手順を先に書く
+
+---
+
+<h2 className="slide-cont">変更作業の進め方（続き）</h2>
+
+<Callout type="field">
+
+**作業手順書に「戻し方」が書かれていない変更は、実施しないほうが安全です。**
+
+最低限、次の 3 つを事前に用意してください。
+
+1. **戻すための具体的なコマンド** — 「元に戻す」ではなく `cp /etc/nginx/nginx.conf.20260919-1430 /etc/nginx/nginx.conf && systemctl reload nginx` のように実行可能な形で
+2. **戻すと判断する基準** — 「エラー率が 1% を超えたら」「5 分待って復旧しなければ」など、その場で迷わない条件
+3. **戻せない変更の洗い出し** — データベースのスキーマ変更、XFS の拡張（前のレッスン）、不可逆なデータ移行など。これらは事前バックアップが唯一の保険
+
+「たぶん大丈夫」で進めた変更ほど、戻し方を考えていない状態で問題が起きます。
+
+</Callout>
+
+### ⑤ 再起動して確認する
+
+恒久化したつもりの設定が本当に残るかは、**実際に再起動するまで分かりません**。
+
+```bash
+# 再起動前に、現在の状態を記録しておく
+systemctl list-units --state=running > /var/tmp/before-reboot.txt
+ip addr > /var/tmp/before-reboot-net.txt
+sysctl -a > /var/tmp/before-reboot-sysctl.txt
+
+sudo reboot
+
+# 再起動後に差分を取る
+systemctl list-units --state=running | diff /var/tmp/before-reboot.txt -
+ip addr | diff /var/tmp/before-reboot-net.txt -
+```
+
+計画的なメンテナンス再起動の機会に、この確認を組み込んでおくと、**障害時の緊急再起動で初めて設定漏れが発覚する**事態を防げます。
+
+---
+
+## まとめ
+
+- **一時適用と恒久化は別の操作**。両方やる。片方だけが最も多い失敗
+- 設定ファイルを書いたら反映コマンド（`sysctl --system` / `firewall-cmd --reload` / `daemon-reload`）
+- ネットワークは管理ツール（`nmcli` / netplan）経由で設定する。ファイル直編集は上書きされる
+- **リモートのネットワーク変更は、自動ロールバックかコンソール確保を用意してから**
+- `systemctl enable --now` で「今」と「次回」を揃える
+- 適用前に構文チェック。`reload` と `restart` の影響の差を理解する
+- **戻し手順のない変更は実施しない**。戻せない変更は事前バックアップが唯一の保険
+- 計画的な再起動の機会に、恒久化できているかを差分で確認する
+
+<Quiz
+  id="q1"
+  question="sysctl -w net.core.somaxconn=8192 を実行して問題が解消しました。この設定を今後も維持するために必要な作業はどれですか。"
+  options={[
+    "特に不要。sysctl -w は永続的に適用される",
+    "/etc/sysctl.d/ に設定ファイルを作成する（-w は実行中のみの変更で、再起動すると失われる）",
+    "systemctl daemon-reload を実行する",
+    "カーネルを再コンパイルする"
+  ]}
+  answer={1}
+  explanation="sysctl -w は実行中のカーネルの値を変更するだけで、再起動すると既定値に戻ります。恒久化するには /etc/sysctl.d/ 配下に .conf ファイルを置き、sysctl --system で読み込ませます。逆に設定ファイルだけ書いて反映コマンドを打たないと今の状態には効かないため、両方を行う必要があります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="リモートのサーバーで、SSH 経由でネットワークインターフェースの IP アドレスを変更する必要があります。最も重要な事前準備はどれですか。"
+  options={[
+    "設定ファイルのバックアップを取る",
+    "変更が失敗した場合に接続を回復する手段（netplan try、時限ロールバックジョブ、BMC やシリアルコンソールへの到達性）を確保しておく",
+    "サービスを事前に停止しておく",
+    "DNS の TTL を短くしておく"
+  ]}
+  answer={1}
+  explanation="ネットワーク設定の変更に失敗すると、SSH セッション自体が切断され、設定ファイルのバックアップがあってもサーバーにアクセスできなくなります。バックアップは必要ですが、それだけでは復旧手段になりません。netplan try のような自動復帰の仕組み、at で仕掛ける時限ロールバック、あるいは BMC の仮想コンソールやクラウドのシリアルコンソールへの到達性を事前に確認しておくことが決定的に重要です。"
+/>

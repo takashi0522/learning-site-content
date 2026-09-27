@@ -1,0 +1,9 @@
+{
+  "title": "GPU / アクセラレータ",
+  "subtitle": "GPU",
+  "description": "NVIDIA GPU の構造とソフトウェアスタック、複数 GPU をまたぐ通信、そして運用と性能測定。CPU サーバーとは前提が違う部分を切り出して扱います。",
+  "order": 4,
+  "accent": "gpu",
+  "level": "基礎 → 実務",
+  "status": "ready"
+}

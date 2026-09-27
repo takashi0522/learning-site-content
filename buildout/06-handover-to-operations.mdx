@@ -1,0 +1,228 @@
+---
+title: 運用に引き渡す
+description: 監視項目、ファームウェアの揃え方、故障 GPU の交換、ノードの入れ替え。構築の続きとして運用を設計します。
+order: 6
+minutes: 18
+tags: ["DCGM Exporter", "ファームウェア", "RMA", "ドレイン", "台帳"]
+objectives:
+  - GPU クラスタで監視すべき項目を挙げられる
+  - ファームウェアとドライバの版を揃える運用を設計できる
+  - 故障 GPU の検知から交換までの手順を組める
+references:
+  - label: "NVIDIA DCGM Exporter (GitHub)"
+    url: "https://github.com/NVIDIA/dcgm-exporter"
+  - label: "NVIDIA DCGM Documentation"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/"
+  - label: "NVIDIA GPU Operator Documentation"
+    url: "https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/"
+  - label: "NVIDIA DCGM Exporter — Metrics (既定で有効な指標)"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/reference/dcgm-exporter-metrics.html"
+  - label: "NVIDIA Xid Errors — Introduction"
+    url: "https://docs.nvidia.com/deploy/xid-errors/introduction.html"
+  - label: "NVIDIA Xid Errors — Catalog"
+    url: "https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html"
+  - label: "NVIDIA GPU Debug Guidelines — GPU Node Triage"
+    url: "https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html"
+  - label: "NVIDIA — RMA Process"
+    url: "https://docs.nvidia.com/deploy/rma-process/index.html"
+  - label: "NVIDIA Fabric Manager User Guide"
+    url: "https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html"
+  - label: "nvidia-smi (UUID と PCI Bus ID、利用率の定義)"
+    url: "https://docs.nvidia.com/deploy/nvidia-smi/index.html"
+---
+
+## 何を見るか
+
+ミドルウェアコース レッスン 5 で「アラートは症状で鳴らす」と書きました。GPU クラスタでも同じですが、**見る対象が増えます。**
+
+| 層 | 主な指標 | 何が分かるか |
+| --- | --- | --- |
+| GPU 単体 | 利用率、VRAM 使用量、温度、電力、**Xid** | 壊れかけていないか |
+| ノード内 | NVLink のエラーカウンタ | GPU 間通信が健全か |
+| ファブリック | ポートのエラーカウンタ、リンク速度 | ケーブル・光モジュールの劣化 |
+| ジョブ | ステップ時間、GPU 利用率の谷 | 通信待ちで遊んでいないか |
+
+**DCGM Exporter** を各ノードで動かすと、GPU 単体の指標を Prometheus 形式で取れます。NVLink のエラーカウンタも取れますが、既定の設定では無効になっているので、使うなら有効にします。ファブリックのポートとジョブのステップ時間は、DCGM Exporter の範囲外です（スイッチやジョブ側で別に取ります）。
+
+```bash
+# Kubernetes なら GPU Operator が面倒を見る
+kubectl -n gpu-operator get pods | grep dcgm
+```
+
+---
+
+<h2 className="slide-cont">何を見るか（続き）</h2>
+
+<Callout type="field">
+
+**GPU 利用率だけ見ていると、遊んでいることに気づきません。**
+
+GPU コース レッスン 4 で扱ったとおり、`nvidia-smi` の利用率は「カーネルが実行中の時間の割合」であって、「性能を出し切っているか」ではありません。カーネルが走っている時間の割合なので、GPU のどれだけを使っているかは表しません。
+
+分散学習では**ステップ時間**も見ます。利用率では見えない遅れが、ステップ時間には現れます。原因は通信待ちやデータ待ちのこともあれば、クロックの低下で計算そのものが遅いこともあります。
+
+</Callout>
+
+<Callout type="warning" title="Xid はアラートにする">
+
+Xid は GPU で起きたエラーの報告です。NVIDIA によれば、原因はハードウェア・NVIDIA のソフトウェア・アプリケーションのどれでもありえます。原因が何であれ、**発生したら通知が飛ぶようにしてください。**
+
+NVIDIA の切り分け手順では、Xid 79（GPU がバスから外れた）はノードをドレインしてサポートへ報告する対象です。Xid 48（Double Bit ECC）は、Xid 63 か 64 が続けばドレインして GPU をリセットし、続かなければ Field Diagnostics で追加の情報を集めます（いつ・どう実行するかはシステムベンダーに確認する、と NVIDIA は書いています）。ログに残しておくだけでは、誰も気づかないまま学習ジョブが落ち続けることがあります。
+
+</Callout>
+
+---
+
+## 版を揃える
+
+GPU クラスタで厄介なのは、**揃えるべきものが多い**ことです。
+
+```text
+ノードごとに揃っている必要があるもの
+  □ NVIDIA ドライバ
+  □ Fabric Manager（NVSwitch 搭載機のみ。ドライバと一致）
+  □ DOCA / MOFED
+  □ GPU のファームウェア（VBIOS）
+  □ NIC のファームウェア
+  □ BMC / BIOS
+  □ スイッチの OS
+```
+
+<Callout type="pitfall">
+
+**1 ノードだけ版が違う状態は、全ノードを並べて比べないと見つかりません。**
+
+分散学習は全ノードが揃って動くので、1 ノードの不調がジョブ全体に響きます。AI 基盤コース レッスン 6 で見たとおり、**遅い 1 台が全体の足を引っ張る**構造です。
+
+「このノードを含むジョブだけおかしい」という症状が出たら、版の一致も確認してください。
+
+```bash
+# 全ノードのドライバ版を並べる
+pdsh -w node[1-32] 'nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1'
+```
+
+</Callout>
+
+### 更新の進め方
+
+運用オペレーションコース レッスン 5 で扱った更新戦略が、ここでも効きます。
+
+1. **1 ノードで試す** — ドレインして、更新して、受け入れ検証（レッスン 5）を流す
+2. **数ノードに広げる** — 分散学習を実際に流して、混在状態で問題が出ないか見る
+3. **全体に展開** — 空いている時間帯に、ドレインしながら順に
+
+**ドライバと Fabric Manager は必ずセットで更新してください。** 片方だけ上げると Fabric Manager が起動せず、CUDA のジョブが起動しなくなります（レッスン 4）。
+
+---
+
+## 故障 GPU への対処
+
+検知から交換までの流れを、あらかじめ決めておきます。
+
+```text
+① 検知     Xid、DCGM の health check、ジョブの失敗
+② 隔離     そのノードを新規ジョブの割り当て対象から外す（ドレイン）
+③ 確認     dcgmi diag -r 3 で再現するか
+④ 情報収集 Field Diagnostics（RMA の前に通常求められる。実行はシステムベンダーの指示に従う）
+⑤ 交換     RMA（出すものは下を参照）
+⑥ 復帰     受け入れ検証をもう一度流してから戻す
+```
+
+⑤で出すものは、NVIDIA の資料によって書き方が違います。GPU ノードの切り分けガイドは、**システムベンダー**へ `nvidia-bug-report.sh` の出力と DCGM の診断ログ（HGX なら Fabric Manager のログも）を出すとしています。RMA の手順書（R525 版、2023 年の更新）は、fieldiag.log と nvidia-bug-report を添えて **NVIDIA のポータル**から申し込むとしています。契約の形で窓口が変わるので、構築時に確かめておきます。
+
+<Callout type="field">
+
+**②のドレインを手順に入れておくことが重要です。**
+
+Kubernetes なら `kubectl drain`、Slurm なら `scontrol update nodename=... state=drain`。壊れかけたノードを放置すると、そこに割り当たったジョブが落ち続けます。
+
+AI 基盤コース レッスン 6 で扱ったとおり、分散学習は 1 ノードの失敗でジョブ全体が止まります。**壊れたノードを自動で外す仕組み**があると、夜間の障害で朝まで無駄にする事故を防げます。
+
+</Callout>
+
+<Callout type="note" title="戻すときも検証する">
+
+交換後のノードは**新品と同じ扱い**で受け入れ検証を流してください。
+
+交換作業そのものが新しい問題を持ち込むことがあります。ケーブルの挿し直しで光モジュールが緩む、別の GPU に触れてしまう、といったことです。レッスン 5 のチェックリストをそのまま使えます。
+
+</Callout>
+
+---
+
+## 台帳を作る
+
+構築時に集めた情報は、運用に入ると急に必要になります。**引き渡しの成果物として残してください。**
+
+```text
+ノード台帳
+  ホスト名 / シリアル / ラック位置（何番ラックの何 U）
+  GPU のシリアル（枚数分）
+  各 NIC の MAC / GUID と、接続先スイッチ・ポート
+  BMC の IP
+  ドライバ・ファームウェアの版
+
+配線台帳
+  ケーブルの両端（機器・ポート）、種別、長さ
+  レール番号と GPU 番号の対応（レッスン 2）
+
+電力台帳
+  各ノードがどの PDU のどの口に繋がっているか（A 系 / B 系）
+```
+
+<Callout type="warning">
+
+**「GPU 3 が壊れた」と言われて、それが物理的にどのラックのどのノードのどのスロットか、すぐに分からないと交換できません。**
+
+特に **GPU の識別子と物理位置の対応**は、現地で確認するのが面倒です。構築時に `nvidia-smi --query-gpu=uuid,pci.bus_id --format=csv` で取って残しておいてください。
+
+対応づけの鍵には **UUID か PCI Bus ID** を使います。nvidia-smi のマニュアルによれば、GPU の番号の順番は再起動をまたいで同じになる保証がなく、ボードのシリアルは同じボード上の複数の GPU で共有されることがあります。PCI Bus ID と筐体のスロット位置の対応は、機種の資料で確かめて一緒に残します。
+
+配線台帳も同じです。レール番号と GPU 番号の対応が記録されていないと、ケーブルを 1 本交換したあとに正しく戻せたか確認できません。
+
+</Callout>
+
+---
+
+## このコースのまとめ
+
+- リファレンスアーキテクチャは「試験済みの構成」。**外すなら、どこを変えたかを意識して自分で測る**
+- 規模は**スケーラブルユニット**という塊で考える。B200 世代の SuperPOD の RA では、台数を減らしてもファブリックは SU 満数で組む
+- Rubin 世代の **NVL72 と NVL8 の数字は、NVLink でつながる GPU の枚数**。世代の序列ではない
+- OEM のサーバーで組むなら **Enterprise RA**。ファブリックの形を決めるのは筐体ではなく **GPU と NIC の数**
+- ネットワークは**4 系統**。HGX AI Factory の RA（HGX B300 世代の版）は、計算ファブリックをノンブロッキングで組むと明記している
+- **レール最適化**は、全ノードの同じ GPU 番号を同じリーフに集める配線
+- 設置前に**電力・冷却・床荷重・搬入経路**を確定させる。U より先に電力が尽きうる
+- ソフトウェアは**下から順に積み、1 段ごとに確認する**
+- 受け入れでは「動く」と「速い」を**別々に検証**する。動いていても遅いことがある
+- 運用へは**台帳と一緒に**引き渡す
+
+---
+
+<Quiz
+  id="q1"
+  question="NVSwitch を積んだ HGX / DGX ノード 32 台のクラスタで、ドライバの更新を 1 ノードずつ進めていました。更新した 1 ノードを含むジョブだけが、CUDA の初期化で cudaErrorSystemNotReady になって起動しません。そのノードの nvidia-smi では GPU が見えています。次に確認すべきことはどれですか。"
+  options={[
+    "GPU の温度",
+    "そのノードのドライバと Fabric Manager の版が一致しているか。全ノードの版を並べて確認する",
+    "ジョブのバッチサイズ",
+    "ストレージの空き容量"
+  ]}
+  answer={1}
+  explanation="NVSwitch 搭載機では、Fabric Manager が起動時にドライバとの互換性を確かめ、合わなければ処理を中止します。Fabric Manager が初期化を終えていない状態でアプリケーションを起動すると、CUDA の初期化が cudaErrorSystemNotReady で失敗します（Fabric Manager User Guide）。ドライバだけを上げて Fabric Manager を置き去りにすると、この状態になります。pdsh などで全ノードの版を並べ、H100 以降なら nvidia-smi -q の Fabric の State と Status も確認します。ドライバと Fabric Manager は版を揃えて更新してください。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Xid 48（Double Bit ECC）が 1 ノードで発生しました。NVIDIA の切り分け手順に沿った対応はどれですか。"
+  options={[
+    "ログに記録し、様子を見る",
+    "Xid 63 か 64 が続いていれば、ノードをドレインして処理の終了を待ち、GPU をリセットする。続いていなければ Field Diagnostics を流して情報を集める",
+    "即座にノードの電源を落とす",
+    "クラスタ全体を停止して全ノードを検査する"
+  ]}
+  answer={1}
+  explanation="NVIDIA の GPU ノードの切り分け手順では、Xid 48 のあとに Xid 63 か 64 が続いていれば、ノードをドレインして実行中の処理が終わるのを待ち、GPU をリセットします。続いていなければ Field Diagnostics を流して情報を集めます（いつ・どう実行するかはシステムベンダーに確認します）。Field Diagnostics は GPU の健全性を判断する NVIDIA の正式なツールで、RMA を始める前には通常これが求められます。即座に電源を落とすと実行中のジョブが失われ、クラスタ全体の停止は影響が大きすぎます。交換後は新品と同じ受け入れ検証を流してから戻します。"
+/>

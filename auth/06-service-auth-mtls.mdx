@@ -1,0 +1,378 @@
+---
+title: サービス間認証と mTLS
+description: 人間ではないクライアントをどう認証するか。mTLS、ワークロード ID、シークレット管理を扱います。
+order: 6
+minutes: 18
+tags: ["mTLS", "ServiceAccount", "Vault", "SPIFFE", "Client Credentials"]
+objectives:
+  - サービス間認証の方式を比較し、用途に応じて選べる
+  - mTLS の設定と、プライベート CA との関係を説明できる
+  - 長命なシークレットを短命な資格情報へ置き換える考え方を理解できる
+references:
+  - label: "RFC 8705 — OAuth 2.0 Mutual-TLS Client Authentication"
+    url: "https://www.rfc-editor.org/rfc/rfc8705.html"
+  - label: "Kubernetes — Service Account token volume projection"
+    url: "https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/"
+  - label: "SPIFFE — Secure Production Identity Framework"
+    url: "https://spiffe.io/docs/latest/spiffe-about/overview/"
+---
+
+## 人間の認証とは前提が違う
+
+レッスン 1〜5 は「人間」を認証する話でした。サービス間では前提が変わります。
+
+| | 人間 | **サービス** |
+| --- | --- | --- |
+| 認証要素 | 知識・所持・生体 | **鍵か証明書のみ** |
+| MFA | 有効 | **不可能** |
+| 対話 | ブラウザでリダイレクトできる | **できない** |
+| 数 | 従業員数 | **Pod 数・インスタンス数（動的）** |
+| 寿命 | 在籍期間 | **数分〜数時間のこともある** |
+
+**「対話できない」「数が動的」という 2 点が、方式の選択を決めます。**
+
+---
+
+## 方式の比較
+
+| 方式 | 資格情報 | 強度 | 向く場面 |
+| --- | --- | --- | --- |
+| **API キー** | 長い文字列 | **低い** | 簡易な内部連携。非推奨 |
+| **mTLS** | クライアント証明書 | **高い** | **オンプレ、固定的なサービス間** |
+| **OAuth Client Credentials** | client_id + secret | 中 | IdP がある環境 |
+| **ワークロード ID**（SPIFFE / K8s SA） | 短命トークン / 証明書 | **高い** | **動的な環境（K8s）** |
+
+<Callout type="pitfall" title="API キーの問題">
+
+```text
+✗ 長命（発行したら何年も使われる）
+✗ 共有される（チャット、設定ファイル、Git にコピーされる）
+✗ 失効が難しい（どこで使われているか把握できていない）
+✗ 誰が使ったか分からない（同じキーを複数が使う）
+```
+
+**「とりあえず API キー」で始めた連携が、数年後に誰も触れない状態になる**のはよくあることです。
+
+最低限、次を守ってください。
+
+- 用途ごとに**別のキー**を発行する（共有しない）
+- **有効期限を設定する**
+- 使用状況をログに残し、**未使用のキーを棚卸しする**
+
+ただし、これらを守れるなら mTLS か Client Credentials に移行したほうが結局は楽です。
+
+</Callout>
+
+---
+
+## mTLS
+
+通常の TLS はサーバーだけが証明書を出しますが、**mTLS では双方が証明書を提示**します。
+
+```text
+通常の TLS:
+  クライアント ──► サーバー証明書を検証 ──► サーバー
+                   「相手は本物のサーバーか」
+
+mTLS:
+  クライアント ◄─► 互いに証明書を検証 ◄─► サーバー
+                   「相手は本物のサーバーか」
+                   「接続元は許可されたクライアントか」
+```
+
+**レッスン 3 のプライベート CA が前提になります。** クライアント証明書を発行できる CA が必要だからです。
+
+---
+
+### nginx での設定
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name api.internal;
+
+    ssl_certificate     /etc/ssl/certs/api-fullchain.crt;
+    ssl_certificate_key /etc/ssl/private/api.key;
+
+    # ── ここから mTLS ──
+    ssl_client_certificate /etc/ssl/certs/internal-ca-chain.crt;  # 信頼する CA
+    ssl_verify_client on;           # 必須にする（optional なら任意）
+    ssl_verify_depth 2;             # ルート + 中間
+
+    location / {
+        # 検証結果とクライアントの識別情報を上流へ渡す
+        proxy_set_header X-SSL-Client-Verify $ssl_client_verify;
+        proxy_set_header X-SSL-Client-DN     $ssl_client_s_dn;
+        proxy_pass http://backend;
+    }
+}
+```
+
+---
+
+<h2 className="slide-cont">mTLS（続き）</h2>
+
+```bash
+# クライアント側から接続する
+curl --cert client.crt --key client.key --cacert internal-ca-chain.crt \
+  https://api.internal/health
+```
+
+<Callout type="warning" title="mTLS は認証であって認可ではない">
+
+レッスン 1 の区別がここでも効きます。
+
+**`ssl_verify_client on` が通ったということは、「内部 CA が発行した証明書を持っている」ことしか意味しません。** 内部 CA が発行した証明書を持つ**すべてのサービス**が通ってしまいます。
+
+```text
+✗ mTLS を通れば全操作を許可
+✓ 証明書の Subject / SAN を見て、どのサービスかを識別し、
+   そのサービスに許可された操作だけを通す
+```
+
+```nginx
+# 特定の CN のみ許可する例
+if ($ssl_client_s_dn !~ "CN=orders-worker") { return 403; }
+```
+
+より複雑な制御が必要なら、上流のアプリで `X-SSL-Client-DN` を見て判定します。**その場合、このヘッダをクライアントが偽装できないよう、nginx 側で必ず上書きする**（ネットワークコース レッスン 6 の `X-Forwarded-For` と同じ注意）必要があります。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">mTLS（続き）</h2>
+
+<Callout type="field">
+
+**mTLS の運用上の課題は、証明書の配布と更新です。**
+
+サービスが 100 個あれば 100 枚の証明書を配り、期限が来る前に更新しなければなりません。レッスン 3 で述べたとおり、**ACME による自動更新を前提に組む**のが唯一現実的な進め方です。
+
+```bash
+# step-ca で短命なクライアント証明書を取得し、自動更新する
+step ca certificate "orders-worker" client.crt client.key \
+  --provisioner acme --not-after 24h
+step ca renew --daemon client.crt client.key
+```
+
+手作業で配る運用は、**サービス数が二桁になった時点で破綻します**。
+
+</Callout>
+
+---
+
+## OAuth Client Credentials
+
+IdP（レッスン 5）がある環境では、**サービスも IdP から資格情報を得る**方式が使えます。
+
+```bash
+curl -s -X POST https://idp.internal/realms/corp/protocol/openid-connect/token \
+  -d "grant_type=client_credentials" \
+  -d "client_id=orders-worker" \
+  -d "client_secret=$SECRET" \
+  -d "scope=orders:write" | jq -r .access_token
+```
+
+```text
+ユーザーが介在しない（対話なし）ので、Authorization Code は使えない
+  → Client Credentials グラントを使う
+  → 返るのはアクセストークンのみ（ID トークンは返らない）
+```
+
+**利点は、レッスン 4 で作ったトークン検証の仕組みをそのまま使えること**です。API 側は人間のトークンもサービスのトークンも、同じ方法で検証できます。
+
+<Callout type="note">
+
+`client_secret` を持つということは、**結局シークレットの配布・管理が必要**という点では API キーと同じ問題を抱えます。
+
+これを解消するのが **mTLS によるクライアント認証**（RFC 8705）です。`client_secret` の代わりにクライアント証明書で認証すれば、共有シークレットが不要になります。Keycloak も対応しています。
+
+```text
+client_secret       → 漏れたら誰でも成りすませる
+クライアント証明書  → 秘密鍵はサーバーから出ない
+```
+
+</Callout>
+
+---
+
+## Kubernetes のワークロード ID
+
+AI 基盤コース レッスン 5 で扱った Kubernetes では、**Pod が自動的に ID を持ちます**。
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders-worker
+---
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: orders-worker
+  containers:
+  - name: app
+    image: orders-worker:1.4
+```
+
+Pod には、その ServiceAccount のトークンが自動でマウントされます。
+
+```bash
+cat /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+---
+
+<h2 className="slide-cont">Kubernetes のワークロード ID（続き）</h2>
+
+<Callout type="warning" title="旧来の Secret ベースのトークンは使わない">
+
+Kubernetes には 2 種類の ServiceAccount トークンがあります。
+
+| | **旧: Secret ベース** | **新: Bound Service Account Token** |
+| --- | --- | --- |
+| 有効期限 | **なし（永続）** | **あり（既定 1 時間、自動更新）** |
+| 対象（`aud`） | なし | **指定できる** |
+| Pod との紐付け | なし | **あり**（Pod が消えれば無効） |
+| etcd 上の保存 | **される** | されない |
+
+**旧来のトークンは無期限で、etcd から読めれば永久に使えます。** Kubernetes 1.24 以降、ServiceAccount 作成時に自動で Secret が作られなくなり、現在は Bound Token が標準です。
+
+```yaml
+# audience を指定した projected token（明示的に取得する場合）
+volumes:
+- name: token
+  projected:
+    sources:
+    - serviceAccountToken:
+        path: token
+        audience: orders-api          # このトークンは orders-api 向け
+        expirationSeconds: 3600
+```
+
+**`audience` を指定すると、そのトークンは指定した相手にしか使えません。** レッスン 4 の `aud` 検証がここでも効きます。万一漏れても、他の API では使えません。
+
+</Callout>
+
+### 外部サービスへの ID 提示
+
+Kubernetes の ServiceAccount トークンは **OIDC の ID トークンとして検証できます**。
+
+---
+
+<h2 className="slide-cont">Kubernetes のワークロード ID（続き）</h2>
+
+```bash
+# クラスタの OIDC discovery エンドポイント
+kubectl get --raw /.well-known/openid-configuration | jq .
+kubectl get --raw /openid/v1/jwks | jq .
+```
+
+これにより、**外部のサービス（Vault、クラウドの IAM など）が「この Pod は確かにこの ServiceAccount だ」を検証できます**。共有シークレットを配らずに、サービス間の信頼を作れます。
+
+```text
+Pod ──[ SA トークン ]──► Vault
+                           ↓ クラスタの JWKS で検証
+                         「orders-worker だと確認できた」
+                           ↓
+                        DB のパスワードを動的に発行（TTL 1時間）
+```
+
+---
+
+## シークレット管理
+
+<Callout type="field">
+
+**長命なシークレットを、短命な資格情報に置き換える**のが現在の方向です。
+
+| | 従来 | **現在** |
+| --- | --- | --- |
+| DB パスワード | 設定ファイルに固定値 | **Vault が動的発行（TTL 付き）** |
+| API キー | 発行したら使い続ける | 短命トークン + 自動更新 |
+| 証明書 | 1 年 | **24 時間 + ACME 自動更新** |
+| 漏洩時 | 気づくまで有効 | **TTL で自動失効** |
+
+```bash
+# Vault で DB の資格情報を動的に発行する例
+vault read database/creds/orders-role
+# username: v-k8s-orders-x7f2...
+# password: A1a-...
+# lease_duration: 1h          ← 1時間で自動的に無効になる
+```
+
+**「漏れないようにする」から「漏れても短時間で無効になる」への転換**です。レッスン 2 で見た証明書の短命化と、まったく同じ発想です。
+
+</Callout>
+
+### 最低限守ること
+
+Vault のような仕組みをすぐ入れられない場合でも、これだけは。
+
+```text
+✓ シークレットを Git に入れない（履歴に残るため、消しても残る）
+✓ 環境変数か、権限を絞ったファイル（0600）で渡す
+✓ ログに出力しない（運用コース レッスン 2）
+✓ 用途ごとに分ける（1 つ漏れても全部は漏れない）
+✓ ローテーション手順を用意しておく（手順がなければローテーションは起きない）
+```
+
+---
+
+<h2 className="slide-cont">シークレット管理（続き）</h2>
+
+<Callout type="pitfall">
+
+**「Git に入れてしまったシークレットは、消しても漏洩したものとして扱う」**のが原則です。
+
+コミットを取り消しても、履歴、フォーク、クローン、CI のキャッシュに残ります。**やるべきことは履歴の削除ではなく、そのシークレットのローテーション**です。
+
+この判断を即座にできるよう、**ローテーション手順を事前に用意しておいてください**。手順がない状態で事故が起きると、「影響が大きいから今は替えられない」となって放置されます。
+
+</Callout>
+
+---
+
+## まとめ
+
+- サービス認証は **MFA も対話もできない**。鍵か証明書しか使えない
+- **API キーは長命・共有・失効困難**。使うなら用途別・期限付き・棚卸し前提
+- **mTLS はプライベート CA（レッスン 3）が前提**。自動更新なしでは運用が破綻する
+- **mTLS を通ったことは認証にすぎない**。Subject を見て認可判定する
+- `X-SSL-Client-DN` は**プロキシ側で必ず上書き**する（偽装防止）
+- Client Credentials は IdP の検証基盤を再利用できる。**mTLS 併用で secret を無くせる**
+- Kubernetes では **Bound Service Account Token**（期限付き・`aud` 指定可）を使う
+- SA トークンは **OIDC として外部から検証できる**。共有シークレットを配らずに済む
+- 方向性は**長命シークレットから短命な動的資格情報へ**
+- **Git に入れたシークレットは、消すのではなくローテーションする**
+
+---
+
+<Quiz
+  id="q1"
+  question="内部 API に mTLS を導入し、ssl_verify_client on を設定しました。これだけで「許可されたサービスだけがアクセスできる」状態になりますか。"
+  options={[
+    "なる。証明書を持つサービスだけが接続できる",
+    "ならない。内部 CA が発行した証明書を持つ任意のサービスが通るため、証明書の Subject / SAN を見てどのサービスかを識別し、許可された操作だけを通す認可判定が別途必要",
+    "ならない。mTLS は暗号化のみを提供するため",
+    "なる。ただし証明書の有効期限内に限る"
+  ]}
+  answer={1}
+  explanation="ssl_verify_client on が検証しているのは「信頼する CA が発行した有効な証明書を提示したか」だけです。同じ内部 CA が発行した証明書を持つサービスはすべて通過します。レッスン 1 で扱った認証と認可の区別がここにも当てはまり、証明書の CN や SAN からクライアントを識別し、そのクライアントに許可された操作かを判定する処理が別途必要です。上流へ渡す X-SSL-Client-DN はクライアントが偽装できないよう、プロキシ側で必ず上書きします。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="設定ファイルに書いた DB のパスワードを誤って Git にコミットし、リモートへ push してしまいました。直後に気づいた場合、最優先で行うべきことはどれですか。"
+  options={[
+    "該当コミットを revert して履歴から消す",
+    "git filter-repo などで履歴を書き換えてから push --force する",
+    "そのパスワードを漏洩したものとして扱い、直ちにローテーションする",
+    "リポジトリを private に変更する"
+  ]}
+  answer={2}
+  explanation="push した時点で、フォーク、クローン、CI のキャッシュ、各種ミラーに残っている可能性があり、履歴の書き換えでは回収できません。したがって最優先はそのシークレットの無効化とローテーションです。履歴の整理は、漏洩を止める効果はないものの再発防止として後から行う意味はあります。このような場面で即断できるよう、平時からローテーション手順を用意しておくことが重要で、手順がないと「影響が大きいから替えられない」として放置されがちです。"
+/>

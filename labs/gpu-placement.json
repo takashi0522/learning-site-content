@@ -1,0 +1,199 @@
+{
+  "id": "gpu-placement",
+  "title": "GPU ジョブを配置する",
+  "subtitle": "同じ 8 GPU でも、どこに置くかで学習時間が変わる",
+  "goal": "GPU 間の通信がノード内で済むかノードを跨ぐかで、1 ステップの所要時間が桁で変わることを、配置を変えながら確かめる。",
+  "minutes": 12,
+  "status": "ready",
+  "mode": "place",
+  "accent": "ai",
+  "placement": {
+    "gradientGb": 10,
+    "links": {
+      "intra": {
+        "label": "NVLink（ノード内）",
+        "gbps": 900
+      },
+      "inter": {
+        "label": "InfiniBand（ノード間）",
+        "gbps": 50
+      }
+    },
+    "nodes": [
+      {
+        "id": "node-1",
+        "label": "ノード 1",
+        "sub": "8 GPU / NVSwitch",
+        "gpus": [
+          {
+            "id": "n1g0",
+            "label": "GPU 0",
+            "status": "free"
+          },
+          {
+            "id": "n1g1",
+            "label": "GPU 1",
+            "status": "free"
+          },
+          {
+            "id": "n1g2",
+            "label": "GPU 2",
+            "status": "free"
+          },
+          {
+            "id": "n1g3",
+            "label": "GPU 3",
+            "status": "free"
+          },
+          {
+            "id": "n1g4",
+            "label": "GPU 4",
+            "status": "free"
+          },
+          {
+            "id": "n1g5",
+            "label": "GPU 5",
+            "status": "free"
+          },
+          {
+            "id": "n1g6",
+            "label": "GPU 6",
+            "status": "free"
+          },
+          {
+            "id": "n1g7",
+            "label": "GPU 7",
+            "status": "free"
+          }
+        ]
+      },
+      {
+        "id": "node-2",
+        "label": "ノード 2",
+        "sub": "8 GPU / NVSwitch",
+        "gpus": [
+          {
+            "id": "n2g0",
+            "label": "GPU 0",
+            "status": "free"
+          },
+          {
+            "id": "n2g1",
+            "label": "GPU 1",
+            "status": "free"
+          },
+          {
+            "id": "n2g2",
+            "label": "GPU 2",
+            "status": "free"
+          },
+          {
+            "id": "n2g3",
+            "label": "GPU 3",
+            "status": "free"
+          },
+          {
+            "id": "n2g4",
+            "label": "GPU 4",
+            "status": "free"
+          },
+          {
+            "id": "n2g5",
+            "label": "GPU 5",
+            "status": "free"
+          },
+          {
+            "id": "n2g6",
+            "label": "GPU 6",
+            "status": "free"
+          },
+          {
+            "id": "n2g7",
+            "label": "GPU 7",
+            "status": "free"
+          }
+        ]
+      }
+    ],
+    "missions": [
+      {
+        "id": "m1",
+        "title": "8 GPU を確保する",
+        "brief": "8 GPU を使う学習ジョブを流します。ノードは 2 台あり、どちらも 8 GPU すべて空いています。どこから取っても同じでしょうか。まず 8 個選んで、右側の所要時間を見てください。",
+        "requirements": [
+          "GPU を 8 個選ぶ",
+          "ノード内の NVLink だけで済む配置にする"
+        ],
+        "need": 8,
+        "requireLink": "intra",
+        "hint": "2 つのノードに分かれています。ノードを 1 つでも跨ぐと、通信はノード間の InfiniBand を通ります。All-Reduce の速さは経路のうち最も遅いところで決まるので、ノード内がいくら速くても引きずられます。1 つのノードに寄せてください。",
+        "afterword": "NVLink は 900 GB/s。10GB の勾配を全 GPU で揃えるのに 19ms で済みます。1 万ステップでも 3 分ほどです。"
+      },
+      {
+        "id": "m2",
+        "title": "ノード 1 が埋まっている",
+        "brief": "ノード 1 の GPU が 2 つ、別のジョブに使われています。空いているのは 6 個だけ。それでも 8 GPU 必要です。選んでから、所要時間がどうなるか見てください。",
+        "requirements": [
+          "GPU を 8 個選ぶ",
+          "使えるものから選ぶ（空きは 6 + 8）"
+        ],
+        "need": 8,
+        "unavailable": [
+          {
+            "gpu": "n1g6",
+            "status": "busy"
+          },
+          {
+            "gpu": "n1g7",
+            "status": "busy"
+          }
+        ],
+        "hint": "空いている GPU を合計 8 個選んでください。",
+        "afterword": "ノードを跨いだ瞬間、実効帯域が 900 GB/s から 50 GB/s に落ちました。同じ 8 GPU、同じジョブで 19ms が 350ms。1 万ステップなら 3 分が 58 分になります。「GPU が空いていれば動く」は正しくても、「同じ速さで動く」は正しくありません。"
+      },
+      {
+        "id": "m3",
+        "title": "6+2 と 4+4 はどちらが速いか",
+        "brief": "ノードを跨ぐのが避けられないとき、分け方で差は出るでしょうか。6+2 と 4+4 の両方を試して、所要時間を比べてみてください。確定は好きなほうで構いません。",
+        "requirements": [
+          "GPU を 8 個選ぶ",
+          "分け方を変えて所要時間を比べる"
+        ],
+        "need": 8,
+        "unavailable": [
+          {
+            "gpu": "n1g6",
+            "status": "faulty"
+          },
+          {
+            "gpu": "n1g7",
+            "status": "faulty"
+          }
+        ],
+        "hint": "空いている GPU を合計 8 個選んでください。",
+        "afterword": "どちらも同じ 350ms です。ボトルネックはノード間リンクであって、何個ずつに分けたかではありません。だから「均等に分ければ速くなる」は成り立ちません。効くのは跨ぐかどうかの一点で、跨ぐなら何 GPU 分かれていても同じです。"
+      }
+    ]
+  },
+  "summary": [
+    "All-Reduce の速さは、経路のうち最も遅いリンクで決まる",
+    "1 ノードに収まれば NVLink の 900 GB/s、跨げば InfiniBand の 50 GB/s。18 倍の差",
+    "同じ 8 GPU・同じジョブでも、配置しだいで 1 ステップが 19ms にも 350ms にもなる",
+    "跨いでしまえば、6+2 でも 4+4 でも所要時間は同じ。効くのは跨ぐかどうかだけ",
+    "スケジューラが「空いている GPU」だけを見て配置すると、この差は防げない。だから Gang Scheduling とトポロジ認識が要る"
+  ],
+  "next": [
+    {
+      "label": "GPU コース レッスン 3 — 複数 GPU とインターコネクト",
+      "href": "/courses/gpu/multi-gpu-interconnect/"
+    },
+    {
+      "label": "AI 基盤コース レッスン 3 — NCCL のチューニング",
+      "href": "/courses/ai/nccl-tuning/"
+    },
+    {
+      "label": "AI 基盤コース レッスン 6 — ジョブスケジューリング",
+      "href": "/courses/ai/job-scheduling/"
+    }
+  ]
+}

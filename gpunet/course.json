@@ -1,0 +1,9 @@
+{
+  "title": "GPU ネットワーク",
+  "subtitle": "AI Fabric over Ethernet",
+  "description": "GPU 間の計算ファブリックを Ethernet で組むための一式を扱います。ロスレスをどう作るか、なぜ ECMP が偏るか、製品が何を足して解決しているか。InfiniBand との比較ではなく、Ethernet で成立させる側から書いています。",
+  "order": 8,
+  "accent": "gpunet",
+  "level": "応用",
+  "status": "ready"
+}

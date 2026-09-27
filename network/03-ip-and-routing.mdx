@@ -1,0 +1,288 @@
+---
+title: IP とルーティングの実際
+description: ルーティングテーブルの選択規則、複数 NIC での非対称経路、PMTU ブラックホールの診断を押さえます。
+order: 3
+minutes: 18
+tags: ["IP", "routing", "rp_filter", "PMTUD", "conntrack", "NAT"]
+objectives:
+  - ルーティングテーブルから、あるパケットがどこへ出ていくかを判断できる
+  - 複数 NIC 構成で通信できなくなる原因を rp_filter と経路から説明できる
+  - ICMP の遮断が引き起こす通信障害を診断できる
+references:
+  - label: "ip-route(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/ip-route.8.html"
+  - label: "ip-rule(8) — Policy routing"
+    url: "https://man7.org/linux/man-pages/man8/ip-rule.8.html"
+  - label: "RFC 1191 — Path MTU Discovery"
+    url: "https://www.rfc-editor.org/rfc/rfc1191.html"
+---
+
+## 経路はどう選ばれるか
+
+パケットの送り先は、ルーティングテーブルの**最長一致（longest prefix match）**で決まります。より具体的な（プレフィックス長の大きい）経路が優先されます。
+
+```bash
+ip route show
+```
+
+```text
+default via 10.0.0.1 dev eth0 proto static metric 100
+10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.15
+10.1.0.0/16 via 10.0.0.254 dev eth0 proto static
+192.168.50.0/24 dev eth1 proto kernel scope link src 192.168.50.10
+```
+
+宛先 `10.1.5.20` の場合、`10.1.0.0/16`（/16）と `default`（/0）が一致しますが、**より長い /16 が選ばれます**。
+
+推測せずに、カーネルに直接聞くのが確実です。
+
+```bash
+# このパケットはどの経路・どの送信元 IP で出るか
+ip route get 10.1.5.20
+# 10.1.5.20 via 10.0.0.254 dev eth0 src 10.0.0.15 uid 0
+
+# 送信元を指定した場合の挙動も確認できる
+ip route get 8.8.8.8 from 192.168.50.10
+```
+
+<Callout type="tip">
+
+`ip route get` は経路調査の最短経路です。テーブルを目で追って読み違えるより速く、policy routing（後述）まで含めた**実際の判断結果**が返ります。
+
+</Callout>
+
+---
+
+## 複数 NIC でハマる: 非対称経路
+
+サーバーに 2 枚の NIC があり、それぞれ別セグメントに繋がっている構成はよくあります。ここで典型的な問題が起きます。
+
+```text
+eth0: 10.0.0.15/24    デフォルトゲートウェイ 10.0.0.1
+eth1: 192.168.50.10/24  （業務用セグメント、GW 192.168.50.1）
+
+外部の 203.0.113.5 から 192.168.50.10 宛にアクセスすると…
+```
+
+```text
+① 受信: 203.0.113.5 → 192.168.50.10   （eth1 から入る）
+② 応答: 192.168.50.10 → 203.0.113.5
+   ルーティングテーブルを引くと default しかない
+   → eth0 から出ていこうとする              ← 入口と出口が違う
+```
+
+これが**非対称経路**です。ファイアウォールやスイッチが「行きと帰りで経路が違う」通信を不正とみなして落とすため、**接続できたりできなかったりする**不安定な状態になります。
+
+### rp_filter
+
+Linux 自身にも同種の防御機構があります。**リバースパス フィルタ**です。
+
+```bash
+sysctl net.ipv4.conf.all.rp_filter
+sysctl net.ipv4.conf.eth1.rp_filter
+```
+
+| 値 | 動作 |
+| --- | --- |
+| `0` | 無効 |
+| `1` | **Strict**: 受信インターフェースが、その送信元へ返すときの経路と一致しなければ破棄 |
+| `2` | Loose: どこかのインターフェースから返せるなら許可 |
+
+---
+
+<h2 className="slide-cont">複数 NIC でハマる: 非対称経路（続き）</h2>
+
+`1`（strict）の環境では、上の例のパケットは**カーネルが黙って捨てます**。ログも残らないため、`tcpdump` では届いているのにアプリには来ない、という状況になります。
+
+<Callout type="field">
+
+**`tcpdump` では見えるのに、アプリケーションに届かない。** この症状が出たら `rp_filter` を疑ってください。`tcpdump` は入口に近い位置でパケットを見るため、その後カーネルに破棄されても捕まえられます。
+
+```bash
+# 破棄されたパケットの統計
+nstat -az | grep -i martian
+# IpInAddrErrors / IpExtInMartianSrc などが増えていないか
+```
+
+</Callout>
+
+### 正しい解き方: policy routing
+
+`rp_filter` を無効化するのは対症療法です。根本的には、**入ってきたインターフェースから返す**ようにルーティングを分けます。
+
+```bash
+# 1. テーブル名を定義（任意）
+echo "100 eth1table" | sudo tee -a /etc/iproute2/rt_tables
+
+# 2. eth1 用のテーブルに、そのセグメントとデフォルト経路を入れる
+sudo ip route add 192.168.50.0/24 dev eth1 src 192.168.50.10 table eth1table
+sudo ip route add default via 192.168.50.1 dev eth1 table eth1table
+
+# 3. 送信元が 192.168.50.10 のパケットは、このテーブルを使う
+sudo ip rule add from 192.168.50.10 table eth1table
+
+# 確認
+ip rule show
+ip route show table eth1table
+ip route get 203.0.113.5 from 192.168.50.10    # eth1 から出れば成功
+```
+
+---
+
+<h2 className="slide-cont">複数 NIC でハマる: 非対称経路（続き）</h2>
+
+これで「eth1 に来た通信は eth1 から返る」状態になり、非対称経路も `rp_filter` の破棄も解消します。
+
+---
+
+## PMTU ブラックホール
+
+レッスン 2 で MTU 不一致を扱いました。IP には本来、これを自動解決する仕組みがあります。
+
+### Path MTU Discovery の仕組み
+
+```text
+1. 送信側は分割禁止（DF）ビットを立ててパケットを送る
+2. 経路上の MTU が小さいルータが、そのパケットを転送できない
+3. ルータは ICMP「Fragmentation Needed」(Type 3, Code 4) を返す
+   このメッセージには「私の MTU は 1400 です」という情報が含まれる
+4. 送信側は経路 MTU を 1400 に記憶し、以降は小さく送る
+```
+
+**この仕組みは ICMP が返ってくることに完全に依存しています。**
+
+<Callout type="warning" title="ICMP を全部塞ぐとこうなる">
+
+「ICMP はセキュリティ上危険だから全部拒否」という設定は、PMTUD を壊します。
+
+```text
+1. 送信側が 1500 バイトで送る
+2. 途中のルータが転送できず破棄
+3. ICMP が途中のファイアウォールで塞がれ、送信側に届かない
+4. 送信側は「応答がない」として再送を繰り返す
+5. 何度送っても同じサイズなので、永久に通らない
+```
+
+これが **PMTU ブラックホール**です。症状はレッスン 2 の MTU 不一致と同じ「小さい通信は通るが大きい通信が固まる」ですが、原因は ICMP の遮断側にあります。
+
+**ICMP Type 3 Code 4（Fragmentation Needed）は必ず通してください。** ICMP echo（ping）を塞ぐかどうかとは別の話です。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">PMTU ブラックホール（続き）</h2>
+
+```bash
+# カーネルが学習した経路 MTU のキャッシュ
+ip route get 203.0.113.5
+# 203.0.113.5 via 10.0.0.1 dev eth0 src 10.0.0.15 mtu 1400   ← 学習済み
+
+# キャッシュをクリアして再学習させる
+sudo ip route flush cache
+```
+
+### 回避策: MSS クランプ
+
+VPN やトンネル（IPsec、GRE、VXLAN）では、カプセル化のヘッダ分だけ実効 MTU が減ります。相手側の PMTUD に依存せず、**TCP の 3 ウェイハンドシェイク時に MSS を書き換えて**小さく申告させる方法が確実です。
+
+```bash
+# 経路の MTU に合わせて MSS を自動調整する
+sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN \
+  -j TCPMSS --clamp-mss-to-pmtu
+
+# nftables の場合
+# nft add rule inet filter forward tcp flags syn tcp option maxseg size set rt mtu
+```
+
+トンネルを扱う機器では、ほぼ必須の設定です。
+
+---
+
+## NAT と conntrack
+
+NAT は「アドレスを書き換える」だけではなく、**戻りの通信を元に戻すための状態表**を持つ必要があります。それが **conntrack**（コネクション追跡）です。
+
+```bash
+# 現在追跡中のコネクション数と上限
+sysctl net.netfilter.nf_conntrack_count
+sysctl net.netfilter.nf_conntrack_max
+
+# 中身を見る
+sudo conntrack -L | head
+sudo conntrack -S      # CPU ごとの統計（insert_failed, drop に注目）
+```
+
+<Callout type="pitfall" title="nf_conntrack: table full">
+
+テーブルが上限に達すると、カーネルログにこのメッセージが出て、**新規の通信が確立できなくなります**。
+
+```bash
+dmesg | grep -i conntrack
+# nf_conntrack: nf_conntrack: table full, dropping packet
+```
+
+高トラフィックの NAT ゲートウェイやロードバランサで起きます。対処は 2 方向です。
+
+```bash
+# ① 上限を上げる（メモリ消費も増える。1エントリ約 300 バイト）
+sudo sysctl -w net.netfilter.nf_conntrack_max=1048576
+
+# ② タイムアウトを短くして回転を速める
+sysctl net.netfilter.nf_conntrack_tcp_timeout_established   # 既定 432000 秒 = 5日
+sudo sysctl -w net.netfilter.nf_conntrack_tcp_timeout_established=86400
+```
+
+既定の 5 日は長すぎることがほとんどです。ただし短くしすぎると、長時間アイドルする正常な接続（DB のコネクションプールなど）が切られます。**アプリ側の TCP keepalive 間隔より長く**設定してください。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">NAT と conntrack（続き）</h2>
+
+<Callout type="note">
+
+NAT を使っていなくても、`iptables`/`nftables` で `conntrack` を参照するルール（`-m state --state ESTABLISHED,RELATED` など）があれば追跡は動きます。純粋なルータやロードバランサで追跡が不要なら、`NOTRACK` で対象を外すと負荷が下がります。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 経路は**最長一致**で決まる。判断は `ip route get` にやらせる
+- 複数 NIC では非対称経路が起きる。`rp_filter=1` はそれを**黙って破棄**する
+- **`tcpdump` では見えるのにアプリに届かない**なら `rp_filter` を疑う
+- 根本対処は policy routing（`ip rule` + 専用テーブル）で「入った口から返す」
+- PMTUD は ICMP Type 3 Code 4 に依存する。**これを塞ぐとブラックホールになる**
+- トンネル経由では MSS クランプが確実な解
+- NAT/ステートフルフィルタでは `nf_conntrack_max` とタイムアウトが実質的な同時接続上限
+
+<Quiz
+  id="q1"
+  question="eth1 側のセグメントから届く通信が不安定です。tcpdump では該当パケットが確認できますが、アプリケーションには届きません。サーバーには eth0 側にのみデフォルトゲートウェイがあります。最も疑わしい原因はどれですか。"
+  options={[
+    "アプリケーションが listen していない",
+    "rp_filter が strict で動作しており、応答経路と受信インターフェースが一致しないパケットをカーネルが破棄している",
+    "MTU が不一致である",
+    "conntrack テーブルが溢れている"
+  ]}
+  answer={1}
+  explanation="tcpdump はカーネルの処理より手前でパケットを捕捉するため、その後 rp_filter に破棄されても表示されます。デフォルトゲートウェイが eth0 側にしかないと、eth1 で受けた通信の応答経路は eth0 になり、strict モードの rp_filter が入口の不一致を理由に破棄します。policy routing で「入った口から返す」構成にするのが根本対処です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="セキュリティ強化のためファイアウォールで ICMP を全面的に拒否したところ、一部の通信で「接続はできるが大きなデータ転送で固まる」現象が発生しました。原因はどれですか。"
+  options={[
+    "ping による死活監視が失敗しているため",
+    "Path MTU Discovery が依存する ICMP Fragmentation Needed が届かず、送信側が経路 MTU を学習できないため",
+    "ARP が ICMP で行われているため",
+    "TCP の再送が ICMP で通知されるため"
+  ]}
+  answer={1}
+  explanation="PMTUD は、経路上のルータが返す ICMP Type 3 Code 4（Fragmentation Needed）によって成立します。これが遮断されると送信側は MTU を学習できず、大きいパケットを送り続けて破棄され、再送を繰り返す PMTU ブラックホールに陥ります。ICMP echo を塞ぐのとは別の判断が必要で、Type 3 Code 4 は必ず通す必要があります。"
+/>

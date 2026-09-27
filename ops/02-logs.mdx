@@ -1,0 +1,299 @@
+---
+title: ログを読む・残す
+description: journalctl を絞り込んで使い、ログを消さずに溜めすぎない設定を組み立てられるようにします。
+order: 2
+minutes: 17
+tags: ["journalctl", "journald", "logrotate", "rsyslog"]
+objectives:
+  - journalctl の絞り込みを組み合わせて目的のログに最短で辿り着ける
+  - 再起動でログが消える設定かどうかを判断し、永続化できる
+  - logrotate の設定を読み、ローテート後もアプリが書き続ける構成にできる
+references:
+  - label: "journalctl(1) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man1/journalctl.1.html"
+  - label: "journald.conf(5)"
+    url: "https://www.freedesktop.org/software/systemd/man/latest/journald.conf.html"
+  - label: "logrotate(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/logrotate.8.html"
+---
+
+## journalctl は絞り込みを組み合わせる
+
+`journalctl` をページャで延々スクロールしているなら、使い方を変えるだけで調査時間が桁で変わります。**絞り込みは組み合わせられます。**
+
+```bash
+# 単体で使う条件
+journalctl -u nginx.service        # ユニット
+journalctl -k                      # カーネルのみ
+journalctl -p err                  # 優先度 err 以上
+journalctl --since "10 min ago"    # 期間
+journalctl -b                      # 今回の起動分
+journalctl _PID=1234               # プロセス ID
+journalctl /usr/sbin/sshd          # 実行ファイル
+
+# 組み合わせる（AND になる）
+journalctl -u nginx.service -p err --since "today" --no-pager
+journalctl -u myapp.service -b --since "14:00" --until "14:30"
+```
+
+覚えておくと効くオプションです。
+
+| オプション | 効果 |
+| --- | --- |
+| `-f` | 追尾（`tail -f` 相当） |
+| `-e` | **末尾にジャンプして開く**。最新を見たいときの既定にすべき |
+| `-r` | 新しい順に表示 |
+| `--no-pager` | ページャを使わない。スクリプトやコピー時に必須 |
+| `-o short-iso` | タイムスタンプを ISO 形式（他システムのログと突き合わせやすい） |
+| `-o json-pretty` | 全フィールドを見る。どんなメタデータがあるか確認するとき |
+| `-g <正規表現>` | メッセージ本文を正規表現で検索 |
+
+---
+
+<h2 className="slide-cont">journalctl は絞り込みを組み合わせる（続き）</h2>
+
+```bash
+# 実務でよく打つ形
+journalctl -u myapp.service -e -o short-iso
+journalctl -b -p warning --no-pager | tail -50
+journalctl -k -g 'Xid|EDAC|Machine Check'
+```
+
+<Callout type="tip">
+
+`-o json-pretty` で 1 件見てみると、`_SYSTEMD_UNIT`、`_PID`、`_UID`、`_COMM`、`_HOSTNAME` などのフィールドが付いていることが分かります。これらは `journalctl _UID=1000` のようにそのまま絞り込み条件に使えます。
+
+grep で頑張る前に、**構造化されたフィールドで絞れないか**を考えてください。
+
+</Callout>
+
+---
+
+## 再起動でログが消える設定になっていないか
+
+これは必ず確認してください。**既定でメモリ上（`/run/log/journal`）にしか保存されない環境があります。** その場合、再起動すると過去のログは全部消えます。
+
+```bash
+# 永続化されているかの判定
+ls -d /var/log/journal 2>/dev/null && echo "永続化されている" || echo "揮発。再起動で消える"
+
+# 保持されている期間と使用量
+journalctl --disk-usage
+journalctl --list-boots | head
+```
+
+`--list-boots` に過去の起動が並んでいなければ、揮発設定です。
+
+### 永続化する
+
+```bash
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal
+sudo systemctl restart systemd-journald
+```
+
+設定ファイルで明示するほうが確実です。
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/persist.conf > /dev/null <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=2G
+SystemMaxFileSize=128M
+MaxRetentionSec=30day
+EOF
+sudo systemctl restart systemd-journald
+```
+
+---
+
+<h2 className="slide-cont">再起動でログが消える設定になっていないか（続き）</h2>
+
+| 設定 | 意味 |
+| --- | --- |
+| `Storage=persistent` | `/var/log/journal` に保存（ディレクトリも自動作成） |
+| `SystemMaxUse` | ジャーナル全体の上限。**既定はファイルシステムの 10%** |
+| `MaxRetentionSec` | この期間より古いものは消す |
+
+<Callout type="warning" title="既定の上限はファイルシステムの 10%">
+
+`SystemMaxUse` を指定しないと、`/var` が 500GB あるサーバーではジャーナルが **50GB まで膨らみます**。`/var` が逼迫する原因になります。
+
+逆に、上限に達したときの挙動は「古いものから削除」なので、ログが書けなくなることはありません。**サイズを明示して、想定内に収めてください。**
+
+</Callout>
+
+### 手動で減らす
+
+```bash
+# 500MB を超える分を古い順に削除
+sudo journalctl --vacuum-size=500M
+
+# 7日より古いものを削除
+sudo journalctl --vacuum-time=7d
+```
+
+容量逼迫の応急処置として使えます。ただし、根本は `SystemMaxUse` の設定です。
+
+---
+
+## logrotate: ファイルに書くログ
+
+journald を使わず自前でファイルに書くアプリケーション（nginx、Apache、多くのミドルウェア）は `logrotate` で管理します。
+
+```bash
+# 設定の場所
+cat /etc/logrotate.conf
+ls /etc/logrotate.d/
+
+# 実行状態（最後にいつローテートしたか）
+cat /var/lib/logrotate/logrotate.status | head
+```
+
+典型的な設定です。
+
+```text
+/var/log/nginx/*.log {
+    daily                # 日次
+    rotate 30            # 30世代保持
+    missingok            # ファイルがなくてもエラーにしない
+    notifempty           # 空ならローテートしない
+    compress             # gzip 圧縮する
+    delaycompress        # 1世代目は圧縮しない（書き込み中の可能性があるため）
+    create 0640 nginx adm
+    sharedscripts
+    postrotate
+        # ローテート後、アプリにファイルを開き直させる
+        [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid)
+    endscript
+}
+```
+
+### なぜ postrotate が必要か
+
+Linux コース レッスン 4 の内容が、そのままここに効きます。
+
+`logrotate` は既定で、ログファイルを `mv`（リネーム）してから新しいファイルを作ります。しかし**アプリケーションは inode を掴んだままなので、リネーム後の古いファイルに書き続けます**。
+
+---
+
+<h2 className="slide-cont">logrotate: ファイルに書くログ（続き）</h2>
+
+```text
+1. access.log を access.log.1 にリネーム    ← nginx は同じ inode に書き続ける
+2. 新しい access.log を作成                 ← 誰も書かない空ファイル
+3. postrotate で nginx にシグナル           ← ここで初めて新ファイルを開き直す
+```
+
+**`postrotate` がないと、新しいログファイルは永久に空のまま**で、実際のログは `access.log.1` に書かれ続けます。さらに 30 世代分ローテートされて削除されると、Linux コース レッスン 4 で扱った「削除済みだが開かれたまま」の状態になり、**ディスクだけが埋まって `du` では見えなくなります**。
+
+<Callout type="pitfall">
+
+`df` と `du` が食い違い、`/var` が埋まっていく — これの多くはログローテートの設定ミスです。
+
+```bash
+# 削除済みだが開かれたままのファイルを探す
+sudo lsof +L1 | grep -i log
+```
+
+`NLINK` が 0 のログファイルが出てきたら確定です。アプリにシグナルを送るか再起動すれば解放されます。
+
+</Callout>
+
+### copytruncate という選択肢
+
+アプリがシグナルに対応していない場合の代替です。
+
+```text
+    copytruncate
+```
+
+ファイルをコピーしてから元ファイルを 0 バイトに切り詰めるため、inode が変わらず、アプリは何も知らずに書き続けられます。
+
+ただし、**コピーと切り詰めの間に書かれたログは失われます**。監査ログのように欠落が許されない用途には使えません。可能なら `postrotate` でシグナルを送る方式を選んでください。
+
+---
+
+### テストする
+
+```bash
+# 実際には実行せず、何が起きるかだけ表示（-d = debug）
+sudo logrotate -d /etc/logrotate.d/nginx
+
+# 強制実行（日次の条件を無視して今すぐ）
+sudo logrotate -vf /etc/logrotate.d/nginx
+```
+
+`-d` で確認してから `-vf` で試すのが安全な順序です。
+
+---
+
+## ログを集約する
+
+サーバーが増えると、1 台ずつ入って調べるのは現実的でなくなります。また、**侵害されたサーバーのログはそのサーバー上では信用できません**。
+
+```bash
+# journald から rsyslog へ転送し、rsyslog からリモートへ送る構成が一般的
+sudo tee /etc/rsyslog.d/90-forward.conf > /dev/null <<'EOF'
+# TCP で集約サーバーへ転送（@@ が TCP、@ が UDP）
+*.* @@logserver.example.com:514
+EOF
+sudo systemctl restart rsyslog
+```
+
+<Callout type="field">
+
+集約を入れる場合、**転送先が落ちたときの挙動**を必ず確認してください。ディスクキューを設定していないと、転送先の障害時にログがメモリに溜まり続け、最悪の場合ログ送信元のサーバーごと不安定になります。
+
+```text
+# rsyslog でディスクキューを使う例
+$ActionQueueType LinkedList
+$ActionQueueFileName fwd_queue
+$ActionQueueMaxDiskSpace 1g
+$ActionResumeRetryCount -1
+```
+
+「ログ基盤の障害がサービス障害に波及する」のは避けたい構成です。
+
+</Callout>
+
+---
+
+## まとめ
+
+- `journalctl` は**絞り込みの組み合わせ**で使う。`-u` `-p` `-k` `--since` `-e` `-g`
+- `-o json-pretty` で使えるフィールドを知り、grep より前に構造化検索を試す
+- **`/var/log/journal` がなければログは再起動で消える**。`Storage=persistent` を明示する
+- `SystemMaxUse` 未指定だとファイルシステムの 10% まで膨らむ
+- **`postrotate` がないとローテート後のログが空のまま**になり、ディスクだけ埋まる
+- `df` と `du` の食い違いは `lsof +L1` で確認する
+- 集約する場合、転送先障害時にログ送信元を巻き込まない設定にする
+
+<Quiz
+  id="q1"
+  question="logrotate で日次ローテートを設定しましたが、新しい access.log が空のままで、ディスク使用量だけが増え続けています。原因はどれですか。"
+  options={[
+    "compress の設定が抜けている",
+    "postrotate でアプリケーションにシグナルを送っておらず、アプリがリネーム前の inode に書き続けている",
+    "rotate の世代数が多すぎる",
+    "journald が二重にログを保存している"
+  ]}
+  answer={1}
+  explanation="logrotate は既定でファイルをリネームして新規作成しますが、アプリケーションは開いているファイル記述子（inode）に書き続けるため、リネーム後の古いファイルに出力が続きます。postrotate でシグナルを送ってファイルを開き直させる必要があります。さらに古い世代が削除されると「削除済みだが開かれたまま」となり、df だけが増えて du では見えない状態になります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="予期しない再起動の原因を調べようと journalctl --list-boots を実行したところ、現在の起動しか表示されませんでした。何を意味しますか。"
+  options={[
+    "ログの優先度フィルタが効いている",
+    "journald が揮発ストレージ（/run/log/journal）にしか保存しておらず、再起動前のログが失われている",
+    "ディスクが満杯でログが書けていない",
+    "journalctl の権限が不足している"
+  ]}
+  answer={1}
+  explanation="/var/log/journal ディレクトリが存在しない環境では、journald はログをメモリ上の /run/log/journal にのみ保存し、再起動で消えます。過去の起動が一覧に出ないのはこの状態です。Storage=persistent を設定してディレクトリを作れば永続化されますが、既に失われたログは戻りません。サーバー構築時に確認しておくべき項目です。"
+/>

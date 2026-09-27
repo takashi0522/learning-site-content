@@ -1,0 +1,434 @@
+---
+title: リファレンスアーキテクチャを読む
+description: BasePOD / SuperPOD / NVL72 / NVL8 の違いと、スケーラブルユニットという単位の意味を整理します。
+order: 1
+minutes: 28
+tags: ["DGX BasePOD", "DGX SuperPOD", "NVL72", "NVL8", "Enterprise RA", "NVIDIA-Certified", "Scalable Unit"]
+objectives:
+  - BasePOD / SuperPOD / Enterprise RA のどれを読むかを判断できる
+  - NVL72 と NVL8 の違いを、NVLink ドメインのサイズとして説明できる
+  - スケーラブルユニット（SU）という単位で規模を考えられる
+  - OEM サーバーで組む場合にどの RA を読むかを判断できる
+  - リファレンスアーキテクチャから逸脱するときのリスクを説明できる
+references:
+  - label: "NVIDIA DGX BasePOD — Architecture"
+    url: "https://docs.nvidia.com/dgx-basepod/deployment-guides/dgx-basepod-a100/latest/architecture.html"
+  - label: "NVIDIA DGX SuperPOD — Architecture (B200)"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/dgx-superpod-architecture.html"
+  - label: "NVIDIA DGX SuperPOD Rubin NVL8 — Key Components (SU = 72 ノード)"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/dgx-superpod-components.html"
+  - label: "NVIDIA DGX SuperPOD Rubin NVL8 — Network Fabrics"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/network-fabrics.html"
+  - label: "NVIDIA Enterprise Reference Architectures"
+    url: "https://www.nvidia.com/en-us/technologies/enterprise-reference-architecture/"
+  - label: "NVIDIA HGX AI Factory (H100/H200/B200) — Overview"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/overview.html"
+  - label: "NVIDIA DGX BasePOD (B200/H200/H100) — Overview (2 ノードから数十ノード)"
+    url: "https://docs.nvidia.com/dgx-basepod/reference-architecture-infrastructure-foundation-enterprise-ai/latest/dgx-basepod-overview.html"
+  - label: "NVIDIA DGX BasePOD (B200/H200/H100) — Reference Architectures (2〜8 ノード)"
+    url: "https://docs.nvidia.com/dgx-basepod/reference-architecture-infrastructure-foundation-enterprise-ai/latest/reference-architectures.html"
+  - label: "NVIDIA DGX SuperPOD Rubin NVL8 — Architecture (1 ラック約 225kW)"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/dgx-superpod-architecture.html"
+  - label: "NVIDIA DGX Rubin NVL8 (製品ページ、約 24kW、Xeon 6776P × 2)"
+    url: "https://www.nvidia.com/en-us/data-center/dgx-rubin-nvl8/"
+  - label: "NVIDIA Technical Blog — Inside the NVIDIA Rubin Platform"
+    url: "https://developer.nvidia.com/blog/inside-the-nvidia-rubin-platform-six-new-chips-one-ai-supercomputer/"
+  - label: "NVIDIA-Certified Systems (Certification Programs)"
+    url: "https://docs.nvidia.com/certification-programs/latest/nvidia-certified-systems.html"
+  - label: "NVIDIA DGX SuperPOD (B200) — Network Fabrics (SU と違う台数の組み方)"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html"
+  - label: "NVIDIA HGX AI Factory — Node Configurations (ノードの NIC 構成)"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/appendix-node-configurations.html"
+  - label: "NVIDIA HGX AI Factory — Components (GPU と NIC は 1:1 を推奨)"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/components.html"
+  - label: "NVIDIA HGX AI Factory — Networking Physical Topologies (物理ネットワークは 3 系統)"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/networking-physical-topologies.html"
+  - label: "NVIDIA Enterprise RA White Paper — Design Tenets (2-8-9-400 のような表記の意味)"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/white-paper/latest/design-tenets.html"
+  - label: "NVIDIA DGX SuperPOD (B200) — Key Components (4 SU まで試験済み)"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/dgx-superpod-components.html"
+  - label: "NVIDIA HGX Platform (Vera CPU と x86 CPU の構成)"
+    url: "https://www.nvidia.com/en-us/data-center/hgx/"
+  - label: "NVIDIA CUDA — GPUDirect RDMA (PCIe トポロジと性能)"
+    url: "https://docs.nvidia.com/cuda/gpudirect-rdma/index.html"
+  - label: "Dell — 2-8-9-400 Configuration ERA Endorsed for the Dell AI Factory with NVIDIA"
+    url: "https://www.delltechnologies.com/asset/en-us/solutions/infrastructure-solutions/briefs-summaries/nvidia-2-8-9-400-configuration-era-endorsed-for-the-dell-ai-factory-with-nvidia-brief.pdf"
+  - label: "NVIDIA DGX SuperPOD (製品ページ)"
+    url: "https://www.nvidia.com/en-us/data-center/dgx-superpod/"
+  - label: "NVIDIA DGX B200 User Guide — Introduction (10U、最大 14.3kW)"
+    url: "https://docs.nvidia.com/dgx/dgxb200-user-guide/introduction-to-dgxb200.html"
+---
+
+## なぜ「決まった構成」で売られるのか
+
+GPU サーバーは、単体で買ってきてラックに載せれば動く、という機材ではありません。NVIDIA は、構成をまるごと定義した **リファレンスアーキテクチャ**（RA）を、試験済みの構成として出しています。RA が決めているのは、主に次の 3 つです。
+
+- **ノード内**の GPU 間接続（NVLink / NVSwitch）
+- **ノード間**の集合通信ファブリック（InfiniBand または Ethernet）
+- それを支える**電力・冷却・配線**
+
+どれか 1 つを自己流にすると、他の 2 つが揃っていても学習時間が伸びることがあります。GPU コース レッスン 3 で見たとおり、集合通信の帯域は学習時間に効くためです。
+
+<Callout type="field">
+
+**「RA どおりに買う」のは思考停止ではありません。**
+
+RA は、NVIDIA が試験した構成です。外すと、性能が出なかったときに切り分けを自分で背負うことになります。
+
+一方で、RA をそのまま買えないことも普通にあります。既存のデータセンターに収める、既存のストレージを使う、ネットワーク機器のベンダーを揃える、といった事情があるためです。
+
+**大事なのは「どこを変えたか」を意識しておくこと**です。変更点が 1 つなら、性能が出ないときに疑う場所が 1 つで済みます。
+
+</Callout>
+
+---
+
+## 3 つの系列と、別の軸
+
+NVIDIA のリファレンスアーキテクチャは、**どのサーバーを買うか**と規模で系列が分かれます。世代によって製品名も構成も変わるので、**必ず「どの世代の RA か」を確認してから読んでください。**
+
+| 系列 | サーバー | 規模（世代の例） |
+| --- | --- | --- |
+| **DGX BasePOD** | NVIDIA 製 DGX | B200/H200/H100 世代の RA は構成表が 2〜8 ノード。概要には「2 ノードから数十ノード」 |
+| **DGX SuperPOD** | NVIDIA 製 DGX | B200 世代は 4 SU = 128 ノードまで試験済み。64 SU・2,000 ノード超まで拡張できるとしている |
+| **Enterprise RA** | **OEM の認証サーバー** | HGX AI Factory（HGX H100/H200/B200）の RA は 4〜128 ノード。Dell / HPE などで組む |
+
+**NVL72 は、これらと並ぶ系列ではなく別の軸です。** Enterprise RA の中にも NVL72 の RA（NVL72 AI Factory）があり、Rubin 世代の SuperPOD も Vera Rubin NVL72 で組めます。NVL72 か NVL8 かは、次の節で見る NVLink ドメインの粒度の違いです。
+
+**自分が買うサーバーによって、読む RA が変わります。** Enterprise RA は後の節で扱います。
+
+<Callout type="note" title="世代が変わると数字が変わる">
+
+このレッスンで挙げる具体的な数字は、**その RA が対象にしている世代のもの**です。
+
+例えば BasePOD の A100 世代では計算ファブリックが ConnectX-6 と Quantum QM8700 による HDR 200Gbps でしたが、後の世代では NIC もスイッチも速度も変わります。
+
+**型番と速度は必ず自分が導入する世代の RA で確認してください。** 構成の考え方は引き継がれますが、数字は引き継がれません。
+
+</Callout>
+
+---
+
+## NVL の数字は世代ではない
+
+Rubin 世代の **`NVL72`** と **`NVL8`** の数字は、性能の序列でも世代でもありません。どちらも、**NVLink でつながる GPU の枚数**と一致しています。NVIDIA が命名規則として定義した文書は見当たらないので、ほかの製品名にまで一般化はしないでください。
+
+- **Vera Rubin NVL72** … 72 枚の GPU が NVLink 6 で 1 つのアクセラレータとして動く。**ラックまるごとが 1 台の計算機**として振る舞う
+- **Rubin NVL8** … 8 枚の GPU を載せた、**従来の HGX / DGX と同じサーバー 1 台**の形
+
+つまり NVL8 は NVL72 の後継ではありません。**同じ世代の、粒度が小さいほうの系列**です。Rubin 世代には Vera Rubin NVL72 と Rubin NVL8 が並んで存在します。
+
+<Callout type="pitfall">
+
+**数字が大きいほうが上位機種、という読み方をしないでください。**
+
+選ぶ基準は「速いほう」ではなく、**モデルが 8 枚の GPU に収まるか**です。収まるなら NVL8 で足ります。収まらない場合に、NVLink ドメインの大きい NVL72 が要る、という順で考えます。
+
+</Callout>
+
+---
+
+## 粒度が変わると、設計のどこが変わるか
+
+| Rubin 世代 | NVL72（ラック粒度） | NVL8（ノード粒度） |
+| --- | --- | --- |
+| NVLink ドメイン | 72 GPU | 8 GPU |
+| 納品の単位 | **ラック** | **サーバー** |
+| CPU | Vera CPU | **x86 も選べる** |
+| ラックの設計 | 製品として決まっている | **自分で決める** |
+
+**① ラックを設計する作業が残るかどうか。** NVL72 はラックそのものが製品なので、こちらで主に決めるのは電力・冷却・搬入です。NVL8 は 1 ラックに何台載せるかを自分で決めます。レッスン 3 の計算がそのまま必要になります。
+
+---
+
+<h2 className="slide-cont">粒度が変わると、設計のどこが変わるか（続き）</h2>
+
+**② CPU 側の自由度。** DGX Rubin NVL8 は Intel Xeon 6776P を 2 基積む x86 機です。**既存の OS 配布・監視・認証基盤を持ち込めるかを検討する余地があります。** 実際に持ち込めるかは、サポートされる OS と管理ソフトで確かめます。
+
+**③ SU の大きさが違う。** DGX SuperPOD Rubin NVL8 の RA では **1 SU = 72 ノード（576 GPU）**、検証済みの最大が **16 SU = 9,216 GPU** です。この後で見る B200 世代（1 SU = 32 ノード）とは数字が違います。**SU という考え方は共通ですが、塊の大きさは RA ごとに読み直してください。**
+
+<Callout type="warning" title="粒度が小さい = 密度が低い、ではない">
+
+DGX Rubin NVL8 は、製品ページの公称で **1 台約 24kW** です（製品ページは暫定値としています）。SuperPOD の RA の参照設計では 1 ラックに 8 台を収め、**ラックあたりの消費電力を約 225kW** としています。
+
+同じ RA の部品の説明では、電源シェルフは N+N 冗長で**最大 220kW を供給できる**とあり、2 つの数字は一致していません。どちらにしても、このあと「桁が違う」として挙げる 25kW を大きく上回ります。
+
+**ノード単位で買える製品だからといって、既存のサーバールームに載るとは限りません。** 冷却方式も含めて、機種の資料で確かめてください（レッスン 3）。
+
+</Callout>
+
+---
+
+## 粒度が変わっても変わらないもの
+
+世代と粒度の違う RA を読み比べると、**構造のほうは残っています。**
+
+- **ネットワークは 4 系統** — Rubin NVL8 の RA でも、計算（InfiniBand XDR / Quantum-X800）、ストレージ、帯域内管理、帯域外管理（SN2201M の 1GbE）に分かれます。BasePOD の A100 世代も 4 系統ですが、**切り方は同じではありません**（A100 世代はストレージと帯域内管理を internalnet にまとめ、外部接続を別に持つ）。計算ファブリックの速度は、ポートあたりで HDR 200Gb/s から 800Gb/s の 4 倍です
+- **レール最適化** — ノードあたり ConnectX-9 の 8 ポートで **8 レール**。RA には「あるレール内の通信は、SU 内の残り 71 ノードに対して常にスイッチ 1 台ぶん」と書かれています（レッスン 2）
+- **計算ファブリックはレール最適化の full-fat tree**（Rubin NVL8 の RA の言葉） — ストレージのほうは、DGX 側のストレージリーフに 2:3 のオーバーサブスクリプションがあり、ストレージ側のリーフ群は 1:1 です
+
+Rubin NVL8 では、GPU 8 枚に対して 8 レールです。
+
+---
+
+<h2 className="slide-cont">粒度が変わっても変わらないもの（続き）</h2>
+
+<Callout type="field">
+
+**新しい製品が出たときに読む場所は、いつも同じです。**
+
+- NVLink ドメインは何枚か
+- ネットワークは何系統か
+- SU は何台か
+- 1 ラック何 kW か
+
+この 4 つを拾えば、構成の全体像はつかめます。**型番と速度は必ず変わるので、覚えるのは構造のほうです。**
+
+</Callout>
+
+---
+
+## NVIDIA 製以外のサーバーで組む
+
+筆者の周り（SIer の現場）では、**DGX より Dell / HPE / Supermicro のサーバーで組む案件のほうが多く見られます。** 統計ではなく、見聞きした範囲の話です。
+
+この場合に読むのが **Enterprise RA** です。NVIDIA はこれを「**NVIDIA-Certified システム**を使って AI ファクトリを設計・展開・拡張するための、検証済みで再現可能なインフラ」と位置づけていて、サーバーは **Cisco / Dell / HPE / Lenovo / Supermicro** のものを使います。
+
+`HGX AI Factory` の RA は、対象を「NVIDIA-Certified の HGX H100 / H200 / B200 システム、それぞれ 8 枚の SXM GPU を搭載」と明記し、**128 ノード = 1,024 GPU**（32 SU）までを検証済みとしています。
+
+### `2-8-9-400` という呼び方
+
+Enterprise RA のノード構成には、数字を並べた名前が付きます。次は HGX H100 / H200 / B200 世代の RA の構成です。
+
+```text
+2 - 8 - 9 - 400
+│   │   │    └ GPU 1 枚あたり 400Gb/s（East-West）
+│   │   └───── NIC 9 枚 = 計算用 8 + 外向き 1
+│   └───────── GPU 8 枚（HGX の SXM ボード）
+└───────────── CPU 2 ソケット
+```
+
+**NIC 9 枚のうち 8 枚が、GPU と 1 対 1 に対応します**（RA はパートナーに 1:1 の構成を推奨しています）。 レッスン 2 のレール最適化そのもので、**GPU 1 枚につきレール 1 本**という関係がここで決まっています。
+
+---
+
+<h2 className="slide-cont">NVIDIA 製以外のサーバーで組む（続き）</h2>
+
+<Callout type="field">
+
+**「ネットワークはそのままでサーバーだけ入れ替える」は、おおむね成立します。**
+
+HGX AI Factory の RA は、ネットワークを「**ラックレイアウトの変更やラックあたりのサーバー台数の変更を吸収できる、柔軟なレール最適化の EoR 構成**」と説明しています。筐体のベンダーが変わっても、ファブリックの設計は同じ形です。
+
+そうなるのは、ファブリックの形を決めているのが**筐体ではなく「GPU 8 枚 + NIC 8 枚」という数**だからです。
+
+</Callout>
+
+<Callout type="pitfall">
+
+**入れ替えで確認するのは、ロゴではなく次の 3 つです。**
+
+- **GPU と NIC が 1 対 1 か** — RA が推奨する 1:1 から減ると、GPU 1 枚につきレール 1 本の関係が崩れます
+- **NIC が GPU と同じ PCIe スイッチ配下にあるか** — CUDA の GPUDirect RDMA の文書は、同じ PCIe スイッチ配下を最適とし、CPU を経由すると性能が落ち、CPU ソケット間をまたぐと極端に遅いか不安定になりうるとしています（レッスン 4・5）
+- **NVIDIA-Certified か** — 認証の試験項目には、マルチノード学習の性能（2 ノード構成）が入っています
+
+RA のノード構成表には NIC の数量（計算用 8 + 外向き 1）が載っていますが、1:1 はパートナーへの**推奨**という書き方で、PCIe の挿し場所は RA にありません。**挿し場所は、その製品の資料で確かめてください。** 見積書の GPU 枚数だけを見て決めないでください。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">NVIDIA 製以外のサーバーで組む（続き）</h2>
+
+### OEM 側にも検証済み設計がある
+
+Cisco / Dell / HPE / Lenovo / Supermicro は、Enterprise RA を自社で検証した形で製品化しています（`Dell AI Factory with NVIDIA`、`NVIDIA AI Computing by HPE` など）。
+
+例えば H200 を 8 枚載せた Dell の PowerEdge XE9680 ベースの構成は、**NVIDIA の `2-8-9-400` 構成として承認されている**と Dell 自身が明記しています。
+
+<Callout type="note">
+
+**どちらを読むかではなく、両方を突き合わせます。**
+
+- **NVIDIA の RA** … 何を満たすべきか（レール、ファブリックの形、ネットワークの系統。HGX AI Factory の RA の H100/H200/B200 版では、①計算 ②ストレージと帯域内管理 ③帯域外管理 の物理 3 系統）
+- **OEM の設計** … その筐体でどう満たすか（スロット位置、電源、冷却）
+
+食い違いが出たら、そこが確認すべき箇所です。多くは PCIe のスロット割り当てと、ラックあたりの給電です。
+
+</Callout>
+
+---
+
+## スケーラブルユニット（SU）という単位
+
+SuperPOD の設計で中心になる考え方です。**ノードを 1 台ずつ足していくのではなく、決まった塊で足します。**
+
+B200 世代の SuperPOD リファレンスアーキテクチャでは、**1 SU = 32 DGX ノード**。この RA は **4 SU = 128 ノード**の構成を軸に書かれています。
+
+```text
+1 SU = DGX ノード 32 台
+      + その 32 台を収容するリーフスイッチ
+      + 管理ノード
+      + 電力・冷却の割り当て
+
+SuperPOD = SU × N（RA では 4 SU = 128 ノード）
+```
+
+---
+
+<h2 className="slide-cont">スケーラブルユニット（SU）という単位（続き）</h2>
+
+塊で考えることの利点は 2 つあります。
+
+**1 つめは、配線の形が変わらないこと。** SU を足すたびにリーフを足し、スパインへの線を足すだけで済みます。既存の配線を引き直す必要がありません。ファシリティコース レッスン 6 で見たスパイン・リーフの性質そのものです。
+
+**2 つめは、見積もりが線形になること。** 1 SU あたりの電力・冷却・ラック数・ケーブル本数が決まっていれば、4 SU の設計は 1 SU の 4 倍です。
+
+<Callout type="pitfall">
+
+**「32 台は多すぎるので 20 台で」には、RA 自身が答えを書いています。**
+
+B200 世代の RA は、予算やデータセンターの都合で台数が違う場合も、**リーフスイッチとリーフ-スパイン間の配線は SU 満数ぶん組み、使わないノードの位置を空けておく**よう書いています。理由は「最適なルーティングと、ファブリック全体で揃った性能」のためです。
+
+**削れるのはノードで、ファブリックは削りません。**
+
+</Callout>
+
+---
+
+## 1 ラックに何台載るのか
+
+ここが一般的なサーバーとの一番大きな違いです。
+
+B200 世代の SuperPOD の RA は、レイアウト例で**ラックあたりの消費電力が 25kW を超える**としています。ファシリティコース レッスン 1 で例にしたラック（単相 200V 30A × 2 系統で実質 4.8kW）とは桁が違います。
+
+```text
+例のラック    : 単相 200V 30A × 2 系統で実質 4.8 kW（ファシリティコース レッスン 1 の例）
+DGX B200 1 台 : 10U、最大 14.3 kW（ユーザーガイド）
+```
+
+**U で数えれば 42U に 4 台入りますが、最大消費電力で見積もると、4.8kW のラックには 1 台も載りません。** 先に尽きるのは U ではなく電気です。
+
+<Callout type="warning" title="RA のラックレイアウトはそのまま使えないことがある">
+
+SuperPOD の RA には「ラックレイアウトは、ラックあたりの最大電力など、現地のデータセンターの要件に合わせて調整できる」とあります。裏を返せば、**RA のレイアウトがそのまま入る前提ではない**ということです。
+
+RA が例に挙げるのはラックあたりの最大電力です。ほかに、床荷重（DGX B200 は 1 台で最大 142.4kg）や冷却方式が既存設備と合わない場合も、調整の理由になりえます。
+
+1 ラックの台数を減らすと、**ラック間の配線が伸びることがあります。** 伸びた先でケーブル長の制約に当たることがあるので、レイアウトの変更は配線の再確認とセットです。
+
+</Callout>
+
+---
+
+## RA から外れるとどうなるか
+
+**「逸脱するとこうなる」と帰結を並べた文書は、NVIDIA の資料には見当たりません。** 代わりに、性質の違う 3 つの形で示されています。
+
+**① 変え方が書かれた箇所。** SuperPOD の RA には「ラックレイアウトは、ラックあたりの最大電力など現地のデータセンター要件に合わせて調整できる」とあります。ノード数を SU と違う数にする場合も、ファブリックは SU 満数で組んで空きを残すよう書かれています（前の節）。
+
+**② 認証プログラムという輪郭。** NVIDIA-Certified は「最新の GPU とネットワークで試験し、性能・機能・スケーラビリティ・セキュリティを評価した」システムを指します。禁止ではなく、**試験済みの集合の外に出る**という言い方です。
+
+**③ 納品形態そのもの。** SuperPOD は「すぐ動くターンキーの AI スーパーコンピュータ」として売られ、「アプリケーションの性能を心配しなくてよい」と書かれています。この主張は**その構成に対するもの**です。
+
+<Callout type="field">
+
+**失うのは「動くこと」ではありません。切り分けの初期値です。**
+
+3 つを合わせて読むと、逸脱のコストはこうなります。
+
+**性能が出なかったときに、構成を疑わなくて済むという前提を手放す。**
+
+このレッスンの最初に書いた「変更点が 1 つなら、疑う場所が 1 つで済みます」は、そのまま逸脱のコストの話でした。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">RA から外れるとどうなるか（続き）</h2>
+
+外したときに何が起きるかは、NVIDIA の資料には書かれていません。次の表は、**このコースで扱う仕組みからの推論**です。
+
+| 逸脱 | 起きうること |
+| --- | --- |
+| SU と違う台数でファブリックも削る | RA が保とうとしている、ルーティングと性能の均一性が崩れうる |
+| 計算ファブリックを細らせる | All-Reduce に使える帯域が減りうる（レッスン 2） |
+| レール配線を崩す | 同じレールで済む通信がスパインを通りうる（レッスン 2） |
+| 非認証のストレージを使う | データの読み込みが間に合うかを、自分で確かめることになる |
+| 1 ラックの台数を減らす | ラック間の配線が伸び、ケーブル長の制約に当たりうる |
+
+どれも、**動かなくなるとは限らない**のが厄介なところです。だから外した箇所は、外した時点で**自分で測って数字を持っておく**必要があります。レッスン 5 で「動く」と「速い」を分けて検証するのは、このためです。
+
+---
+
+## 読む順番
+
+はじめて RA を読むときは、次の順で見ると迷いません。
+
+1. **ネットワークの論理構成** — 何系統のネットワークがあり、それぞれ何が流れるか（レッスン 2）
+2. **ネットワークの物理構成** — どのスイッチに何本、どう繋ぐか（レッスン 2）
+3. **ラックレイアウトと電力** — 1 ラックに何が載り、何 kW 使うか（レッスン 3）
+4. **ソフトウェアスタック** — 何をどの順に入れるか（レッスン 4）
+5. **検証手順** — どうやって「できた」と判断するか（レッスン 5）
+
+**1 と 2 を飛ばして 3 から読むと、必ず後戻りします。** ラックレイアウトはネットワークの構成に従属して決まるためです。
+
+---
+
+<Quiz
+  id="q4"
+  question="DGX ではなく OEM の HGX 搭載サーバーでクラスタを組むことになりました。見積書には「HGX B200 8GPU 搭載」とあります。ネットワーク設計を流用できるかを判断するために、まず確認すべきことはどれですか。"
+  options={[
+    "サーバーのベンダー名と筐体の U 数",
+    "NIC が GPU と 1 対 1 の枚数あるか、そして GPU と同じ PCIe スイッチ配下に挿さっているか",
+    "CPU のクロック周波数",
+    "GPU の枚数だけ合っていれば、ほかは確認しなくてよい"
+  ]}
+  answer={1}
+  explanation="レール最適化は GPU 1 枚に NIC 1 枚が対応することで成り立ちます。Enterprise RA のノード構成が 2-8-9-400 と呼ばれるのは、CPU 2 / GPU 8 / NIC 9（計算用 8 + 外向き 1）/ GPU あたり 400Gb/s を表しているためです。RA は GPU と NIC の 1:1 を推奨していますが、実際の枚数と挿し場所は製品の資料で確かめる必要があり、枚数が減れば GPU 1 枚につきレール 1 本の関係が崩れます。また GPUDirect RDMA は、GPU と NIC が同じ PCIe スイッチ配下にあるのが最適で、離れるほど性能が落ちます。ファブリックの形を決めているのは筐体のベンダーではなく、この GPU と NIC の数と位置です。"
+/>
+
+---
+
+<Quiz
+  id="q3"
+  question="Rubin 世代の構成を検討していたところ、同僚から「NVL8 は NVL72 より数字が小さいので下位機種だろう」と言われました。どう答えるのが正しいですか。"
+  options={[
+    "そのとおり。NVL72 のほうが新しい世代なので性能が高い",
+    "誤り。Rubin 世代の NVL72 と NVL8 の数字は NVLink でつながる GPU の枚数と一致していて、世代や性能の序列ではない。同じ Rubin 世代で粒度が違うだけで、モデルが 8 枚に収まるかで選ぶ",
+    "誤り。NVL8 のほうが後から発表されたので上位機種にあたる",
+    "どちらも中身は同じ構成で、販売上の名前が違うだけ"
+  ]}
+  answer={1}
+  explanation="Rubin 世代では、Vera Rubin NVL72 は 72 枚の GPU を NVLink 6 でラック全体の 1 つのアクセラレータとして動かす構成、Rubin NVL8 は従来の HGX / DGX と同じ 8 枚のノードで、どちらも同じ世代に並んで存在します。NVL の後の数字は、この 2 つでは NVLink でつながる GPU の枚数と一致しています。選ぶ基準は序列ではなく、モデルが 8 枚の GPU に収まるかどうかです。収まらない規模になって初めて、NVLink ドメインの大きい NVL72 が必要になります。なお NVL8 は x86 CPU を選べる一方、1 ラックに何台載せるかは自分で設計することになります。"
+/>
+
+---
+
+<Quiz
+  id="q1"
+  question="SuperPOD のリファレンスアーキテクチャを参考に GPU クラスタを構築します。1 SU = 32 ノードと定義されていますが、予算の都合で 1 SU あたり 20 ノードにしたいという要望が出ました。RA に沿って進めるなら、どうするのが正しいですか。"
+  options={[
+    "20 ノードでは NVLink が動作しないため、構成自体が成立しない",
+    "ノードは 20 台にしても、リーフスイッチとリーフ-スパイン間の配線は 32 台ぶん組み、残りの位置を空けておく",
+    "ノード数に合わせて、リーフスイッチとスパインへの配線も 20 台ぶんに減らす",
+    "ノード数を減らすと 1 ノードあたりの消費電力が上がるので、給電を増やす"
+  ]}
+  answer={1}
+  explanation="B200 世代の SuperPOD の RA は、予算やデータセンターの都合で台数が違う場合も、リーフスイッチとリーフ-スパイン間の配線を SU 満数ぶん組み、使わないノードの位置を空けておくよう書いています。理由は、最適なルーティングと、ファブリックのどこでも揃った性能を保つためです。削れるのはノードで、ファブリックは削りません。NVLink はノード内の接続なので、台数とは関係がありません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="GPU ラックの設計で、42U のラックに DGX B200（10U）を何台載せられるかを検討しています。最初に確認すべきことはどれですか。"
+  options={[
+    "ラックの U 数と、機器の合計 U 数",
+    "そのラックに供給できる電力。DGX B200 は 1 台で最大 14.3kW あり、U より先に電力が尽きうる",
+    "スイッチのポート数",
+    "ラックの奥行き"
+  ]}
+  answer={1}
+  explanation="DGX B200 のユーザーガイドは、最大消費電力を 14.3kW としています。U で数えれば 42U に 4 台入りますが、単相 200V 30A × 2 系統のラック（実質 4.8kW。ファシリティコース レッスン 1 の例）では、最大値で見積もると 1 台も載りません。B200 世代の SuperPOD の RA も、レイアウト例でラックあたり 25kW を超えるとしています。U 数・ポート数・奥行きも確認は必要ですが、台数を先に決めるのは電力です。重さ（DGX B200 は最大 142.4kg）も床荷重として効きます。"
+/>

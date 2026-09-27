@@ -1,0 +1,265 @@
+---
+title: PCIe と割り込み — デバイスの接続
+description: 拡張カードが期待どおりの帯域で繋がっているかを確認し、割り込みの偏りによる性能問題を切り分けられるようにします。
+order: 5
+minutes: 16
+tags: ["PCIe", "lspci", "MSI-X", "IRQ", "NUMA", "SR-IOV"]
+objectives:
+  - PCIe の世代とレーン数から利用可能な帯域を計算できる
+  - lspci でリンクが定格どおり張られているか確認できる
+  - 割り込みの偏りを /proc/interrupts から発見し、対処できる
+references:
+  - label: "PCI-SIG Specifications"
+    url: "https://pcisig.com/specifications"
+  - label: "lspci(8) — Linux manual page"
+    url: "https://man7.org/linux/man-pages/man8/lspci.8.html"
+  - label: "SR-IOV — kernel docs"
+    url: "https://docs.kernel.org/PCI/pci-iov-howto.html"
+---
+
+## 帯域はレーン数 × 世代で決まる
+
+PCIe は「レーン」という単位の束で接続されます。世代が上がるごとに 1 レーンあたりの速度がほぼ倍になります。
+
+| 世代 | 転送レート | **1 レーンの実効帯域（片方向）** | x4 | x8 | x16 |
+| --- | --- | --- | --- | --- | --- |
+| Gen3 | 8 GT/s | 約 0.98 GB/s | 3.9 GB/s | 7.9 GB/s | 15.8 GB/s |
+| Gen4 | 16 GT/s | 約 1.97 GB/s | 7.9 GB/s | 15.8 GB/s | 31.5 GB/s |
+| Gen5 | 32 GT/s | 約 3.94 GB/s | 15.8 GB/s | 31.5 GB/s | 63.0 GB/s |
+
+この表があれば、機器の組み合わせが成立するかを即座に判断できます。
+
+```text
+100GbE NIC = 12.5 GB/s が必要
+  → Gen3 x8 (7.9 GB/s) では足りない
+  → Gen3 x16、または Gen4 x8 以上が必要
+
+NVMe SSD (Gen4 x4) = 7.9 GB/s まで
+  → カタログの「シーケンシャル 7,000 MB/s」はこの上限に張り付いた値
+```
+
+<Callout type="field">
+
+サーバーの拡張スロットには「物理的には x16 だが、電気的には x8 でしか結線されていない」ものがあります。カードは挿さって認識もされますが、**帯域は半分です。**
+
+マザーボードの仕様書でスロットごとの電気的レーン数を確認し、帯域が必要なカード（NIC、GPU、HBA）を優先的に本数の多いスロットへ割り当ててください。
+
+</Callout>
+
+---
+
+## 実際に何で繋がっているかを確認する
+
+「仕様上は Gen4 x8」でも、実際にその条件で**リンクアップしているとは限りません**。
+
+```bash
+# デバイスの一覧
+lspci
+
+# 特定デバイスのリンク状態を詳しく見る
+sudo lspci -s 41:00.0 -vv | grep -E 'LnkCap|LnkSta'
+```
+
+```text
+LnkCap: Port #0, Speed 16GT/s, Width x8, ...   ← デバイスの能力（Gen4 x8）
+LnkSta: Speed 8GT/s (downgraded), Width x4 (downgraded), ...
+                    ↑ 実際は Gen3 x4 でしか繋がっていない = 期待の 1/4
+```
+
+`(downgraded)` の表示が決定的な証拠です。原因は次のいずれかであることが多いです。
+
+- スロットの電気的レーン数が足りない
+- BIOS でスロットの世代が固定されている（互換性のため Gen3 に落としてあるなど）
+- ライザーカードやケーブルの品質・接触
+- 省電力設定によるリンク速度の低下
+
+```bash
+# 全デバイスの downgrade を一括で探す
+sudo lspci -vv 2>/dev/null | grep -B1 'downgraded'
+```
+
+<Callout type="tip">
+
+新しいサーバーの受け入れ時、あるいは拡張カードの増設後に、この確認を手順に入れておくことを勧めます。**「なんとなく遅い」の状態で何か月も運用していた**という事態が防げます。数秒で終わる確認です。
+
+</Callout>
+
+---
+
+## デバイスもどこかの NUMA ノードにぶら下がっている
+
+レッスン 1 で「メモリに遠近がある」と扱いましたが、**PCIe デバイスにも遠近があります**。拡張スロットは特定の CPU ソケットに接続されているためです。
+
+<Figure name="pcie-numa" caption="NIC も NVMe も、どちらかの CPU にぶら下がっている" />
+
+---
+
+<h2 className="slide-cont">デバイスもどこかの NUMA ノードにぶら下がっている（続き）</h2>
+
+CPU 1 上のプロセスが CPU 0 側の NIC を使うと、すべての通信がソケット間接続を経由します。高スループットの処理では、この往復が無視できないコストになります。
+
+```bash
+# NIC がどのノードに属するか
+cat /sys/class/net/eth0/device/numa_node      # 0 または 1（-1 は不明）
+
+# NVMe の場合
+cat /sys/block/nvme0n1/device/device/numa_node
+
+# デバイスごとに一覧する
+lspci -vv 2>/dev/null | grep -E '^[0-9a-f]{2}:|NUMA node'
+```
+
+対処は、プロセスをデバイスと同じノードに固定することです。
+
+```bash
+numactl --cpunodebind=0 --membind=0 ./network-heavy-app
+```
+
+---
+
+<h2 className="slide-cont">デバイスもどこかの NUMA ノードにぶら下がっている（続き）</h2>
+
+<Callout type="note">
+
+`numa_node` が `-1` と表示される場合、BIOS が ACPI のノード情報を提供していないか、シングルソケット機です。シングルソケットであれば考慮不要です。
+
+</Callout>
+
+---
+
+## 割り込みの偏り
+
+デバイスは処理の完了を**割り込み**で CPU に伝えます。ネットワークコースのレッスン 1 で扱った受信経路の起点がこれです。
+
+現代のデバイスは **MSI-X** を使い、**複数の割り込みベクタ**を持てます。NIC なら受信キューごとに別の割り込みを発行でき、複数の CPU で並列に処理できます。
+
+```bash
+# 割り込みが CPU ごとにどう分散しているかを見る
+cat /proc/interrupts | grep -E 'eth0|nvme'
+
+# 変化を追う（偏りが一目で分かる）
+watch -d -n1 "grep eth0 /proc/interrupts"
+```
+
+```text
+        CPU0     CPU1     CPU2     CPU3
+ 128: 8492013        0        0        0   IR-PCI-MSI  eth0-TxRx-0
+ 129:       0        0        0        0   IR-PCI-MSI  eth0-TxRx-1
+ 130:       0        0        0        0   IR-PCI-MSI  eth0-TxRx-2
+```
+
+**CPU0 だけに集中しています。** キューは 4 本あるのに 1 本しか使われていない状態で、1 コア分の処理能力が上限になります。
+
+```bash
+# 特定の割り込みを処理する CPU を確認・変更する（ビットマスク）
+cat /proc/irq/128/smp_affinity_list
+echo 2 | sudo tee /proc/irq/129/smp_affinity_list   # IRQ129 を CPU2 へ
+
+# NIC のキュー数を確認・変更する
+ethtool -l eth0
+sudo ethtool -L eth0 combined 8
+```
+
+---
+
+<h2 className="slide-cont">割り込みの偏り（続き）</h2>
+
+<Callout type="warning" title="irqbalance との競合">
+
+多くのディストリビューションでは `irqbalance` デーモンが割り込みを自動的に分散します。手動で `smp_affinity` を設定しても、`irqbalance` が後から上書きすることがあります。
+
+手動で固定したい場合は、対象 IRQ を除外設定に入れるか、デーモンを停止します。
+
+```bash
+systemctl status irqbalance
+# 除外する IRQ を指定する例（ディストリにより設定ファイルの場所は異なる）
+# IRQBALANCE_ARGS="--banirq=129 --banirq=130"
+```
+
+低レイテンシ要件がない一般的なサーバーでは、`irqbalance` に任せるのが無難です。手動固定は、**分散されていないことを実測で確認してから**行ってください。
+
+</Callout>
+
+---
+
+## IOMMU と SR-IOV
+
+### IOMMU
+
+デバイスは DMA によってメモリへ直接書き込みます。これは高速ですが、**デバイスが任意の物理アドレスに書ける**ことを意味し、仮想化環境ではセキュリティ上の問題になります。
+
+**IOMMU**（Intel VT-d / AMD-Vi）は、デバイスから見えるアドレスを変換・制限する仕組みです。CPU にとってのページテーブルに相当します。
+
+```bash
+# 有効になっているか
+dmesg | grep -iE 'DMAR|IOMMU|AMD-Vi'
+ls /sys/kernel/iommu_groups/ | wc -l
+```
+
+仮想マシンへのデバイス直接割り当て（パススルー）には IOMMU が必須です。カーネルパラメータ `intel_iommu=on` / `amd_iommu=on` で有効化します。
+
+### SR-IOV
+
+1 枚の物理 NIC を、複数の**仮想的な NIC** としてゲストや コンテナに直接見せる仕組みです。
+
+```text
+物理 NIC
+├── PF (Physical Function)  ← ホストが管理する本体
+├── VF (Virtual Function) 0 ← VM1 に直接割り当て
+├── VF (Virtual Function) 1 ← VM2 に直接割り当て
+└── ...
+```
+
+ホストのソフトウェアスイッチを経由しないため、CPU 消費が減りレイテンシも下がります。代わりに、ライブマイグレーションが難しくなる、ソフトウェア側で柔軟な制御ができない、といった制約があります。
+
+---
+
+<h2 className="slide-cont">IOMMU と SR-IOV（続き）</h2>
+
+```bash
+# 対応と VF の数を確認
+lspci -vv -s 41:00.0 | grep -A3 SR-IOV
+cat /sys/class/net/eth0/device/sriov_totalvfs
+
+# VF を 8 個作る
+echo 8 | sudo tee /sys/class/net/eth0/device/sriov_numvfs
+```
+
+---
+
+## まとめ
+
+- 帯域 = **世代 × レーン数**。Gen3 x8 ≒ 7.9 GB/s を基準に覚えると計算が速い
+- `lspci -vv` の **`LnkSta` に `(downgraded)` が出ていないか**を受け入れ時に必ず確認する
+- PCIe デバイスにも NUMA ノードがある。`/sys/class/net/*/device/numa_node` で確認できる
+- 割り込みが 1 CPU に偏ると、そこが上限になる。`/proc/interrupts` で分散を確認する
+- 手動の `smp_affinity` は `irqbalance` に上書きされうる
+- IOMMU はデバイスの DMA を制限する仕組みで、パススルーに必須
+
+<Quiz
+  id="q1"
+  question="100GbE（約12.5 GB/s）の NIC を導入しましたが、実測で 7 GB/s 程度しか出ません。lspci -vv の LnkSta は「Speed 8GT/s, Width x8」でした。何が起きていますか。"
+  options={[
+    "NIC のファームウェアが古い",
+    "PCIe Gen3 x8（約7.9 GB/s）でリンクしており、PCIe 側が帯域のボトルネックになっている",
+    "MTU の設定が小さい",
+    "割り込みが1つの CPU に偏っている"
+  ]}
+  answer={1}
+  explanation="8GT/s は PCIe Gen3 を意味し、x8 では約 7.9 GB/s が上限です。100GbE が必要とする 12.5 GB/s には届きません。実測の 7 GB/s はこの上限に張り付いた値で、NIC 側ではなく接続側の制約です。Gen4 対応スロットへの移設か、x16 スロットの利用が必要になります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="NIC のキューは 8 本設定されているのに、/proc/interrupts を見ると受信割り込みが CPU0 にのみ記録されています。この状態の問題点はどれですか。"
+  options={[
+    "問題ない。割り込みは CPU0 が処理する仕様である",
+    "受信処理が実質 1 コア分に制限され、そのコアが飽和した時点でスループットの上限になる",
+    "キューが多すぎるためメモリを浪費している",
+    "NIC が Gen3 でリンクしている"
+  ]}
+  answer={1}
+  explanation="MSI-X による複数キューは、割り込みを複数 CPU に分散して並列処理するための仕組みです。1 CPU に集中していると、そのコアの処理能力がシステム全体の受信性能の上限になります。ethtool -l でキュー数を、/proc/irq/*/smp_affinity_list で割り当てを確認し、irqbalance の動作状況も併せて調べます。"
+/>

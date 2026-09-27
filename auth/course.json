@@ -1,0 +1,9 @@
+{
+  "title": "認証基盤 / PKI",
+  "subtitle": "Identity & PKI",
+  "description": "オンプレで認証基盤を組むための知識。X.509 と自己認証局の設計・運用から、OAuth 2.0 / OIDC の仕組み、IdP の構築、サービス間の mTLS まで扱います。",
+  "order": 11,
+  "accent": "auth",
+  "level": "実務",
+  "status": "ready"
+}

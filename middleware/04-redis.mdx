@@ -1,0 +1,320 @@
+---
+title: Redis とキャッシュ運用
+description: シングルスレッドという性質から生まれる落とし穴と、fork によるメモリ急増を押さえます。
+order: 4
+minutes: 17
+tags: ["Redis", "maxmemory", "fork", "SCAN", "persistence"]
+objectives:
+  - シングルスレッドであることが運用上どう効くかを説明できる
+  - maxmemory-policy の既定値が引き起こす問題を説明できる
+  - BGSAVE の fork がメモリを急増させる仕組みを理解できる
+references:
+  - label: "Redis Documentation — Memory optimization"
+    url: "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/memory-optimization/"
+  - label: "Redis — Persistence"
+    url: "https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/"
+  - label: "Redis — SCAN command"
+    url: "https://redis.io/docs/latest/commands/scan/"
+---
+
+## コマンド実行は 1 スレッド
+
+Redis が速い理由は、**すべてのコマンドを 1 つのスレッドで順番に実行する**ことにあります。ロックが不要で、コンテキストスイッチも起きません。
+
+```text
+クライアントA ─┐
+クライアントB ─┼─► [ 単一のイベントループ ] ─► メモリ上のデータ構造
+クライアントC ─┘     1つずつ順番に実行
+```
+
+レッスン 1 で見たイベント駆動型と同じ構造で、`epoll` で多数の接続を監視し、来たものから処理します。
+
+<Callout type="warning" title="1 つの遅いコマンドが全体を止める">
+
+**この設計の代償は、重いコマンドが他のすべてをブロックすることです。**
+
+```bash
+# 100万キーある本番環境でこれを打つと、その間 Redis 全体が停止する
+KEYS user:*          # O(N) — 全キーを走査
+
+# 正しくはカーソルで分割して走査する
+SCAN 0 MATCH user:* COUNT 100
+```
+
+同様に危険なコマンドです。
+
+| コマンド | 計算量 | 代替 |
+| --- | --- | --- |
+| `KEYS` | O(N) | **`SCAN`** |
+| `FLUSHALL` / `FLUSHDB` | O(N) | `FLUSHALL ASYNC` |
+| `SMEMBERS` / `HGETALL`（巨大な集合） | O(N) | `SSCAN` / `HSCAN` |
+| `DEL`（巨大な値） | O(N) | **`UNLINK`**（別スレッドで解放） |
+
+`SCAN` 系はカーソルを返し、1 回の呼び出しが短時間で終わります。全体を止めないため、**本番では `KEYS` を使わない**を徹底してください。
+
+</Callout>
+
+### 遅いコマンドを見つける
+
+---
+
+<h2 className="slide-cont">コマンド実行は 1 スレッド（続き）</h2>
+
+```bash
+# 実行に時間がかかったコマンドを記録する
+redis-cli CONFIG SET slowlog-log-slower-than 10000   # 10ms 以上を記録
+redis-cli SLOWLOG GET 10
+```
+
+```text
+1) 1) (integer) 42
+   2) (integer) 1789776018
+   3) (integer) 1284310          ← 所要時間（マイクロ秒）= 1.28 秒
+   4) 1) "KEYS"
+      2) "session:*"
+```
+
+```bash
+# どんなコマンドがどれだけ来ているか（本番での実行は短時間に留める）
+redis-cli --stat
+redis-cli INFO commandstats
+```
+
+---
+
+## maxmemory とエビクション
+
+**既定値が用途に合っていない**ことが多い、代表的な設定です。
+
+```bash
+redis-cli CONFIG GET maxmemory maxmemory-policy
+```
+
+```text
+maxmemory        0            ← 無制限
+maxmemory-policy noeviction   ← 上限に達したら書き込みエラー
+```
+
+| ポリシー | 挙動 |
+| --- | --- |
+| **`noeviction`** | **既定。上限到達で書き込みがエラーになる** |
+| `allkeys-lru` | 全キーから、最近使われていないものを削除 |
+| `allkeys-lfu` | 全キーから、使用頻度の低いものを削除 |
+| `volatile-lru` | **TTL 付きのキーだけ**から LRU で削除 |
+| `volatile-ttl` | TTL が近いものから削除 |
+
+---
+
+<h2 className="slide-cont">maxmemory とエビクション（続き）</h2>
+
+<Callout type="pitfall" title="キャッシュ用途で noeviction のまま使う">
+
+Redis をキャッシュとして使うなら、**上限に達したら古いものを捨てる**のが期待される動作です。しかし既定の `noeviction` では、上限に達した瞬間に
+
+```text
+(error) OOM command not allowed when used memory > 'maxmemory'
+```
+
+となり、**書き込みがすべて失敗します**。キャッシュが「エラーを返す存在」になってしまいます。
+
+```bash
+# キャッシュ用途の設定
+redis-cli CONFIG SET maxmemory 8gb
+redis-cli CONFIG SET maxmemory-policy allkeys-lru
+```
+
+逆に、**セッションストアやジョブキューとして使っている場合は `noeviction` が正しい**こともあります。勝手に消えては困るデータだからです。その場合は容量監視とアラートが必須になります。
+
+**「何に使っているか」でポリシーを決めてください。** 1 つの Redis を両方の用途に使い回していると、どちらにも適した設定がなくなります。用途ごとにインスタンスを分けるのが定石です。
+
+</Callout>
+
+<Callout type="note" title="volatile-* は TTL のないキーを消さない">
+
+`volatile-lru` を設定していても、**TTL が設定されていないキーは削除対象になりません**。TTL 付きのキーをすべて消してもまだ上限を超えている場合、`noeviction` と同じくエラーになります。
+
+「`volatile-lru` にしたのに OOM エラーが出る」という場合、TTL を付け忘れたキーが大量にあることを疑ってください。
+
+```bash
+# TTL が設定されていないキーの割合を調べる
+redis-cli INFO keyspace
+# db0:keys=1000000,expires=12000,avg_ttl=0   ← expires が極端に少ない
+```
+
+</Callout>
+
+---
+
+## 永続化と fork
+
+Redis には 2 つの永続化方式があります。
+
+| | **RDB**（スナップショット） | **AOF**（追記ログ） |
+| --- | --- | --- |
+| 内容 | ある時点の全データをダンプ | 実行したコマンドを追記 |
+| 復旧の粒度 | スナップショット時点 | ほぼ直前まで |
+| ファイルサイズ | 小さい | 大きい（定期的に書き換え） |
+| 再起動時の読み込み | 速い | 遅い |
+
+```bash
+# AOF の書き出し頻度
+redis-cli CONFIG GET appendfsync
+# everysec   ← 既定。1秒ごとに fsync（最大1秒分を失う可能性）
+```
+
+`appendfsync always` は 1 コマンドごとに `fsync` するため安全ですが、Linux コース レッスン 4 で見たとおり `fsync` は高価で、スループットが大きく落ちます。
+
+### fork によるメモリ急増
+
+---
+
+<h2 className="slide-cont">永続化と fork（続き）</h2>
+
+<Callout type="warning" title="BGSAVE で使用メモリが最大 2 倍になりうる">
+
+`BGSAVE`（バックグラウンドのスナップショット）と AOF の書き換えは、**`fork()` で子プロセスを作ります**。
+
+Linux コース レッスン 3 で扱ったとおり、`fork` 直後は親子でメモリを共有し、**書き込みがあったページだけコピーされます**（Copy-on-Write）。
+
+```text
+fork 直後      : 親 8GB / 子 8GB だが、物理メモリは 8GB（共有）
+書き込みが続く : 変更されたページが次々コピーされる
+最悪の場合     : 物理メモリ 16GB を消費する
+```
+
+**書き込みが多い Redis ほど、スナップショット中のメモリ消費が跳ね上がります。** ここで OOM Killer（Linux コース レッスン 3）に殺されるのが、Redis の典型的な障害です。
+
+対策は 2 つです。
+
+```bash
+# ① overcommit を許可する（Redis 公式が推奨。fork 自体が失敗するのを防ぐ）
+sudo sysctl -w vm.overcommit_memory=1
+
+# ② Transparent Huge Pages を無効化する
+#    THP 有効時は CoW のコピー単位が 2MB になり、メモリ消費とレイテンシが悪化する
+echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+**この 2 つは Redis 起動時に警告として出ます。** ログに出ているのに放置されている環境は多いので、確認してください。
+
+```bash
+redis-cli INFO stats | grep -E 'latest_fork_usec|rdb_last_bgsave_status'
+```
+
+`latest_fork_usec` が大きい（数百 ms 以上）なら、fork 自体がサービスを止めています。メモリが大きいインスタンスほど `fork` に時間がかかります。
+
+</Callout>
+
+---
+
+## メモリの内訳を見る
+
+```bash
+redis-cli INFO memory
+```
+
+```text
+used_memory_human:6.20G          ← Redis が認識しているデータ量
+used_memory_rss_human:8.91G      ← OS から見た実メモリ（RSS）
+mem_fragmentation_ratio:1.44     ← rss / used
+maxmemory_human:8.00G
+```
+
+| `mem_fragmentation_ratio` | 意味 |
+| --- | --- |
+| 1.0 前後 | 正常 |
+| **1.5 以上** | **断片化**。大量の削除の後に起きやすい |
+| **1.0 未満** | **スワップが発生している**（Linux コース レッスン 3）。最も危険 |
+
+<Callout type="field">
+
+**`mem_fragmentation_ratio` が 1 を下回ったら、スワップアウトされています。**
+
+Redis はすべてがメモリ上にあることを前提に設計されているため、スワップは致命的です。ミリ秒未満で返るはずの処理が、ディスクアクセス（ハードウェアコース レッスン 1 の桁を思い出してください）に化けます。
+
+```bash
+# Redis プロセスがスワップしているか
+grep -E 'VmSwap' /proc/$(pgrep -o redis-server)/status
+```
+
+対策は `maxmemory` を物理メモリに対して余裕を持って設定することです。**`maxmemory` は RSS ではなくデータ量に対する上限**なので、断片化や fork の分を見込んで、物理メモリの 60〜70% 程度に留めるのが安全です。
+
+</Callout>
+
+### キーの分布を調べる
+
+---
+
+<h2 className="slide-cont">メモリの内訳を見る（続き）</h2>
+
+```bash
+# メモリを食っているキーを探す（本番でも比較的安全）
+redis-cli --bigkeys
+
+# 特定キーのメモリ使用量
+redis-cli MEMORY USAGE session:abc123
+```
+
+---
+
+## 可用性
+
+| 構成 | 内容 |
+| --- | --- |
+| **レプリカ** | 非同期レプリケーション。読み取り分散と冗長化 |
+| **Sentinel** | マスター障害を検知して自動フェイルオーバー |
+| **Cluster** | データをスロットで分割。水平スケール |
+
+<Callout type="pitfall">
+
+**Redis のレプリケーションは非同期です。** マスターが応答を返した後、レプリカに届く前にマスターが落ちれば、その書き込みは失われます。
+
+`WAIT` コマンドで一定数のレプリカへの到達を待つことはできますが、完全な同期レプリケーションではありません。**「絶対に失えないデータ」を Redis だけに置く設計は避けてください。**
+
+キャッシュとしては十分ですが、決済情報のような永続性が要るデータには、レッスン 3 の RDBMS を使います。
+
+</Callout>
+
+---
+
+## まとめ
+
+- コマンド実行は**単一スレッド**。1 つの重いコマンドが全体を止める
+- **`KEYS` を本番で使わない**。`SCAN` / `UNLINK` を使う
+- `SLOWLOG` で遅いコマンドを継続的に監視する
+- **`maxmemory-policy` の既定は `noeviction`**。キャッシュ用途なら `allkeys-lru` に変える
+- `volatile-*` は **TTL のないキーを消さない**
+- **`BGSAVE` の fork で、書き込みが多いとメモリが最大 2 倍**になる
+- `vm.overcommit_memory=1` と **THP 無効化**は Redis の前提条件
+- **`mem_fragmentation_ratio` が 1 未満 = スワップ発生**。最も危険な状態
+- レプリケーションは非同期。**失えないデータを Redis だけに置かない**
+
+---
+
+<Quiz
+  id="q1"
+  question="Redis をキャッシュとして使っています。データ量が maxmemory に達した途端、アプリケーションから「OOM command not allowed」というエラーが返るようになりました。原因はどれですか。"
+  options={[
+    "物理メモリが不足している",
+    "maxmemory-policy が既定の noeviction のままで、上限到達時に古いキーを削除せず書き込みを拒否している",
+    "AOF の書き込みが追いついていない",
+    "レプリカとの同期が遅延している"
+  ]}
+  answer={1}
+  explanation="maxmemory-policy の既定値は noeviction で、上限に達すると書き込みコマンドをエラーにします。キャッシュ用途では古いキーを自動的に捨てる挙動が期待されるため、allkeys-lru や allkeys-lfu に変更する必要があります。なお volatile-lru を選んだ場合は TTL が設定されたキーしか削除対象にならないため、TTL を付け忘れたキーが多いと同じエラーが出ます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="書き込みの多い 8GB の Redis インスタンスが、スナップショット保存中に OOM Killer で終了しました。仕組みの説明として正しいものはどれですか。"
+  options={[
+    "スナップショットファイルがメモリ上に作られるため",
+    "BGSAVE は fork で子プロセスを作り、Copy-on-Write により書き込まれたページが次々複製されるため、最悪で物理メモリ消費が約 2 倍になる",
+    "AOF と RDB を同時に有効にしていたため",
+    "maxmemory の設定が大きすぎたため"
+  ]}
+  answer={1}
+  explanation="BGSAVE は fork() で子プロセスを作り、親子でメモリを共有します。Copy-on-Write により変更されたページだけがコピーされますが、書き込みが多いインスタンスでは短時間に大量のページが複製され、最悪で使用メモリが 2 倍近くまで膨らみます。対策として vm.overcommit_memory=1 の設定と THP の無効化（THP 有効時は CoW の単位が 2MB になり悪化する）が Redis 公式に推奨されており、maxmemory も物理メモリの 60〜70% 程度に抑えるのが安全です。"
+/>

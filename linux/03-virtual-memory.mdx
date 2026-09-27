@@ -1,0 +1,237 @@
+---
+title: 仮想メモリとページキャッシュ
+description: free コマンドの数字が何を指しているのかを理解し、メモリ不足なのか正常なキャッシュなのかを判断できるようにします。
+order: 3
+minutes: 18
+tags: ["memory", "page-cache", "swap", "OOM", "THP"]
+objectives:
+  - 仮想アドレスが物理メモリに割り当てられるまでの流れを説明できる
+  - free の available 列を根拠にメモリ不足を判断できる
+  - OOM Killer が対象を選ぶ基準と、その回避方法を説明できる
+references:
+  - label: "Memory Management — kernel admin-guide"
+    url: "https://docs.kernel.org/admin-guide/mm/index.html"
+  - label: "proc(5) — /proc/meminfo"
+    url: "https://man7.org/linux/man-pages/man5/proc.5.html"
+  - label: "Transparent Hugepage Support — kernel docs"
+    url: "https://docs.kernel.org/admin-guide/mm/transhuge.html"
+---
+
+## 確保したメモリは、まだ存在しない
+
+前のレッスンで「`malloc` は必ずしもカーネルに入らない」と触れました。仮想メモリでは、さらに踏み込んだことが起きています。
+
+```c
+void *p = malloc(1 * 1024 * 1024 * 1024);  // 1 GiB
+```
+
+この時点で消費される物理メモリは、ほぼゼロです。カーネルがしたのは「この仮想アドレス範囲は使ってよい」という帳簿上の記録だけで、物理ページは 1 枚も割り当てていません。
+
+物理メモリが割り当てられるのは、**そのアドレスに初めてアクセスした瞬間**です。
+
+<Figure name="demand-paging" caption="ページフォルトはエラーではなく、メモリ割り当ての通常の経路" />
+
+これを **demand paging**（要求時ページング）と呼びます。
+
+---
+
+### ページフォルトの 2 種類
+
+| 種類 | 内容 | ディスクアクセス | コスト |
+| --- | --- | --- | --- |
+| **Minor fault** | ページキャッシュ上に既にある、またはゼロページを新規割り当て | なし | 数マイクロ秒 |
+| **Major fault** | ディスクから読み込む必要がある | **あり** | ミリ秒単位 |
+
+---
+
+<h2 className="slide-cont">確保したメモリは、まだ存在しない（続き）</h2>
+
+```bash
+# プロセスごとのフォルト回数 (MINFL = minor, MAJFL = major)
+ps -eo pid,comm,min_flt,maj_flt --sort=-maj_flt | head
+
+# リアルタイムに観察する
+pidstat -r 1 5
+```
+
+<Callout type="field">
+
+**Major fault の急増は、ほぼ常に問題の兆候です。** メモリ不足でスワップアウトされたページを読み戻している（スラッシング）か、ページキャッシュが足りずファイルを何度も読み直しているかのどちらかです。Minor fault はプロセス起動時に大量に出るのが正常なので、監視するなら major を見てください。
+
+</Callout>
+
+---
+
+## free コマンドを正しく読む
+
+`free` の出力は、慣れていないと必ず誤読します。
+
+```text
+              total        used        free      shared  buff/cache   available
+Mem:          31Gi        8.2Gi       1.1Gi       412Mi        22Gi        22Gi
+Swap:        8.0Gi          0B       8.0Gi
+```
+
+`free` が 1.1 GiB しかありません。メモリ不足でしょうか。**違います。**
+
+- **buff/cache (22 GiB)** … ページキャッシュ。一度読んだファイルの内容をメモリに保持しているもの。**必要になれば即座に解放できる**
+- **available (22 GiB)** … 新しいプロセスが、スワップを発生させずに使える見込み量。カーネルが解放可能なキャッシュを考慮して算出する
+
+**見るべきは `free` ではなく `available` 列です。**
+
+カーネルは空きメモリを遊ばせておく理由がないので、使われていないメモリは片っ端からページキャッシュに回します。`free` が少ないのは、むしろメモリが有効活用されている状態です。
+
+<Callout type="pitfall">
+
+「free が少ない → メモリ増設」という判断は誤りです。判断基準は次の 2 つです。
+
+- `available` が総メモリの 10% を下回っている
+- Major fault やスワップイン（`vmstat` の `si` 列）が継続的に発生している
+
+この両方が出ていなければ、`free` が小さくても健全です。
+
+</Callout>
+
+---
+
+## スワップとの付き合い方
+
+スワップは「メモリが足りないときの緊急避難」と説明されがちですが、実際にはもう少し積極的な役割があります。
+
+カーネルは、**長時間アクセスされていない匿名ページ**（ファイルに紐づかないプロセスのヒープなど）をスワップに追い出し、その分をページキャッシュに回そうとします。起動時に読み込んだきり使われない初期化コードなどは、ディスクに置いておくほうが全体としては効率的だからです。
+
+この積極性を決めるのが `vm.swappiness` です。
+
+```bash
+sysctl vm.swappiness       # 既定値は 60
+
+# 変更（恒久化するなら /etc/sysctl.d/ に書く）
+sysctl -w vm.swappiness=10
+```
+
+| 値 | 挙動 | 向いている用途 |
+| --- | --- | --- |
+| `0` | 可能な限りスワップしない（OOM のリスクは残る） | レイテンシが最優先のシステム |
+| `1`–`10` | ほぼ緊急時のみ | データベース、キャッシュサーバー |
+| `60` | 既定。バランス重視 | 一般的な用途 |
+| `100` | 積極的にスワップ | ページキャッシュを最大化したいバッチ処理 |
+
+<Callout type="warning" title="スワップを完全に無効化する前に">
+
+`swapoff -a` でスワップを消すと、メモリ逼迫時の逃げ道がなくなり、**いきなり OOM Killer が動きます**。スワップがあれば性能劣化として現れていたものが、プロセスの強制終了になります。
+
+「遅くなってもいいから落ちないでほしい」のか「遅いくらいなら落ちてほしい」のか、要件に応じて決めてください。Kubernetes のように、そもそもスワップ無効を前提とする設計もあります。
+
+</Callout>
+
+---
+
+## OOM Killer
+
+物理メモリもスワップも尽きると、カーネルは **OOM Killer** を起動し、プロセスを 1 つ選んで強制終了します。
+
+選ばれるのは「最もメモリを使っているプロセス」ではなく、**`oom_score` が最大のプロセス**です。
+
+```bash
+# 現在のスコアを確認（0-1000、大きいほど狙われやすい）
+cat /proc/1234/oom_score
+
+# スコアの調整値 (-1000 〜 1000)
+cat /proc/1234/oom_score_adj
+
+# 重要なプロセスを保護する
+echo -500 > /proc/1234/oom_score_adj
+```
+
+`oom_score` はプロセスのメモリ使用量を基礎として、`oom_score_adj` を加味して算出されます。`-1000` を設定すると事実上 OOM の対象から外れます。
+
+```bash
+# OOM が発生していたかを確認する
+journalctl -k --grep="Out of memory"
+dmesg -T | grep -i "killed process"
+```
+
+<Callout type="field">
+
+OOM のログには `Killed process 4821 (mysqld) total-vm:8123456kB, anon-rss:6234512kB` のように、終了させたプロセスと当時の使用量が残ります。「サービスがいつの間にか落ちていた」という障害では、まずこれを確認してください。アプリケーションのログには何も残らないことが多く（`SIGKILL` なので終了処理が走らない）、カーネルログだけが証拠になります。
+
+</Callout>
+
+### overcommit
+
+Linux は既定で、物理メモリ + スワップの合計を超える量のメモリ確保を許します。demand paging により「確保したが使わない」領域が多いため、そのほうが効率的だからです。
+
+---
+
+<h2 className="slide-cont">OOM Killer（続き）</h2>
+
+```bash
+sysctl vm.overcommit_memory   # 0 = ヒューリスティック（既定）
+                              # 1 = 常に許可
+                              # 2 = 厳格に制限
+```
+
+`2` にすると、`CommitLimit`（= スワップ + 物理メモリ × `vm.overcommit_ratio`）を超える確保が `malloc` の時点で失敗するようになります。OOM Killer によるランダムな強制終了を避けたい場合の選択肢ですが、`fork` 時に一時的に大きな確保が発生するアプリケーションでは動かなくなることがあります。
+
+---
+
+## Transparent Huge Pages (THP)
+
+通常のページサイズは 4 KiB です。数十 GiB を扱うプロセスでは、ページテーブルのエントリ数が膨大になり、TLB（アドレス変換のキャッシュ）のミスが増えます。
+
+THP は 2 MiB の巨大ページを自動的に使う機能で、TLB ミスを減らせます。ただし副作用があります。
+
+- 2 MiB の連続した物理領域を確保するため、メモリが断片化していると**確保に時間がかかる**
+- その待ち時間がアプリケーションのレイテンシとして現れる（スパイク状の遅延）
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# [always] madvise never
+
+# データベース系では madvise か never が推奨されることが多い
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+<Callout type="tip">
+
+PostgreSQL・MongoDB・Redis などのドキュメントは、THP を `never` または `madvise` にすることを推奨しています。スループットは僅かに落ちても、レイテンシのばらつきが大きく減るためです。設定変更の前に、対象ミドルウェアの公式ドキュメントを確認してください。
+
+</Callout>
+
+---
+
+## まとめ
+
+- メモリは確保時ではなく**初回アクセス時**に割り当てられる（demand paging）
+- `free` ではなく **`available`** を見る。`buff/cache` は必要時に解放される
+- Major fault の増加がメモリ逼迫の実質的なサイン
+- OOM Killer は使用量ではなく `oom_score` で対象を選ぶ。重要プロセスは `oom_score_adj` で保護する
+- THP はレイテンシのばらつきを生むことがあり、DB では無効化が推奨されることが多い
+
+<Quiz
+  id="q1"
+  question="free -h の出力で free が 800Mi、buff/cache が 24Gi、available が 23Gi でした。この状態の評価として正しいものはどれですか。"
+  options={[
+    "空きメモリが枯渇しているため、直ちにメモリ増設が必要",
+    "ページキャッシュが大半を占めており、必要になれば解放されるため健全な状態",
+    "メモリリークが起きている可能性が高い",
+    "スワップが有効になっていないことを示している"
+  ]}
+  answer={1}
+  explanation="buff/cache はページキャッシュで、新たな割り当てが必要になればカーネルが解放します。available 列はそれを見込んだ「実際に使える量」で、23Gi あるので逼迫していません。カーネルは空きメモリを遊ばせない設計なので、free が小さいのはむしろ正常です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="OOM Killer が終了させるプロセスを選ぶ基準として正しいものはどれですか。"
+  options={[
+    "起動してから最も時間が経過しているプロセス",
+    "最も CPU を使用しているプロセス",
+    "メモリ使用量と oom_score_adj から算出される oom_score が最大のプロセス",
+    "最後に起動したプロセス"
+  ]}
+  answer={2}
+  explanation="OOM Killer は各プロセスの oom_score を比較し、最大のものを選びます。スコアはメモリ使用量を基礎に oom_score_adj（-1000〜1000）で調整できるため、落としたくないプロセスには負の値を設定して保護します。CPU 使用率や起動時刻は考慮されません。"
+/>

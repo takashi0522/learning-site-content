@@ -1,0 +1,274 @@
+---
+title: 受け入れ検証
+description: DCGM diag、nccl-tests、ファブリックの健全性確認。どこまで確かめてから運用へ引き渡すかを決めます。
+order: 5
+minutes: 20
+tags: ["DCGM", "nccl-tests", "busbw", "ibdiagnet", "バーンイン"]
+objectives:
+  - 「動く」と「性能が出ている」を別々に検証できる
+  - nccl-tests の busbw を理論値と突き合わせて判断できる
+  - 引き渡し前に確認すべき項目を漏れなく列挙できる
+references:
+  - label: "NVIDIA DCGM Documentation"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/"
+  - label: "NVIDIA nccl-tests (GitHub)"
+    url: "https://github.com/NVIDIA/nccl-tests"
+  - label: "NVIDIA Fabric Manager User Guide"
+    url: "https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html"
+  - label: "NVIDIA DCGM — Diagnostics (レベルごとの試験と所要時間)"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html"
+  - label: "nccl-tests — PERFORMANCE.md (algbw と busbw)"
+    url: "https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md"
+  - label: "NVIDIA NCCL — Environment Variables (P2P と SHM)"
+    url: "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html"
+  - label: "NVIDIA Xid Errors — Catalog"
+    url: "https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html"
+  - label: "Google Cloud — Collect and understand NCCL logs (TCP へのフォールバック)"
+    url: "https://docs.cloud.google.com/ai-hypercomputer/docs/nccl/collect-and-understand"
+  - label: "NVIDIA DCGM — Diagnostic Plugins (targeted stress と targeted power)"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/reference/diagnostics/plugins/index.html"
+  - label: "NVIDIA NCCL Troubleshooting 2.27.6 (GDRDMA)"
+    url: "https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2276/user-guide/docs/troubleshooting.html"
+  - label: "NVIDIA ibdiagnet User Manual — Dump Files (ibdiagnet2.pm はポートカウンタ)"
+    url: "https://networking-docs.nvidia.com/ibdiagnetutilityum/219/ibdiagnet-dump-files"
+  - label: "NVIDIA ibdiagnet User Manual — Output Control"
+    url: "https://networking-docs.nvidia.com/ibdiagnetutilityum/2.27.0/ibdiagnet-output-control"
+  - label: "Oracle — Sun Datacenter InfiniBand Switch 72: Determine Which Links Are Experiencing Significant Errors"
+    url: "https://docs.oracle.com/cd/E19654-01/820-7751-12/z40004881932077.html"
+---
+
+## 「動く」と「速い」は別の検証
+
+前のレッスンで、各段階が動くことは確認しました。**受け入れ検証で確かめるのは、期待した性能が出ているかです。**
+
+この 2 つを分けるのが重要なのは、**性能が出ていない状態でも動いてしまうことがあるから**です。たとえば NCCL には、InfiniBand を使わないときに IP ソケットなど別の経路へ切り替える仕組みがあります（NCCL の環境変数の説明）。Google Cloud の NCCL の解説は、自社の環境で RDMA 用のライブラリのマウントを忘れた場合について、ジョブは失敗せずに TCP へ切り替わり、性能が落ちうると書いています。
+
+検証は 3 つの層で、下から順に行います。
+
+```text
+① 単体      GPU 1 枚ずつが健全か          DCGM diag
+② ノード内  8 枚の GPU が NVLink で繋がるか  nccl-tests（単一ノード）
+③ ノード間  ファブリック越しの通信が出るか   nccl-tests（複数ノード）
+```
+
+**下の層が出ていないのに上を測っても意味がありません。** 数字が悪かったときに原因が特定できなくなります。
+
+---
+
+## ① 単体 — DCGM diag
+
+**DCGM**（Data Center GPU Manager）の診断機能で、GPU 1 枚ずつの健全性を確認します。
+
+```bash
+# 所要時間は DCGM の文書の値（Hopper 世代、8 GPU のシステム）
+# レベル 1: 2.5 秒未満。software プラグインのみ（導入の前提条件と、GPU が報告するハードウェアの状態の確認）
+sudo dcgmi diag -r 1
+
+# レベル 2: 10.5 分未満。PCIe と NVLink、GPU メモリを含む
+sudo dcgmi diag -r 2
+
+# レベル 3: 35 分未満。計算性能を保てるか（targeted stress）、電力を上げられるか（targeted power）、NCCL の試験を含む
+sudo dcgmi diag -r 3
+
+# レベル 4: 2.25 時間未満。メモリの負荷試験（memtest）を含む
+sudo dcgmi diag -r 4
+```
+
+**受け入れではレベル 3 以上を全ノードで流してください。** 負荷をかける試験（targeted stress / power）はレベル 3 から、メモリの負荷試験はレベル 4 にだけ入っています。targeted stress は負荷の最中に出た熱や PCIe のエラーも報告します。
+
+<Callout type="field">
+
+**このコースでは、これをバーンインの代わりとして扱います。**
+
+DCGM の文書は、受け入れやバーンインの手順そのものは定めていません。ここでの狙いは、受け入れ期間中に負荷をかけて、交換できるうちに問題を見つけることです。
+
+レベル 3 を全ノードで数回、時間を空けて流すのが現実的な落としどころです。時間が取れるなら、メモリの負荷試験を含むレベル 4 も流します。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">① 単体 — DCGM diag（続き）</h2>
+
+あわせて、GPU コース レッスン 2 で扱った **Xid エラー**を確認します。
+
+```bash
+# 過去の Xid を洗う
+sudo dmesg | grep -i xid
+sudo journalctl -k | grep -i xid
+```
+
+<Callout type="warning" title="Xid が出ているノードを引き渡さない">
+
+Xid 48（Double Bit ECC）は、GPU で訂正できないエラーが起きたことを示します。Xid 79 は GPU にアクセスできなくなったことを示し、NVIDIA のカタログは原因に PCIe リンクや GPU のハードウェアの故障のほか、ドライバの問題も挙げています。
+
+**受け入れ期間中に出たノードは、レッスン 6 の切り分け手順に沿って確かめてから引き渡してください。** 運用に入ってから出ると、そのノードを使っていた学習ジョブが落ちます。AI 基盤コース レッスン 6 で見たとおり、分散学習は 1 ノード落ちるとジョブ全体が止まります。
+
+</Callout>
+
+---
+
+## ② ノード内 — nccl-tests（単一ノード）
+
+GPU コース レッスン 3 とラボ「[GPU ジョブを配置する](/labs/gpu-placement/)」で扱った集合通信を、実測します。
+
+```bash
+# 1 ノードの全 GPU で All-Reduce
+./build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
+```
+
+```text
+# 出力の形（数値は GPU と NVLink の世代で変わるので省く）
+   size(B)  count  type  time(us)  algbw(GB/s)  busbw(GB/s)
+1073741824   ...   float     ...          ...          ...
+```
+
+見るのは **`busbw`**（bus bandwidth）です。`algbw` はアルゴリズム上の見かけの帯域で、リンクの実効帯域と直接は比較できません。
+
+**busbw を、そのノードの NVLink の理論値と突き合わせます。** nccl-tests の文書は、busbw をハードウェアのピーク帯域と比べるための値としています。
+
+何割出ていれば合格かという目安は、nccl-tests の文書には書かれていません。**合否の基準は、同じ機種の他のノードや、NGC のイメージでの実測をもとに自分たちで決めます。**
+
+```bash
+# 経路が NVLink になっているか
+nvidia-smi topo -m
+```
+
+<Callout type="pitfall">
+
+**busbw が低いときは、GPU の故障を疑う前に経路を確かめます。**
+
+`nvidia-smi topo -m` で GPU 間が `NV#`（NVLink）になっているかを見ます。NCCL のログに `via SHM` と出ていれば、GPU 間の直接通信ができず、ホストのメモリを経由しています（NCCL のドキュメント）。
+
+</Callout>
+
+---
+
+## ③ ノード間 — nccl-tests（複数ノード）
+
+ファブリックを越えた集合通信を実測します。ここが計算ファブリックの受け入れ試験です。
+
+```bash
+# 2 ノード × 8 GPU で All-Reduce（起動方法は環境による）
+mpirun -np 16 -H node1:8,node2:8 \
+  ./build/all_reduce_perf -b 8 -e 8G -f 2 -g 1
+```
+
+**経路の確認を必ずログで行ってください。** AI 基盤コース レッスン 3 で扱った読み方です。
+
+```bash
+NCCL_DEBUG=INFO mpirun ... 2>&1 | grep -E 'NET/|via|Connected'
+```
+
+```text
+NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB        ← IB を使えている
+NCCL INFO Channel 00 : 0[7000] -> 1[a000] via P2P/direct pointer   ← GPU 間の直接アクセス（NVLink か PCIe）
+NCCL INFO Channel 00 : 7[e000] -> 8[7000] [send] via NET/IB/0/GDRDMA ← GPUDirect 有効
+```
+
+---
+
+<h2 className="slide-cont">③ ノード間 — nccl-tests（複数ノード）（続き）</h2>
+
+<Callout type="warning" title="ここで初めて分かること">
+
+前のレッスンで「GPUDirect RDMA が効いているかは、NCCL を動かすまで分からない」と書きました。それがこのログです。
+
+- **`Using network Socket`** … IB が使われていない。TCP に落ちている
+- **`via SHM`** … GPU 間の直接通信ができず、ホストのメモリを経由している
+- **`GDRDMA` が出ない** … GPUDirect RDMA が使われていない
+
+どれも、エラーで止まるのではなく**経路が変わるだけの表示**です。だから実測とログの確認を受け入れ項目に入れます。
+
+</Callout>
+
+### ファブリック自体の健全性
+
+AI 基盤コース レッスン 2 で扱ったコマンドです。InfiniBand の場合、リンクの品質までここで見ます。
+
+```bash
+# ファブリック全体の診断。結果は既定で /var/tmp/ibdiagnet2/ に出る
+sudo ibdiagnet
+
+# ポートカウンタは ibdiagnet2.pm に出る（ibdiagnet のマニュアルの Dump Files）
+grep -i -n symbol /var/tmp/ibdiagnet2/ibdiagnet2.pm
+```
+
+**シンボルエラーの多いリンクを洗い出します。** どこからを「多い」とするかの目安として、旧世代の InfiniBand スイッチ（Sun Datacenter InfiniBand Switch 72）の文書は、少数なら監視を続けてよいとし、誤り率 10⁻¹² から 1 時間あたり 120 件を上限としています。受け入れで閾値を決めておき、超えたリンクは運用に入る前に原因を調べます。ファシリティコース レッスン 5 で扱った挿し直し・清掃・交換が、その手段になります。
+
+---
+
+## 引き渡し前のチェックリスト
+
+```text
+単体
+  □ 全ノードで dcgmi diag -r 3 が合格
+  □ 時間を空けて複数回実施（初期不良の炙り出し）
+  □ Xid エラーが 1 件も出ていない
+  □ 全ノードで GPU の枚数・シリアル・ドライバ版を記録
+
+ノード内
+  □ nvidia-smi topo -m で GPU 間が NV#
+  □ 単一ノードの busbw が、自分たちで決めた基準値以上
+```
+
+---
+
+<h2 className="slide-cont">引き渡し前のチェックリスト（続き）</h2>
+
+```text
+ノード間
+  □ 複数ノードの busbw が期待値に達している
+  □ NCCL ログで IB / GDRDMA が使われていることを確認
+  □ 全ノードペアで測定し、遅いペアがないことを確認
+  □ ibdiagnet で、シンボルエラーが閾値を超えたリンクがない
+
+その他
+  □ BMC に全ノード到達できる（帯域外管理が独立していること）
+  □ ファームウェア版を全ノードで記録し、揃えてある
+  □ 構成情報（シリアル、MAC、ポート対応表）を台帳化
+```
+
+---
+
+<h2 className="slide-cont">引き渡し前のチェックリスト（続き）</h2>
+
+<Callout type="field">
+
+**「全ノードペアで測る」を省略しないでください。**
+
+全体で測って平均が出ていても、特定の 1 ペアだけ遅いことがあります。全ペアを測れば、そのペアを特定できます。
+
+AI 基盤コース レッスン 3 で触れたとおり、ノードペアを総当たりで測るのが不良リンクの特定に一番早い方法です。台数が多いと時間はかかりますが、**運用に入ってから探すよりはるかに安く済みます。**
+
+</Callout>
+
+---
+
+<Quiz
+  id="q1"
+  question="2 ノード間で nccl-tests を実行したところ、busbw が単一ノードの場合の 10 分の 1 程度でした。NCCL_DEBUG=INFO のログを確認すると NCCL INFO Using network Socket と出ています。何が起きていますか。"
+  options={[
+    "GPU が故障している",
+    "InfiniBand が使われておらず、通信が TCP にフォールバックしている。NIC のドライバ、ポート状態、NCCL の設定を確認する",
+    "NVLink が張れていない",
+    "これは正常な出力で、性能は期待どおり"
+  ]}
+  answer={1}
+  explanation="Using network Socket は、NCCL が RDMA ではなく TCP ソケットで通信していることを示します。InfiniBand を使えていれば NET/IB と出ます。ジョブは失敗しないことがありますが、性能は落ちえます。ibstat でポートが Active か、DOCA / MOFED が正しく入っているか、NCCL がデバイスを認識しているかを順に確認します。NVLink はノード内の接続なので、このログとは別の話です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="納品された GPU ノードの受け入れ検証で、dcgmi diag のレベルを選びます。レベル 1 で全項目が合格しました。このまま運用へ引き渡してよいですか。"
+  options={[
+    "よい。全項目が合格しているため問題ない",
+    "よくない。レベル 1 は導入の前提条件と GPU が報告する状態の確認（software プラグイン）だけで、PCIe・NVLink・メモリの試験も、負荷をかける試験も入っていない。レベル 3 以上を時間を空けて複数回実施すべき",
+    "よくない。レベル 2 を追加すれば十分",
+    "レベルに関係なく、dcgmi diag は受け入れ検証には使えない"
+  ]}
+  answer={1}
+  explanation="DCGM の文書では、レベル 1 に入っているのは software プラグインだけです。ドライバや権限などの導入の前提条件と、リタイアしたページのように GPU が報告しているハードウェアの状態を確かめますが、試験はしません。PCIe と NVLink、GPU メモリの試験はレベル 2 から、計算性能と電力に負荷をかける試験はレベル 3 から、メモリの負荷試験はレベル 4 にだけ入っています。受け入れではレベル 3 以上を全ノードで、時間を空けて複数回流し、交換できる期間のうちに問題を見つけます。あわせて Xid エラーの有無も確認します。"
+/>

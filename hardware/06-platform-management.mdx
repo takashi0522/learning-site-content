@@ -1,0 +1,308 @@
+---
+title: 電源・冷却と BMC による遠隔管理
+description: OS が落ちても触れる管理経路と、ハードウェア障害の予兆をイベントログから拾う方法を押さえます。
+order: 6
+minutes: 17
+tags: ["BMC", "IPMI", "Redfish", "PSU", "cooling", "firmware"]
+objectives:
+  - BMC が独立して動作する意味と、できることを説明できる
+  - SEL（システムイベントログ）から障害の予兆を読み取れる
+  - 電源冗長と冷却の前提を理解し、設置時の要件を説明できる
+references:
+  - label: "DMTF Redfish Specifications"
+    url: "https://www.dmtf.org/standards/redfish"
+  - label: "ipmitool(1) — Linux manual page"
+    url: "https://manpages.debian.org/stable/ipmitool/ipmitool.1.en.html"
+  - label: "Intelligent Platform Management Interface (IPMI) Specification v2.0"
+    url: "https://www.intel.com/content/www/us/en/products/docs/servers/ipmi/ipmi-second-gen-interface-spec-v2-rev1-1.html"
+---
+
+## BMC: サーバーの中のもう一台のコンピュータ
+
+サーバーには、メインの CPU とは完全に独立した小さなプロセッサが載っています。**BMC**（Baseboard Management Controller）です。ベンダーによって iDRAC（Dell）、iLO（HPE）、IMM/XCC（Lenovo）などの名前で呼ばれます。
+
+BMC の重要な性質は次の 2 点です。
+
+- **スタンバイ電源で動く**。サーバーの電源が切れていても、電源ケーブルが繋がっていれば動作している
+- **OS から独立している**。カーネルパニックでもハングでも、BMC は生きている
+
+つまり、**OS が応答しなくなった状態でも、BMC 経由でサーバーを操作できます。**
+
+| できること | 具体例 |
+| --- | --- |
+| 電源操作 | 電源 ON/OFF、強制リセット |
+| コンソール | 画面の遠隔表示と操作（仮想 KVM） |
+| 仮想メディア | 手元の ISO をマウントして OS を再インストール |
+| センサー監視 | 温度、ファン回転数、電圧、消費電力 |
+| イベントログ | ハードウェア障害の履歴（SEL） |
+| ファームウェア更新 | BIOS/UEFI、BMC 自身、各種デバイス |
+
+---
+
+<h2 className="slide-cont">BMC: サーバーの中のもう一台のコンピュータ（続き）</h2>
+
+<Callout type="warning" title="管理ネットワークは分離する">
+
+BMC はサーバーを完全に制御できるため、**乗っ取られるとホストの中身をすべて掌握されます**。次は最低限の前提として扱ってください。
+
+- 業務ネットワークとは分離した管理 VLAN に置く
+- インターネットから直接到達できる場所に置かない
+- 出荷時の既定パスワードを必ず変更する
+- 使わないサービス（旧来の IPMI over LAN など）は無効化する
+
+IPMI v2.0 のプロトコル自体に既知の設計上の弱点があるため、可能なら **Redfish（HTTPS）に寄せる**のが現在の方針です。
+
+</Callout>
+
+---
+
+## ipmitool と Redfish
+
+### ipmitool
+
+古くからある共通インターフェースで、ベンダーを問わず使えます。
+
+```bash
+# ローカル（OS 経由。カーネルモジュール ipmi_si / ipmi_devintf が必要）
+sudo ipmitool sdr list
+sudo ipmitool chassis status
+
+# リモート（管理 LAN 経由）
+ipmitool -I lanplus -H 10.0.100.21 -U admin -P '...' power status
+ipmitool -I lanplus -H 10.0.100.21 -U admin -P '...' sel list
+```
+
+```text
+# ipmitool sdr list の出力例
+CPU1 Temp        | 47 degrees C      | ok
+Inlet Temp       | 22 degrees C      | ok        ← 吸気温度。設置環境の指標
+FAN1 RPM         | 6720 RPM          | ok
+PSU1 Status      | 0x01              | ok
+PSU2 Status      | 0x01              | ok
+Pwr Consumption  | 285 Watts         | ok
+```
+
+<Callout type="pitfall">
+
+コマンドラインにパスワードを直接書くと、`ps` や shell の履歴に残ります。`-f` でファイルから読ませるか、環境変数 `IPMI_PASSWORD` と `-E` を使ってください。
+
+```bash
+ipmitool -I lanplus -H 10.0.100.21 -U admin -f /root/.ipmipw power status
+```
+
+</Callout>
+
+### Redfish
+
+IPMI の後継として DMTF が標準化した、**HTTPS + JSON** の管理インターフェースです。curl とスクリプトだけで扱えるため、自動化との相性が良好です。
+
+---
+
+<h2 className="slide-cont">ipmitool と Redfish（続き）</h2>
+
+```bash
+# サービスのルート（認証不要で構造を確認できる）
+curl -sk https://10.0.100.21/redfish/v1/ | jq .
+
+# システム情報
+curl -sku admin:PASS https://10.0.100.21/redfish/v1/Systems/1 | jq '.Status, .PowerState, .MemorySummary'
+
+# 電源操作
+curl -sku admin:PASS -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"ResetType":"ForceRestart"}' \
+  https://10.0.100.21/redfish/v1/Systems/1/Actions/ComputerSystem.Reset
+```
+
+構造がツリー状になっているため、`/redfish/v1/` から辿っていけばベンダー固有のドキュメントなしでも目的の情報に到達できます。
+
+---
+
+## SEL: 障害の履歴が残っている場所
+
+**SEL**（System Event Log）は BMC が記録するハードウェアイベントのログです。OS のログとは独立しているため、**OS が起動しない障害でも記録が残ります**。
+
+```bash
+ipmitool sel list
+ipmitool sel elist        # より詳しい形式
+```
+
+```text
+  1 | 09/12/2026 | 03:14:22 | Memory #0x02 | Correctable ECC | Asserted
+  2 | 09/14/2026 | 11:02:51 | Memory #0x02 | Correctable ECC | Asserted
+  3 | 09/17/2026 | 22:45:03 | Memory #0x02 | Uncorrectable ECC | Asserted
+  4 | 09/17/2026 | 22:45:04 | System Event | OEM System Boot Event
+```
+
+この例では、**訂正可能エラーが 5 日間にわたって同じ DIMM に出続けた末に、訂正不能エラーで停止しています**。レッスン 3 で扱った CE の監視ができていれば、9/12 の時点で予防交換できていました。
+
+<Callout type="field">
+
+障害対応の初動で、**OS のログと SEL の両方を必ず見てください。** 「原因不明の再起動」の多くは、SEL に答えが書かれています。
+
+- 電源喪失 → `Power Unit | Power off/down`
+- 熱による停止 → `Temperature | Upper Critical`
+- メモリ障害 → `Memory | Uncorrectable ECC`
+- 電源ユニット故障 → `Power Supply | Failure detected`
+
+SEL は容量が有限で、埋まると古いものから消えるか記録が止まります。定期的に収集・退避し、確認後は `ipmitool sel clear` で空けておく運用が有効です。
+
+</Callout>
+
+---
+
+## 電源: 冗長の前提
+
+サーバーの電源ユニット（PSU）は通常 2 台以上搭載され、冗長構成を取ります。
+
+| 構成 | 意味 |
+| --- | --- |
+| **1+1** | 1 台で全負荷をまかなえる。1 台故障しても継続 |
+| **2+0** | 2 台合計で負荷をまかなう。**冗長ではない** |
+| **2+2** | 高消費電力機の冗長構成 |
+
+<Callout type="pitfall" title="2台挿さっていても冗長とは限らない">
+
+高性能な構成（GPU 複数枚など）では、消費電力が PSU 1 台の容量を超え、**2 台必須（2+0）**になっていることがあります。この状態で 1 台が故障すると、サーバーは落ちます。
+
+BMC の電源設定で冗長ポリシーを確認してください。
+
+```bash
+ipmitool sdr type 'Power Supply'
+ipmitool sensor get 'Pwr Consumption'
+```
+
+実消費電力が PSU 1 台の定格を超えていないかを、実測値で確認するのが確実です。
+
+</Callout>
+
+### 給電系統を分ける
+
+PSU を 2 台にしても、**両方を同じ分電盤から取っていれば冗長になりません**。ブレーカーが落ちれば両方同時に落ちます。
+
+```text
+     系統A ──► PDU A ──► PSU 1
+                                 ← 別々の系統から取る
+     系統B ──► PDU B ──► PSU 2
+```
+
+ラック設置時は、A/B 2 系統の給電と、それぞれへの結線までが要件です。設計時に見落とすと、後から配線をやり直すことになります。
+
+---
+
+## 冷却: 吸気温度が上限を決める
+
+サーバーは**前面から吸気し、背面へ排気**します。この流れを前提に、データセンターは冷たい通路（コールドアイル）と熱い通路（ホットアイル）を交互に配置します。
+
+```text
+コールドアイル        ホットアイル        コールドアイル
+     │                    ▲                    │
+     ▼                    │                    ▼
+  [ラック前面] ═══► サーバー ═══► [ラック背面]
+```
+
+**ラックの向きを間違えると、隣のサーバーの排気を吸い込みます。** また、空きスロットにブランクパネルを入れないと、背面の熱気が前面に回り込みます。
+
+```bash
+# 吸気温度（Inlet Temp）を監視する。これが設置環境の実態を示す
+ipmitool sdr type Temperature
+```
+
+| 吸気温度 | 状態 |
+| --- | --- |
+| 18–27°C | ASHRAE 推奨範囲。正常 |
+| 28–35°C | 許容範囲だが、ファンが高回転になり消費電力が増える |
+| 35°C 超 | サーマルスロットリングの危険。原因を調査する |
+
+---
+
+<h2 className="slide-cont">冷却: 吸気温度が上限を決める（続き）</h2>
+
+<Callout type="warning" title="サーマルスロットリング">
+
+CPU が上限温度に近づくと、**周波数を強制的に下げて発熱を抑えます**（レッスン 2 のターボの逆方向）。この状態では性能が大幅に落ちますが、OS からは「なぜか遅い」としか見えません。
+
+```bash
+# スロットリングが発生しているか
+sudo turbostat --interval 5    # PkgTmp と、周波数の低下を確認
+sudo ipmitool sdr type Temperature
+dmesg | grep -i 'thermal\|throttl'
+```
+
+ファンの故障、フィルタの目詰まり、ブランクパネルの欠落、ラックの向き、空調の能力不足 — いずれも同じ症状として現れます。**「特定の 1 台だけ遅い」場合は、まず吸気温度とファン回転数を見てください。**
+
+</Callout>
+
+---
+
+## ファームウェア管理
+
+サーバーには多数のファームウェアが載っています。
+
+- BIOS / UEFI
+- BMC 本体
+- NIC、HBA / RAID コントローラ、SSD
+- CPU マイクロコード（脆弱性緩和はここで入ることが多い）
+
+```bash
+# OS 側から見えるバージョン
+sudo dmidecode -s bios-version
+sudo dmidecode -s bios-release-date
+ipmitool mc info | grep 'Firmware Revision'
+sudo nvme list                       # SSD のファームウェアリビジョン
+```
+
+<Callout type="note">
+
+ファームウェアは「動いているなら触らない」が長く定石でしたが、**投機実行の脆弱性緩和がマイクロコード更新で配布される**ようになり、セキュリティ上の理由で更新が必要になりました。
+
+一方で、ファームウェア更新は失敗すると機器が起動しなくなるリスクがあります。次を前提にしてください。
+
+- ベンダー提供の一括更新ツール（Dell iDRAC / HPE SUM など）を使う
+- 本番前に同一構成の検証機で確認する
+- 更新中は絶対に電源を落とさない
+- 適用したバージョンを台帳に残す
+
+CPU マイクロコードだけは、OS のパッケージ（`intel-microcode` / `amd64-microcode`）経由で起動時に適用する方法もあり、こちらはロールバックが容易です。
+
+</Callout>
+
+---
+
+## まとめ
+
+- BMC は**スタンバイ電源で動く独立したコンピュータ**。OS が落ちていても操作できる
+- 管理ネットワークは必ず分離する。BMC の奪取はホストの奪取と等しい
+- IPMI は互換性に優れるが、新規は **Redfish（HTTPS/JSON）**を基本にする
+- **SEL に障害の答えが残っている**。原因不明の再起動では必ず確認する
+- PSU が 2 台でも 2+0 なら冗長ではない。給電系統も A/B に分ける
+- 吸気温度とファン回転数は、性能低下の原因として最初に見る指標
+- ファームウェアは脆弱性緩和の配布経路でもあり、計画的な更新が必要
+
+<Quiz
+  id="q1"
+  question="サーバーが深夜に再起動していましたが、OS のログには何も記録が残っていません。次に確認すべき場所として最も適切なものはどれですか。"
+  options={[
+    "アプリケーションのログ",
+    "BMC の SEL（システムイベントログ）",
+    "/var/log/lastlog",
+    "ファイルシステムのジャーナル"
+  ]}
+  answer={1}
+  explanation="OS のログに何も残らない再起動は、OS が動作を継続できない形で停止したことを意味します（電源喪失、訂正不能メモリエラー、熱による緊急停止など）。BMC は OS から独立しスタンバイ電源で動作するため、これらのイベントを SEL に記録しています。ipmitool sel list が初動の確認先です。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="同一構成のサーバー群のうち、1台だけ処理性能が明らかに低い状態が続いています。CPU 使用率もメモリも他と同じ傾向です。最初に確認すべきものはどれですか。"
+  options={[
+    "アプリケーションのバージョン差異",
+    "吸気温度とファン回転数（サーマルスロットリングの有無）",
+    "ディスクの空き容量",
+    "ネットワークの MTU 設定"
+  ]}
+  answer={1}
+  explanation="同一構成・同一負荷で1台だけ遅い場合、ハードウェア側の物理的要因を疑います。CPU が温度上限に近づくと周波数を強制的に下げるため、OS からは「なぜか遅い」としか見えません。ラック内の位置、ファンの故障、フィルタの目詰まり、ブランクパネルの欠落などが原因になります。ipmitool sdr type Temperature と turbostat で確認できます。"
+/>

@@ -1,0 +1,299 @@
+---
+title: マルチ GPU と GPU 間通信
+description: 複数 GPU で処理を分ける方式と、その性能を決める集合通信・インターコネクトを整理します。
+order: 3
+minutes: 19
+tags: ["NCCL", "NVLink", "InfiniBand", "RoCE", "GPUDirect", "分散学習"]
+objectives:
+  - データ並列とモデル並列の違いと、それぞれの通信パターンを説明できる
+  - 集合通信（All-Reduce など）が性能を左右する理由を説明できる
+  - NCCL の通信経路を確認し、トポロジに合わせた配置を判断できる
+references:
+  - label: "NVIDIA Collective Communications Library (NCCL)"
+    url: "https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html"
+  - label: "GPUDirect RDMA — NVIDIA Docs"
+    url: "https://docs.nvidia.com/cuda/gpudirect-rdma/"
+  - label: "NVIDIA NVLink and NVSwitch"
+    url: "https://www.nvidia.com/en-us/data-center/nvlink/"
+---
+
+## なぜ複数 GPU が必要になるか
+
+理由は 2 つあり、**どちらなのかで必要な構成がまったく違います**。
+
+| 理由 | 何が足りない | 方式 | GPU 間通信の量 |
+| --- | --- | --- | --- |
+| **処理が遅い** | 演算能力 | データ並列 | 中（勾配の交換） |
+| **モデルが載らない** | VRAM 容量 | モデル並列 / テンソル並列 | **非常に多い** |
+
+レッスン 1 で見たとおり、データセンター GPU の VRAM は 80〜141GB です。これを超えるモデルは、**1 枚では物理的に動きません**。分割するしかない、というのが後者です。
+
+### データ並列
+
+各 GPU が**モデルの完全なコピー**を持ち、違うデータを処理します。
+
+```text
+GPU0: モデル全体 + データのバッチA → 勾配A
+GPU1: モデル全体 + データのバッチB → 勾配B
+GPU2: モデル全体 + データのバッチC → 勾配C
+GPU3: モデル全体 + データのバッチD → 勾配D
+        ↓
+   全 GPU の勾配を合計して配る（All-Reduce）
+        ↓
+   全 GPU が同じ更新済みモデルを持つ
+```
+
+通信はステップごとに 1 回、勾配の交換だけです。**実装が簡単で、スケールしやすい**のが利点です。
+
+### テンソル並列・パイプライン並列
+
+1 つのモデルを複数 GPU に分割します。
+
+- **テンソル並列** … 1 つの層の行列を分割する。**層ごとに通信が発生する**ため、極めて高速な GPU 間接続が必要
+- **パイプライン並列** … 層の集まりを GPU ごとに分ける。通信量は少ないが、待ちが生じる（パイプラインバブル）
+
+---
+
+<h2 className="slide-cont">なぜ複数 GPU が必要になるか（続き）</h2>
+
+<Callout type="field">
+
+**テンソル並列は、原則として NVLink で繋がった GPU 間でのみ使います。** PCIe 越しやノードをまたいで行うと、通信待ちが支配的になり、GPU を増やしたのに遅くなることがあります。
+
+実務では組み合わせます。
+
+```text
+ノード内（NVLink 接続の 8 GPU）: テンソル並列
+ノード間（ネットワーク）          : データ並列 / パイプライン並列
+```
+
+速い接続に通信の多い並列化を、遅い接続に通信の少ない並列化を割り当てる、という考え方です。レッスン 1 の `nvidia-smi topo -m` が、この配置を決める材料になります。
+
+</Callout>
+
+---
+
+## 集合通信が性能を決める
+
+複数 GPU が協調する処理は、**集合通信**（collective communication）という定型パターンに分解できます。
+
+| 操作 | 内容 | 使われる場面 |
+| --- | --- | --- |
+| **All-Reduce** | 全 GPU の値を合計し、結果を全 GPU が持つ | **データ並列の勾配集約（最頻出）** |
+| All-Gather | 各 GPU の断片を集めて、全 GPU が全体を持つ | ZeRO、テンソル並列 |
+| Reduce-Scatter | 合計しつつ、結果を分割して配る | ZeRO |
+| Broadcast | 1 つの GPU の値を全 GPU に配る | 初期化、パラメータ配布 |
+| All-to-All | 各 GPU が各 GPU に異なるデータを送る | MoE（Mixture of Experts） |
+
+---
+
+### All-Reduce の所要時間
+
+素朴に実装すると GPU 数に比例して遅くなりますが、**Ring All-Reduce** というアルゴリズムでは所要時間が GPU 数にほぼ依存しなくなります。
+
+```text
+データ量 D、GPU 数 N、リンク帯域 B のとき
+
+  Ring All-Reduce の転送量 ≒ 2D × (N-1)/N  →  N が大きくても 2D に漸近
+  所要時間 ≒ 2D / B
+```
+
+**つまり、通信時間はほぼ「データ量 ÷ 帯域」で決まります。** ここで効いてくるのがレッスン 1 の数字です。
+
+<Figure name="gpu-interconnect-paths" caption="同じ All-Reduce でも、どの経路を通るかで 70 倍変わる" />
+
+---
+
+<h2 className="slide-cont">集合通信が性能を決める（続き）</h2>
+
+計算自体が 100ms で終わるとしても、通信が 1,600ms かかれば**全体は通信律速**になります。GPU を増やしても速くなりません。
+
+<Callout type="pitfall">
+
+「GPU を 8 枚に増やしたのに、4 枚のときの 1.3 倍にしかならない」— 分散学習で最も多い相談です。
+
+まず疑うべきは**通信経路**です。`nvidia-smi topo -m` で `SYS` や `NODE` が出ている組み合わせを使っていないか、ノード間ネットワークが 10GbE しかないのに分散させていないか。演算能力ではなく接続が足りていないケースが大半です。
+
+</Callout>
+
+---
+
+## NCCL
+
+NVIDIA の集合通信ライブラリで、PyTorch や TensorFlow の分散処理はこれを経由します。**NCCL はトポロジを自動検出し、NVLink・PCIe・ネットワークの中から最適な経路を選びます。**
+
+```bash
+# NCCL が何を選んだかを表示させる（トラブル時に必須）
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET
+python train.py 2>&1 | grep -i nccl
+```
+
+```text
+NCCL INFO NCCL_IB_DISABLE set by environment to 0.
+NCCL INFO Channel 00/12 : 0 1 2 3 4 5 6 7
+NCCL INFO Using network IB                        ← InfiniBand を使っている
+NCCL INFO Connected all rings
+```
+
+出力で確認すべき点です。
+
+| 行 | 見るポイント |
+| --- | --- |
+| `Using network IB` / `Socket` | **`Socket` なら TCP/IP 経由**。RDMA が効いていない |
+| `via P2P/direct pointer` | GPU 間が直接接続（NVLink / PCIe P2P） |
+| `via SHM` | **ホストの共有メモリ経由**。GPU 直接通信が使えていない |
+| `NET/IB` | InfiniBand / RoCE を使用 |
+
+---
+
+<h2 className="slide-cont">NCCL（続き）</h2>
+
+<Callout type="warning" title="Socket にフォールバックしていないか">
+
+RDMA 対応のネットワークがあるのに `Using network Socket` と出ている場合、**本来の性能が出ていません**。TCP/IP スタックを経由するため、CPU を消費し、レイテンシも大きくなります。
+
+原因として多いもの。
+
+- コンテナに InfiniBand デバイス（`/dev/infiniband`）が渡されていない
+- `NCCL_IB_DISABLE=1` が設定されている
+- ドライバ（MLNX_OFED など）が入っていない
+- 使うインターフェースの指定が必要
+
+```bash
+# 使用するインターフェースを明示する
+export NCCL_SOCKET_IFNAME=eth0        # 管理用 NIC を誤って使わせない
+export NCCL_IB_HCA=mlx5_0,mlx5_1      # 使用する HCA を指定
+```
+
+**複数 NIC があるサーバーでは、NCCL が管理用の低速 NIC を選んでしまうことがあります。** `NCCL_SOCKET_IFNAME` で明示するのが定石です。
+
+</Callout>
+
+### 帯域を実測する
+
+```bash
+# NCCL のベンチマーク（nccl-tests）
+./build/all_reduce_perf -b 8 -e 8G -f 2 -g 8
+```
+
+```text
+   size    count   type  time(us)  algbw(GB/s)  busbw(GB/s)
+  1.0 GB  268435456  float   2431.0       411.2        719.6
+```
+
+**`busbw`（バス帯域）がリンクの理論値にどれだけ近いか**を見ます。NVLink 900GB/s の環境で `busbw` が 700GB/s 程度なら健全、100GB/s 台なら経路がおかしいと判断できます。
+
+---
+
+<h2 className="slide-cont">NCCL（続き）</h2>
+
+導入時にこの値を取っておくと、後から性能劣化が起きたときの比較基準になります。
+
+---
+
+## ノードをまたぐ: InfiniBand と RoCE
+
+1 台に載る GPU は最大 8 枚程度です。それを超える規模では、**ノード間のネットワークが性能を決めます**。
+
+| | **InfiniBand** | **RoCE v2** | 通常の TCP/IP |
+| --- | --- | --- | --- |
+| 実体 | 専用ネットワーク | **イーサネット上の RDMA** | イーサネット |
+| レイテンシ | 最も低い（1μs 前後） | 低い | 高い（10μs 以上） |
+| CPU 負荷 | ほぼゼロ | ほぼゼロ | **高い** |
+| 必要なもの | 専用スイッチ・HCA | ロスレス設定した Ethernet スイッチ | 何も要らない |
+| 運用の難度 | 専門知識が必要 | **設定が繊細** | 容易 |
+
+**RDMA**（Remote Direct Memory Access）が鍵です。相手ノードのメモリへ、**CPU とカーネルを介さずに**直接読み書きします。ネットワークコース レッスン 1 で辿った受信経路（割り込み → softirq → プロトコルスタック → ソケット）を、まるごと迂回します。
+
+### GPUDirect RDMA
+
+さらに進めて、**NIC が GPU の VRAM へ直接 DMA する**仕組みです。
+
+```text
+GPUDirect なし:
+  GPU VRAM → ホストメモリ → NIC → ネットワーク → NIC → ホストメモリ → GPU VRAM
+
+GPUDirect RDMA あり:
+  GPU VRAM → NIC → ネットワーク → NIC → GPU VRAM      ← ホストメモリを経由しない
+```
+
+ホストメモリへのコピーが往復で 2 回消えるため、レイテンシと CPU 負荷が大きく下がります。
+
+```bash
+# 有効になっているか
+lsmod | grep nvidia_peermem      # 新しめの環境
+lsmod | grep nv_peer_mem         # 従来
+```
+
+---
+
+<h2 className="slide-cont">ノードをまたぐ: InfiniBand と RoCE（続き）</h2>
+
+<Callout type="field">
+
+GPUDirect RDMA は、**NIC と GPU が同じ PCIe スイッチ配下にある**ときに最も効きます。ハードウェアコース レッスン 5 で扱った PCIe トポロジがそのまま効いてきます。
+
+```bash
+# NIC と GPU の距離を確認する
+nvidia-smi topo -m        # 出力に NIC の行も含まれる
+```
+
+GPU0 と `mlx5_0` の関係が `PIX`（同一 PCIe スイッチ配下）なら理想、`SYS`（ソケットまたぎ）なら CPU 間接続を経由するため効果が落ちます。
+
+8 GPU ノードでは「GPU 2 枚につき NIC 1 枚」「GPU 1 枚につき NIC 1 枚」のように、**GPU と NIC をペアで配置した設計**になっていることが多く、ジョブの GPU 割り当てをその設計に合わせる必要があります。
+
+</Callout>
+
+### RoCE の注意点
+
+RoCE は既存のイーサネット機器を使えるのが利点ですが、**パケットロスに非常に弱い**という性質があります。RDMA はロスを前提にしていないため、1 パケット落ちるだけで性能が激しく劣化します。
+
+そのため、スイッチ側で **PFC**（Priority Flow Control）や **ECN** を設定してロスレスに近い状態を作る必要があります。この設定が不完全だと、「動くけれど遅い」「たまに極端に遅い」という状態になり、原因の特定が困難です。
+
+**InfiniBand と比べて機器は安価ですが、設計と運用の難度は上がる**と考えてください。
+
+---
+
+## まとめ
+
+- 複数 GPU が必要な理由は **「速度が足りない」か「VRAM に載らない」か**。必要な構成が違う
+- テンソル並列は通信量が多い。**NVLink で繋がった範囲内で使う**
+- 通信時間はほぼ **データ量 ÷ 帯域**。NVLink と 100GbE では 70 倍違う
+- スケールしないときは、演算より先に**通信経路**を疑う
+- **`NCCL_DEBUG=INFO` で実際に選ばれた経路を確認する**。`Socket` フォールバックは要調査
+- `NCCL_SOCKET_IFNAME` で使う NIC を明示する。管理用 NIC を掴まれることがある
+- ノード間は InfiniBand か RoCE。**RoCE はロスに弱く、スイッチ側の設定が前提**
+- GPUDirect RDMA は NIC と GPU が同じ PCIe スイッチ配下にあると最も効く
+
+InfiniBand のファブリック運用（Subnet Manager、診断コマンド、SHARP）と NCCL のチューニングは、**AI 基盤コースのレッスン 2・3** で詳しく扱います。
+
+---
+
+<Quiz
+  id="q1"
+  question="GPU を 4 枚から 8 枚に増やしたところ、学習速度は 1.3 倍程度にしかなりませんでした。nvidia-smi topo -m を見ると、追加した 4 枚との接続が SYS と表示されています。最も妥当な解釈はどれですか。"
+  options={[
+    "GPU の演算能力が不足している",
+    "追加した GPU との通信が CPU ソケット間接続を経由しており、All-Reduce の通信時間が支配的になっている",
+    "VRAM が不足している",
+    "CUDA のバージョンが古い"
+  ]}
+  answer={1}
+  explanation="SYS は NUMA ノードをまたぐ最も遅い接続経路を示します。データ並列では毎ステップ All-Reduce で勾配を交換するため、通信時間はほぼ「データ量 ÷ 帯域」で決まります。NVLink なら数十 ms で済む交換が、ソケット間接続経由では桁違いに遅くなり、GPU を増やしても通信待ちで相殺されます。ジョブの GPU 割り当てをトポロジに合わせるか、NVLink で繋がった範囲に収める必要があります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="InfiniBand を備えたクラスタで分散学習を実行したところ、NCCL_DEBUG=INFO の出力に「Using network Socket」と表示されました。これは何を意味しますか。"
+  options={[
+    "正常。NCCL は常に Socket を使用する",
+    "RDMA が使われず TCP/IP スタック経由で通信しており、本来の性能が出ていない。IB デバイスの受け渡しやドライバ、NCCL_IB_DISABLE の設定を確認する必要がある",
+    "InfiniBand のケーブルが断線している",
+    "GPU 間の NVLink が無効になっている"
+  ]}
+  answer={1}
+  explanation="「Using network Socket」は NCCL が RDMA ではなく通常の TCP/IP ソケットを使っていることを示します。カーネルのプロトコルスタックを経由するため CPU を消費しレイテンシも大きく、InfiniBand の利点が失われます。コンテナに /dev/infiniband が渡されていない、MLNX_OFED などのドライバが入っていない、NCCL_IB_DISABLE=1 が設定されている、といった原因が典型です。"
+/>
