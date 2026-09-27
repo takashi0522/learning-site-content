@@ -1,0 +1,786 @@
+@import "tailwindcss";
+
+/*
+ * Tailwind CSS v4 は設定を CSS 側に持つ (tailwind.config.js は存在しない)。
+ * ここには「意味の名前」のトークンだけを登録し、実際の色は :root / dark 側で差し替える。
+ * これで JSX に dark: を書かなくてもテーマが切り替わる。
+ */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-ng: var(--ng);
+
+  --font-sans: "Segoe UI", "Hiragino Kaku Gothic ProN", "Noto Sans JP", Meiryo, system-ui, sans-serif;
+  --font-mono: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+
+:root {
+  color-scheme: light;
+  --bg: oklch(98.5% 0.004 260);
+  --surface: oklch(100% 0 0);
+  --surface-2: oklch(96.5% 0.006 260);
+  --border: oklch(90% 0.008 260);
+  --fg: oklch(21% 0.02 260);
+  --fg-muted: oklch(45% 0.015 260);
+  --fg-subtle: oklch(60% 0.012 260);
+  --ok: oklch(58% 0.14 150);
+  --ng: oklch(58% 0.19 25);
+  --accent: oklch(55% 0.16 255);
+  --accent-fg: oklch(99% 0 0);
+  --accent-soft: oklch(95% 0.04 255);
+  /* コースカードの装飾の濃さ。明るい背景では薄く見えるので強めに取る */
+  --course-art-opacity: 0.24;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: oklch(17% 0.015 265);
+    --surface: oklch(21% 0.018 265);
+    --surface-2: oklch(25% 0.02 265);
+    --border: oklch(32% 0.02 265);
+    --fg: oklch(95% 0.008 265);
+    --fg-muted: oklch(74% 0.015 265);
+    --fg-subtle: oklch(58% 0.015 265);
+    --ok: oklch(72% 0.15 150);
+    --ng: oklch(70% 0.17 25);
+    --accent: oklch(72% 0.14 255);
+    --accent-fg: oklch(17% 0.02 265);
+    --accent-soft: oklch(28% 0.05 255);
+    --course-art-opacity: 0.13;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: oklch(17% 0.015 265);
+  --surface: oklch(21% 0.018 265);
+  --surface-2: oklch(25% 0.02 265);
+  --border: oklch(32% 0.02 265);
+  --fg: oklch(95% 0.008 265);
+  --fg-muted: oklch(74% 0.015 265);
+  --fg-subtle: oklch(58% 0.015 265);
+  --ok: oklch(72% 0.15 150);
+  --ng: oklch(70% 0.17 25);
+  --accent: oklch(72% 0.14 255);
+  --accent-fg: oklch(17% 0.02 265);
+  --accent-soft: oklch(28% 0.05 255);
+  --course-art-opacity: 0.13;
+}
+
+/* コース別アクセント: 要素に data-accent を付けると配下すべてに効く */
+[data-accent="linux"] {
+  --accent: oklch(62% 0.16 62);
+  --accent-soft: oklch(94% 0.05 62);
+}
+[data-accent="network"] {
+  --accent: oklch(52% 0.14 240);
+  --accent-soft: oklch(94% 0.04 240);
+}
+[data-accent="hardware"] {
+  --accent: oklch(52% 0.18 300);
+  --accent-soft: oklch(95% 0.04 300);
+}
+[data-accent="middleware"] {
+  --accent: oklch(52% 0.13 165);
+  --accent-soft: oklch(94% 0.04 165);
+}
+[data-accent="ops"] {
+  --accent: oklch(52% 0.17 12);
+  --accent-soft: oklch(95% 0.04 12);
+}
+[data-accent="gpu"] {
+  --accent: oklch(50% 0.15 130);
+  --accent-soft: oklch(94% 0.05 130);
+}
+[data-accent="facility"] {
+  --accent: oklch(52% 0.16 330);
+  --accent-soft: oklch(95% 0.04 330);
+}
+[data-accent="ai"] {
+  --accent: oklch(50% 0.13 195);
+  --accent-soft: oklch(94% 0.04 195);
+}
+[data-accent="auth"] {
+  --accent: oklch(50% 0.15 265);
+  --accent-soft: oklch(94% 0.04 265);
+}
+[data-accent="buildout"] {
+  --accent: oklch(54% 0.15 95);
+  --accent-soft: oklch(94% 0.05 95);
+}
+[data-accent="gpunet"] {
+  --accent: oklch(53% 0.17 35);
+  --accent-soft: oklch(94% 0.05 35);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) [data-accent="linux"] {
+    --accent: oklch(80% 0.14 72);
+    --accent-soft: oklch(30% 0.05 72);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="network"] {
+    --accent: oklch(78% 0.12 230);
+    --accent-soft: oklch(29% 0.05 230);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="hardware"] {
+    --accent: oklch(77% 0.13 300);
+    --accent-soft: oklch(30% 0.05 300);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="middleware"] {
+    --accent: oklch(78% 0.13 165);
+    --accent-soft: oklch(29% 0.05 165);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="ops"] {
+    --accent: oklch(76% 0.13 12);
+    --accent-soft: oklch(30% 0.05 12);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="gpu"] {
+    --accent: oklch(80% 0.16 130);
+    --accent-soft: oklch(29% 0.05 130);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="facility"] {
+    --accent: oklch(77% 0.13 330);
+    --accent-soft: oklch(30% 0.05 330);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="ai"] {
+    --accent: oklch(79% 0.12 195);
+    --accent-soft: oklch(29% 0.05 195);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="auth"] {
+    --accent: oklch(76% 0.13 265);
+    --accent-soft: oklch(30% 0.05 265);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="buildout"] {
+    --accent: oklch(80% 0.14 95);
+    --accent-soft: oklch(30% 0.05 95);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+  :root:not([data-theme="light"]) [data-accent="gpunet"] {
+    --accent: oklch(77% 0.14 35);
+    --accent-soft: oklch(30% 0.05 35);
+    --accent-fg: oklch(17% 0.02 265);
+  }
+}
+
+:root[data-theme="dark"] [data-accent="linux"] {
+  --accent: oklch(80% 0.14 72);
+  --accent-soft: oklch(30% 0.05 72);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="network"] {
+  --accent: oklch(78% 0.12 230);
+  --accent-soft: oklch(29% 0.05 230);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="hardware"] {
+  --accent: oklch(77% 0.13 300);
+  --accent-soft: oklch(30% 0.05 300);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="middleware"] {
+  --accent: oklch(78% 0.13 165);
+  --accent-soft: oklch(29% 0.05 165);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="ops"] {
+  --accent: oklch(76% 0.13 12);
+  --accent-soft: oklch(30% 0.05 12);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="gpu"] {
+  --accent: oklch(80% 0.16 130);
+  --accent-soft: oklch(29% 0.05 130);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="facility"] {
+  --accent: oklch(77% 0.13 330);
+  --accent-soft: oklch(30% 0.05 330);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="ai"] {
+  --accent: oklch(79% 0.12 195);
+  --accent-soft: oklch(29% 0.05 195);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="auth"] {
+  --accent: oklch(76% 0.13 265);
+  --accent-soft: oklch(30% 0.05 265);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="buildout"] {
+  --accent: oklch(80% 0.14 95);
+  --accent-soft: oklch(30% 0.05 95);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="gpunet"] {
+  --accent: oklch(77% 0.14 35);
+  --accent-soft: oklch(30% 0.05 35);
+  --accent-fg: oklch(17% 0.02 265);
+}
+
+/*
+ * トップページの装飾。**情報を持たない。**
+ *
+ * 文字が多い画面なので、目を休ませる面を作るのが目的。読ませるものではないため、
+ * 本文の可読性を落とさないところまでしか濃くしない (彩度も不透明度も低く保つ)。
+ * 色は --accent 由来なので、テーマを切り替えても勝手に追従する。
+ */
+.hero-aura {
+  position: absolute;
+  top: -140px;
+  left: 0;
+  z-index: -1;
+  width: 100%;
+  height: 560px;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      38% 44% at 20% 38%,
+      color-mix(in oklab, var(--accent) 40%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      32% 38% at 76% 24%,
+      color-mix(in oklab, var(--ok) 28%, transparent),
+      transparent 72%
+    ),
+    radial-gradient(
+      42% 48% at 54% 76%,
+      color-mix(in oklab, var(--accent) 22%, transparent),
+      transparent 74%
+    );
+  filter: blur(30px);
+  opacity: 0.85;
+}
+
+/*
+ * 細かい点の地紋。上端から下へ向かって消す。
+ * 一様に敷くと本文の下にも出て読みにくいので、mask で必ず減衰させる。
+ */
+.dot-field {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: -1;
+  width: 100%;
+  height: 560px;
+  pointer-events: none;
+  background-image: radial-gradient(
+    color-mix(in oklab, var(--fg) 26%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: 20px 20px;
+  -webkit-mask-image: radial-gradient(64% 58% at 50% 2%, #000 0%, transparent 76%);
+  mask-image: radial-gradient(64% 58% at 50% 2%, #000 0%, transparent 76%);
+}
+
+/*
+ * カードの背景画 (コース一覧・ラボ一覧)。これも情報を持たない装飾。
+ *
+ * 画像は **グレースケールのまま** 置き、色付けは background-blend-mode に任せている。
+ * こうするとファイルが 1 枚で済み、ライト/ダークの切り替えにも、カードに付いている
+ * data-accent (コース別の色) にも自動で追従する。図を C 経由で書いているのと同じ狙い。
+ *
+ * 焼き付けた 2 色の画像にすると、テーマごと・コースごとにファイルが要る。
+ */
+/*
+ * レッスン冒頭の帯。
+ *
+ * `.lesson-intro` はスライドモードで CSS ごと隠れるので、ここに置いた装飾は
+ * **1 枚 850px のスライド予算を一切食わない**。記事として読むときだけ出る。
+ *
+ * 画像は `public/course-band/` に、**この帯と同じ 5.12:1 で置く**。カード用の
+ * 640x360 を流用すると上端しか映らず、何が描いてあるのか分からない絵になる。
+ * 比率を合わせてあるので、ここでは cover しても実質切れない。
+ *
+ * コース内のレッスンは同じ絵でよい (コースの識別が目的で、レッスンの識別ではない)。
+ */
+.lesson-band {
+  aspect-ratio: 1344 / 262;
+  max-height: 150px;
+  border-radius: 1rem;
+  background-color: var(--accent);
+  background-size: cover;
+  background-blend-mode: luminosity;
+  opacity: var(--course-art-opacity, 0.16);
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, transparent 94%);
+  mask-image: linear-gradient(to bottom, #000 0%, transparent 94%);
+}
+
+.card-art {
+  border-radius: inherit;
+  background-color: var(--accent);
+  background-position: center;
+  background-size: cover;
+  background-blend-mode: luminosity;
+  opacity: var(--course-art-opacity, 0.16);
+  /* 左に向かって消す。文章が乗る側に画を残さない */
+  -webkit-mask-image: linear-gradient(to left, #000 0%, transparent 58%);
+  mask-image: linear-gradient(to left, #000 0%, transparent 58%);
+  pointer-events: none;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- 教材本文のタイポグラフィ -------------------------------------- */
+/* Tailwind Typography は入れず、必要な範囲だけ自前で定義する */
+
+.prose {
+  line-height: 1.85;
+  color: var(--fg);
+}
+.prose > * + * {
+  margin-top: 1.1em;
+}
+.prose h2 {
+  font-size: 1.45rem;
+  font-weight: 700;
+  line-height: 1.4;
+  margin-top: 2.4em;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+  scroll-margin-top: 5rem;
+}
+.prose h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin-top: 2em;
+  scroll-margin-top: 5rem;
+}
+.prose h4 {
+  font-size: 1rem;
+  font-weight: 700;
+  margin-top: 1.6em;
+  color: var(--fg-muted);
+}
+.prose a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.prose ul,
+.prose ol {
+  padding-left: 1.4em;
+}
+.prose ul {
+  list-style: disc;
+}
+.prose ol {
+  list-style: decimal;
+}
+.prose li + li {
+  margin-top: 0.4em;
+}
+.prose li::marker {
+  color: var(--fg-subtle);
+}
+.prose blockquote {
+  border-left: 3px solid var(--accent);
+  padding: 0.2em 0 0.2em 1em;
+  color: var(--fg-muted);
+}
+.prose hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2.5em 0;
+}
+
+/* インラインコード (コードブロック内の span は除外) */
+.prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  padding: 0.12em 0.36em;
+  word-break: break-word;
+}
+
+.prose pre {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.7;
+  border: 1px solid var(--border);
+  border-radius: 0.7rem;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+}
+.prose pre code {
+  display: grid;
+  background: transparent;
+}
+
+/* rehype-pretty-code の 2 テーマ出力を CSS 変数で切り替える */
+.prose pre[data-theme],
+.prose code[data-theme] span {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .prose pre[data-theme],
+  :root:not([data-theme="light"]) .prose code[data-theme] span {
+    color: var(--shiki-dark);
+    background-color: var(--shiki-dark-bg);
+  }
+}
+:root[data-theme="dark"] .prose pre[data-theme],
+:root[data-theme="dark"] .prose code[data-theme] span {
+  color: var(--shiki-dark);
+  background-color: var(--shiki-dark-bg);
+}
+
+.prose figure[data-rehype-pretty-code-figure] figcaption {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--fg-subtle);
+  padding: 0 0.3rem 0.45rem;
+}
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  display: block;
+  overflow-x: auto;
+}
+.prose th,
+.prose td {
+  border: 1px solid var(--border);
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+.prose th {
+  background: var(--surface-2);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* ---- 図 (Figure / components/figures) -------------------------------- */
+
+/*
+ * 幅の上限は見栄えではなく制約。記事モード (prose 幅) とスライドモード
+ * (論理 1280px) で図の実寸をほぼ揃え、1 枚 850px の予算を図が食い潰さないようにする。
+ * rem 基準なので .slide-canvas の font-size: 18px には影響されない。
+ */
+.figure {
+  max-width: 48rem;
+  margin-inline: auto;
+}
+
+/*
+ * viewBox + width:100% + height:auto で、縦横比が読み込み前に確定する。
+ * これが崩れると slide-stage.tsx の scrollHeight 測定が空振りする。
+ */
+.figure svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: var(--font-sans);
+}
+
+/* 本文に収めると図の文字は小さくなるので、枠ごとクリック可能にして拡大へ誘導する */
+.figure-trigger {
+  position: relative;
+  display: block;
+  width: 100%;
+  appearance: none;
+  cursor: zoom-in;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  /* 下は拡大ヒットの帯を確保する分だけ広く取る (図の中身と重ねないため) */
+  padding: 1rem 1rem 1.85rem;
+  text-align: left;
+  transition: border-color 0.15s ease;
+}
+.figure-trigger:hover,
+.figure-trigger:focus-visible {
+  border-color: var(--accent);
+}
+.figure-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.figure-trigger-hint {
+  position: absolute;
+  right: 0.6rem;
+  bottom: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  padding: 0.1rem 0.55rem;
+  font-size: 0.68rem;
+  color: var(--fg-subtle);
+  opacity: 0.55;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.figure-trigger:hover .figure-trigger-hint,
+.figure-trigger:focus-visible .figure-trigger-hint {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/*
+ * 拡大表示。showModal() で開くとトップレイヤーに入るため、
+ * スライドの transform: scale() の影響を受けず実寸で描かれる。
+ */
+.figure-dialog {
+  /*
+   * Tailwind の preflight が全要素に margin: 0 を当てるため、
+   * ブラウザ既定の `dialog { margin: auto }` が消えて inset:0 の左上に貼り付く。
+   * 中央寄せはここで明示的に戻す必要がある。
+   */
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  /* vw はスクロールバーの幅を含むので、左右の余白が揃わない。% で取る */
+  width: min(1600px, 96%);
+  max-width: 96%;
+  max-height: 94%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: var(--surface);
+  padding: 0;
+  color: var(--fg);
+}
+.figure-dialog::backdrop {
+  background: rgb(0 0 0 / 0.7);
+}
+
+.figure-dialog-inner {
+  display: flex;
+  max-height: inherit;
+  flex-direction: column;
+}
+
+.figure-dialog-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border);
+  padding: 0.7rem 1rem;
+}
+.figure-dialog-label {
+  overflow: hidden;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--fg-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.figure-dialog-tools {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.4rem;
+}
+.figure-dialog-tools button {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface-2);
+  padding: 0.25rem 0.65rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--fg);
+  cursor: pointer;
+}
+.figure-dialog-tools button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.figure-dialog-tools button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.figure-dialog-ratio {
+  min-width: 2.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--fg-subtle);
+  text-align: center;
+}
+.figure-dialog-close {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.figure-dialog-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 1rem;
+}
+
+.figure-dialog-help {
+  border-top: 1px solid var(--border);
+  padding: 0.45rem 1rem 0.6rem;
+  font-size: 0.7rem;
+  color: var(--fg-subtle);
+  text-align: center;
+}
+
+/* ---- スライドモード ------------------------------------------------- */
+
+/*
+ * スライドは 16:9 の枠に収める。
+ * 枠の寸法と中身の縮尺は slide-stage.tsx が JS で決めてインラインで当てる
+ * (CSS 側に aspect-ratio や max-width を持たせると測定と干渉するため)。
+ */
+.slide-outer {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+}
+.slide-frame {
+  /* 測定前および flow 時のみここが効く。fit 時はインラインスタイルが優先される */
+  width: 100%;
+  min-height: 55vh;
+}
+
+/* スライド表示中は、レッスンの見出し・説明・ゴール枠を畳む。
+   スライドだけで 1 画面に収めるため (タイトルはスライド上部に出ている) */
+body[data-slide-mode="on"] .lesson-intro {
+  display: none;
+}
+/* スライドに使える高さを稼ぐため、ページ上下の余白も詰める */
+body[data-slide-mode="on"] main {
+  padding-top: 0.75rem;
+  padding-bottom: 0.75rem;
+}
+body[data-slide-mode="on"] main > div {
+  gap: 0.75rem;
+}
+
+/* レッスンページは max-w-3xl で読みやすさを優先しているが、
+   スライドだけはその制約を抜けて画面幅いっぱいまで広げる */
+.slide-view {
+  width: min(84rem, calc(100vw - 3rem));
+  max-width: none;
+  margin-inline: 50%;
+  transform: translateX(-50%);
+}
+
+/* 全画面時はヘッダなどが無い分、より大きく使える */
+.slide-view:fullscreen {
+  width: 100vw;
+  margin-inline: 0;
+  transform: none;
+  border: 0;
+  border-radius: 0;
+  justify-content: center;
+}
+
+/* 長いスライドを分割したときに付く「（続き）」見出し。
+   スライドでは文脈として要るが、記事として読むときは邪魔なので隠す */
+.slide-cont {
+  display: none;
+}
+.slide-view .slide-cont {
+  display: block;
+}
+/* 分割で生まれた区切り線も、記事として読むときは不要 (元は 1 つの節) */
+.prose section:has(> .slide-cont) > hr {
+  display: none;
+}
+
+/* 論理サイズ 1280px のキャンバス。見た目の大きさは scale で決まる */
+.slide-canvas {
+  padding: 1.75rem 2.5rem;
+  font-size: 18px;
+}
+/* 1 枚に収まりきらないスライドは、下端をぼかしてスクロールできることを示す */
+.slide-frame[data-overflowing="true"] {
+  position: relative;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 2.5rem), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 2.5rem), transparent);
+}
+
+.slide-frame[data-slide-frame="flow"] .slide-canvas {
+  padding: 0;
+  font-size: 1rem;
+}
+
+.slide-view .prose {
+  line-height: 1.75;
+}
+.slide-view .prose h2 {
+  margin-top: 0;
+  border-bottom: 0;
+  font-size: 1.85em;
+  line-height: 1.3;
+}
+.slide-view .prose h3 {
+  margin-top: 1.4em;
+}
+.slide-view .prose > * + * {
+  margin-top: 0.7em;
+}
+.slide-view .prose ul,
+.slide-view .prose ol {
+  margin-top: 0.5em;
+}
+.slide-view .prose li + li {
+  margin-top: 0.25em;
+}
+.slide-view .prose table {
+  font-size: 0.85em;
+}
+.slide-view .prose th,
+.slide-view .prose td {
+  padding: 0.35rem 0.6rem;
+}
+.slide-view .prose > *:first-child {
+  margin-top: 0;
+}
+/* スライドでは余白を詰めて、1 枚に入る情報量を増やす */
+.slide-view .prose pre {
+  padding: 0.8rem 1rem;
+  line-height: 1.6;
+}
+.slide-view .prose aside {
+  margin-block: 0.8em;
+  padding-block: 0.7rem;
+}
+
+/* キーボード操作が主になるのでフォーカスリングは常に見えるようにする */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
