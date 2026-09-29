@@ -11,6 +11,8 @@ objectives:
 references:
   - label: "NVIDIA DGX SuperPOD Rubin NVL8 RA — Key Components（Storage Requirements）"
     url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/dgx-superpod-components.html"
+  - label: "NVIDIA HGX Platform（HGX Rubin NVL8 の構成）"
+    url: "https://www.nvidia.com/en-us/data-center/hgx/"
   - label: "NVIDIA DGX SuperPOD Rubin NVL8 RA — Network Fabrics"
     url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/network-fabrics.html"
   - label: "NVIDIA DGX SuperPOD Rubin NVL8 RA — High Performance Storage Architecture"
@@ -61,11 +63,11 @@ references:
 
 <h2 className="slide-cont">3 つの方式（続き）</h2>
 
-**ブロック**では、ノードが自分でファイルシステム（ext4 や XFS）を載せます。Red Hat はこれを「ローカルファイルシステム」と呼び、単一のサーバーで動くものと説明しています。**複数のサーバーから同じブロックデバイスを直接使うには、GFS2 のようなクラスタファイルシステム**が必要になります。Red Hat は GFS2 を「共通のブロックデバイスを共有する複数ノードの間で整合性を管理する」ファイルシステムと説明しています。整合をとる仕組みを、ファイルシステムの側に別に持たせる必要があるということです。
+**ブロック**では、ノードが自分でファイルシステム（ext4 や XFS）を載せます。Red Hat はこれを「ローカルファイルシステム」と呼び、単一のサーバーで動くものと説明しています。**複数のサーバーから同じブロックデバイスを直接使う場合は、GFS2 のようなクラスタファイルシステム**を使います。Red Hat は GFS2 を「共通のブロックデバイスを共有する複数ノードの間で整合性を管理する」ファイルシステムと説明しています。ノード間の整合をとる仕組みを、ファイルシステム自身が持っているということです。
 
 **ファイル**では、ファイルシステムはストレージ側にあります。ノードはネットワーク越しにファイル操作を送るだけで、下にあるブロックデバイスには触れません（Red Hat）。だから**多数のノードが同じ名前空間を同時に使えます**。
 
-**オブジェクト**は、バケットの中のオブジェクトをキーで指定し、HTTP の REST API で読み書きします（AWS の S3 ユーザーガイド）。更新はキー単位で、同じキーに同時に書き込むと最後の書き込みが勝ちます。ファイルのロックに相当する仕組みはなく、必要ならアプリケーション側で作ります。
+**オブジェクト**は、バケットの中のオブジェクトをキーで指定し、HTTP の REST API で読み書きします（AWS の S3 ユーザーガイド）。更新はキー単位で、同じキーに同時に書き込むと最後の書き込みが勝ちます。同時に書き込む相手とのロックの仕組みは持たないので、必要ならアプリケーション側で作ります。
 
 ### GPU クラスタにとっての意味
 
@@ -75,7 +77,7 @@ references:
 
 ## NVIDIA のリファレンスアーキテクチャでの分け方
 
-具体例として、NVIDIA が公開している **DGX SuperPOD の Rubin NVL8 世代**のリファレンスアーキテクチャ（RA）を見ます。Rubin GPU を 8 基載せた DGX Rubin NVL8 をノードとして並べる構成で、HGX Rubin NVL8 と同じ世代です。
+具体例として、NVIDIA が公開している **DGX SuperPOD の Rubin NVL8 世代**のリファレンスアーキテクチャ（RA）を見ます。Rubin GPU を 8 基載せた DGX Rubin NVL8 をノードとして並べる構成です。NVIDIA の HGX のページには、同じく Rubin GPU を 8 基載せた HGX Rubin NVL8 が載っています。
 
 RA は、**用途の違う 2 つのストレージを分けて持つ**前提になっています。
 
@@ -96,11 +98,11 @@ HPS には、ノードの RAM とローカルのフラッシュを透過的な�
 
 ### 性能の目安
 
-RA は、ワークロードに応じた 2 段階の目安を示しています（Rubin NVL8 世代の値）。
+RA は、ワークロードに応じて**ストレージ側が出すべき性能**の目安を 2 段階で示しています（Rubin NVL8 世代のガイドラインで、実測値ではありません）。
 
 | | Standard | Enhanced |
 | --- | --- | --- |
-| 想定 | 計算が支配的な LLM やファインチューニング。データセットはノードのメモリキャッシュに収まる | マルチモーダルの学習。データセットがキャッシュに収まらない |
+| 想定 | 計算が支配的な LLM やファインチューニング。ほとんどのデータセットはノードのメモリキャッシュに収まる | マルチモーダルの学習。データセットがキャッシュに収まらない |
 | 1 ノードの読み出し | 1.25 GB/s | 3.91 GB/s |
 | SU（72 ノード）全体の読み出し | 90 GB/s | 281.25 GB/s |
 
@@ -180,7 +182,7 @@ RA のとおり、ホームディレクトリやログは既存の NFS サーバ
 
 1 つのファイルのデータを、複数の OST に RAID 0 のように分けて置くのが**ストライピング**です。何台に分けるかが `stripe_count`、何バイトずつ区切るかが `stripe_size` です。
 
-設定は `lfs getstripe` で確認できます（出力はマニュアルの例）。
+設定は `lfs getstripe` で確認できます。出力はマニュアルの例で、ファイル名だけコマンドに合わせました。このファイルは `lfs setstripe -s 4M` で作ったものなので、`stripe_size` が 4 MB（4194304）になっています。
 
 ```bash
 lfs getstripe /mnt/lustre/new_file
@@ -218,7 +220,7 @@ obdidx     objid        objid           group
 | **計算ファブリック**（East-West） | GPU どうしの通信 | InfiniBand XDR。各ノードは ConnectX-9 の 8 ポートでつなぐ |
 | **Ethernet ファブリック**（North-South） | ストレージ、管理（in-band）、OOB | Spectrum-4 のスイッチ。各ノードは BlueField-4 DPU でつなぐ |
 
-**GPU どうしの通信と、ストレージへの通信は別のファブリックに分かれています。** 1 つ前の世代の B200 版 RA でも、計算ファブリックとは別にストレージ用のファブリックを定義しています。学習中の集合通信と、データの読み出しやチェックポイントの書き込みが同じリンクを取り合わない構成です。
+**GPU どうしの通信と、ストレージへの通信は別のファブリックに分かれています。** B200 版の RA でも、計算ファブリックとは別にストレージ用のファブリックを定義しています。学習中の集合通信と、データの読み出しやチェックポイントの書き込みが同じリンクを取り合わない構成です。
 
 Ethernet ファブリックの中では、ストレージと管理のトラフィックを **VXLAN で論理的に分けて**、物理的なネットワークは共有しています。優先度の高いストレージのトラフィックを、管理系の通信から切り離すためです。高性能ストレージへのアクセスには **RoCEv2**（GPU ネットワークコースで扱った RDMA over Ethernet）を使います。ユーザー用の NFS は管理用のネットワーク側に置かれます。
 
