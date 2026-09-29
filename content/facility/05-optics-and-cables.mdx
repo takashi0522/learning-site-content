@@ -13,6 +13,14 @@ references:
     url: "https://www.snia.org/technology-communities/sff/specifications"
   - label: "QSFP-DD Multi Source Agreement"
     url: "http://www.qsfp-dd.com/"
+  - label: "IEEE 802.3bj Objectives（4 レーン 100G、銅線 5 m 以上）"
+    url: "https://www.ieee802.org/3/bj/objectives_0712.pdf"
+  - label: "IEEE 802.3by Objectives（25G、銅線 5 m 以上）"
+    url: "https://www.ieee802.org/3/by/P802_3by_Objectives.pdf"
+  - label: "IEEE P802.3cd Objectives（50G/レーン、銅線 3 m 以上）"
+    url: "https://www.ieee802.org/3/cd/P802d3cd_objectives_v4.pdf"
+  - label: "IEEE 802.3ck Objectives（100G/レーン、銅線 2 m 以上）"
+    url: "https://www.ieee802.org/3/100GEL/P802_3ck_Objectives_2018mar.pdf"
   - label: "ethtool(8) — トランシーバ診断"
     url: "https://man7.org/linux/man-pages/man8/ethtool.8.html"
 ---
@@ -72,14 +80,17 @@ QSFP-DD と OSFP は**互いに互換性がありません**。ポートがど�
 
 ### DAC の距離制限
 
-DAC は銅線なので、**信号速度が上がるほど到達距離が短くなります**。
+DAC は銅線なので、**レーンあたりの信号速度が上がるほど到達距離が短くなります**。効くのはポートの合計速度ではなく、**1 レーンの速度**です（レッスン 4）。IEEE 802.3 の各規格が掲げた銅線の到達距離の目標は次のとおりです。
 
 ```text
-10G  (SFP+)     : 〜7m
-25G  (SFP28)    : 〜5m
-100G (QSFP28)   : 〜3m  （4×25G）
-400G (QSFP-DD)  : 〜2m  （8×50G PAM4）
+25G / レーン  (SFP28、QSFP28 の 4×25G)      : 5m 以上  （802.3by / 802.3bj）
+50G / レーン  (QSFP56、QSFP-DD の 8×50G)    : 3m 以上  （802.3cd）
+100G / レーン (SFP112、QSFP112、OSFP など)  : 2m 以上  （802.3ck）
 ```
+
+同じ「100G」でも、4×25G の QSFP28 なら目標は 5m、1×100G の SFP112 なら 2m です。これらは規格化の目標（少なくともこの距離）なので、実際の上限は製品のデータシートで確認します。
+
+さらに速い世代で銅線がどこまで短くなるか、銅線と光の間を埋める選択肢（AEC・LPO・CPO）はレッスン 8 で扱います。
 
 ---
 
@@ -89,7 +100,7 @@ DAC は銅線なので、**信号速度が上がるほど到達距離が短く�
 
 **「DAC は 5m まで」と一律に覚えていると、高速化した際に失敗します。**
 
-25G で 5m の DAC を使っていた構成を 100G に上げると、3m が上限になり届きません。ラック内であっても、上下に離れた機器間では 3m を超えることがあります。
+25G/レーンで 5m の DAC を使っていた構成を 100G/レーンの世代（SFP112 など）に上げると、目標は 2m まで下がり、届かないことがあります。ラック内であっても、上下に離れた機器間では 2m を超えることがあります。
 
 距離が足りない場合の選択肢です。
 
@@ -254,7 +265,7 @@ sudo ethtool -m eth0 | grep -E 'Receiver signal|Laser output|Module temperature'
 
 - フォームファクタは**収容レーン数**で決まる。SFP 系 = 1 レーン、QSFP 系 = 4、QSFP-DD / OSFP = 8
 - **QSFP-DD と OSFP は互換性がない**。ポート側を確認して発注する
-- **DAC は速度が上がるほど短くなる**。100G で 3m、400G で 2m
+- **DAC はレーンあたりの速度が上がるほど短くなる**。IEEE の目標は 25G/レーンで 5m、50G/レーンで 3m、100G/レーンで 2m
 - 距離が足りないときは ACC → AOC → モジュール + ファイバ の順で検討
 - **AOC は清掃も極性も不要**で施工ミスが起きにくいが、パッチパネル経由には使えない
 - MMF（水色・`SR`）と SMF（黄色・`LR`/`DR`）は**コネクタが同じでも互換性がない**
@@ -266,15 +277,15 @@ sudo ethtool -m eth0 | grep -E 'Receiver signal|Laser output|Module temperature'
 
 <Quiz
   id="q1"
-  question="25G のサーバー接続で 5m の DAC ケーブルを使っていました。同じ配線経路で 100G に更改する計画があります。注意すべき点はどれですか。"
+  question="25G（SFP28）のサーバー接続で 5m の DAC ケーブルを使っていました。同じ配線経路のまま、1 レーン 100G の SFP112 に更改する計画があります。注意すべき点はどれですか。"
   options={[
-    "100G でも DAC の距離制限は同じなのでそのまま使える",
-    "100G の DAC は到達距離が約 3m に短くなるため 5m では届かず、ACC や AOC への変更が必要になる",
+    "レーン速度が変わっても DAC の距離制限は同じなのでそのまま使える",
+    "100G/レーンの銅線は IEEE の目標が 2m 以上と短くなるため、5m では届かない可能性が高い。データシートで確認し、届かなければ ACC や AOC に変更する",
     "DAC は 100G に対応していないため必ず光モジュールが必要",
     "FEC を無効にすれば 5m でも動作する"
   ]}
   answer={1}
-  explanation="DAC は銅線であり、信号速度が上がるほど減衰の影響が大きくなって到達距離が短くなります。25G(SFP28) では 5m 程度まで可能でも、100G(QSFP28、4×25G) では約 3m が上限です。経路長が足りない場合は、増幅回路を内蔵した ACC（5–10m 程度）か、光の AOC を選びます。発注前にラック図上で実際の取り回し長を確認することが重要です。"
+  explanation="DAC は銅線であり、1 レーンの信号速度が上がるほど減衰の影響が大きくなって到達距離が短くなります。IEEE が掲げた銅線の到達距離の目標は、25G/レーンで 5m 以上、100G/レーンで 2m 以上です。同じ 100G でも 4×25G の QSFP28 なら目標は 5m ですが、1 レーン 100G の SFP112 では 2m まで下がります。経路長が足りない場合は、信号を増幅・打ち直す能動銅線（ACC や AEC）か、光の AOC を選びます。発注前にラック図上で実際の取り回し長を確認することが重要です。"
 />
 
 ---

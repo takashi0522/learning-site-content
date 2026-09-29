@@ -563,3 +563,119 @@ export function LiquidToLiquidVsAir() {
     </svg>
   );
 }
+
+/**
+ * レーンあたりの速度と、IEEE 802.3 が目標にした銅線 (twinax) の到達距離。
+ * 「速くなるほど短くなる」を棒の長さでそのまま見せる。
+ */
+export function CopperReachByLane() {
+  const rows = [
+    { lane: "25G / レーン", std: "802.3by", m: 5 },
+    { lane: "50G / レーン", std: "802.3cd", m: 3 },
+    { lane: "100G / レーン", std: "802.3ck", m: 2 },
+    { lane: "200G / レーン", std: "802.3dj", m: 1 },
+  ];
+  const x0 = 200;
+  const unit = 100;
+  return (
+    <svg viewBox="0 0 800 300" role="img" aria-label="レーン速度ごとの銅線の到達距離の目標">
+      {[0, 1, 2, 3, 4, 5].map((m) => (
+        <g key={m}>
+          <line x1={x0 + m * unit} y1={36} x2={x0 + m * unit} y2={236} stroke={C.border} strokeWidth={1} />
+          <T x={x0 + m * unit} y={256} size={12} anchor="middle">
+            {`${m} m`}
+          </T>
+        </g>
+      ))}
+      {rows.map((r, i) => {
+        const y = 48 + i * 48;
+        return (
+          <g key={r.lane}>
+            <T x={24} y={y + 14} size={13} fill={C.fg} weight={600} middle>
+              {r.lane}
+            </T>
+            <T x={128} y={y + 14} size={12} mono middle>
+              {r.std}
+            </T>
+            <rect x={x0} y={y} width={r.m * unit} height={28} rx={4} fill={C.accentSoft} stroke={C.accent} strokeWidth={1.5} />
+            <T x={x0 + r.m * unit + 10} y={y + 14} size={12.5} fill={C.fg} weight={600} middle>
+              {`${r.m} m 以上`}
+            </T>
+          </g>
+        );
+      })}
+      <T x={400} y={288} size={12} fill={C.subtle} anchor="middle">
+        各規格が目標にした銅線（twinax）の到達距離 — レーンが速くなるほど短くなる
+      </T>
+    </svg>
+  );
+}
+
+/**
+ * ASIC から光に変わるまでの電気の経路。プラガブル / LPO / CPO の違いは
+ * 「電気の区間がどこまで伸びているか」と「DSP をどこに置くか」。
+ */
+export function PluggableLpoCpo() {
+  const row = (y: number, name: string, parts: { w: number; label: string; tone?: "plain" | "accent" | "ghost" }[], note: string) => {
+    let x = 150;
+    return (
+      <g>
+        <T x={24} y={y + 22} size={13} fill={C.fg} weight={700} middle>
+          {name}
+        </T>
+        {parts.map((p, i) => {
+          const bx = x;
+          x += p.w + 18;
+          return (
+            <g key={i}>
+              <Box x={bx} y={y} w={p.w} h={44} label={p.label} size={12} tone={p.tone ?? "plain"} />
+              {i < parts.length - 1 ? <Arrow from={[bx + p.w, y + 22]} to={[bx + p.w + 16, y + 22]} color={C.subtle} head={5} /> : null}
+            </g>
+          );
+        })}
+        <T x={150} y={y + 62} size={12}>
+          {note}
+        </T>
+      </g>
+    );
+  };
+
+  return (
+    <svg viewBox="0 0 800 330" role="img" aria-label="プラガブル、LPO、CPO の電気経路の違い">
+      {row(
+        20,
+        "プラガブル",
+        [
+          { w: 88, label: "スイッチ ASIC", tone: "accent" },
+          { w: 96, label: "基板の配線" },
+          { w: 70, label: "コネクタ" },
+          { w: 76, label: "DSP" },
+          { w: 104, label: "光に変換" },
+          { w: 70, label: "ファイバ", tone: "ghost" },
+        ],
+        "電気の区間が長く損失が大きい → モジュール内の DSP で信号を立て直す",
+      )}
+      {row(
+        122,
+        "LPO",
+        [
+          { w: 88, label: "スイッチ ASIC", tone: "accent" },
+          { w: 96, label: "基板の配線" },
+          { w: 70, label: "コネクタ" },
+          { w: 104, label: "光に変換" },
+          { w: 70, label: "ファイバ", tone: "ghost" },
+        ],
+        "経路は同じまま、モジュールから DSP を外す → スイッチや NIC 側の対応が要る",
+      )}
+      {row(
+        224,
+        "CPO",
+        [
+          { w: 250, label: "ASIC + 光エンジン（同じパッケージ）", tone: "accent" },
+          { w: 70, label: "ファイバ", tone: "ghost" },
+        ],
+        "電気の区間をパッケージの中まで縮める → 損失が小さく、プラガブルがなくなる",
+      )}
+    </svg>
+  );
+}
