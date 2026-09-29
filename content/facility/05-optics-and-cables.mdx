@@ -21,6 +21,14 @@ references:
     url: "https://www.ieee802.org/3/cd/P802d3cd_objectives_v4.pdf"
   - label: "IEEE 802.3ck Objectives（100G/レーン、銅線 2 m 以上）"
     url: "https://www.ieee802.org/3/100GEL/P802_3ck_Objectives_2018mar.pdf"
+  - label: "IEEE P802.3ba Objectives（100G、SMF で 40 km 以上）"
+    url: "https://www.ieee802.org/3/ba/PAR/P802.3ba_Objectives_0709.pdf"
+  - label: "IEEE P802.3bm Objectives（100G、MMF で 100 m 以上）"
+    url: "https://www.ieee802.org/3/bm/P8023bm_Objectives_1113.pdf"
+  - label: "Cisco — Troubleshoot Unsupported Transceiver in Catalyst 3850 Switch"
+    url: "https://www.cisco.com/c/en/us/support/docs/interfaces-modules/gbics/200296-Unsupported-GBIC-SFP-in-sub-module-of.html"
+  - label: "ethtool のソース（sfpid.c / qsfp.c / sff-common.c、`-m` の出力項目名）"
+    url: "https://git.kernel.org/pub/scm/network/ethtool/ethtool.git/tree/"
   - label: "ethtool(8) — トランシーバ診断"
     url: "https://man7.org/linux/man-pages/man8/ethtool.8.html"
 ---
@@ -35,7 +43,7 @@ references:
 | **SFP28** | 1 | **25G** | SFP+ と同じ形状 |
 | SFP56 | 1 | 50G | |
 | **QSFP+** | **4** | 40G (4×10G) | Q = Quad（4 レーン） |
-| **QSFP28** | **4** | **100G (4×25G)** | **現在最も普及** |
+| **QSFP28** | **4** | **100G (4×25G)** | |
 | QSFP56 | 4 | 200G (4×50G) | |
 | **QSFP-DD** | **8** | **400G / 800G** | DD = Double Density |
 | **OSFP** | **8** | **400G / 800G** | QSFP-DD より大きく放熱に有利 |
@@ -72,7 +80,7 @@ QSFP-DD と OSFP は**互いに互換性がありません**。ポートがど�
 | | **DAC** | **AOC** | **光モジュール + ファイバ** |
 | --- | --- | --- | --- |
 | 実体 | 銅線ケーブルの両端にコネクタ直付け | 光ケーブルの両端にトランシーバ直付け | トランシーバとファイバが別 |
-| 距離 | **1–5m**（速度が上がるほど短い） | 3–100m | **用途次第（〜数十km）** |
+| 距離 | **IEEE の目標で 2〜5m 以上**（レーン速度が上がるほど短い。下の表） | DAC より長い（製品による） | **規格による**（100G でも SMF で 40km 以上を目標にした規格がある） |
 | 価格 | **最も安い** | 中間 | **最も高い** |
 | 消費電力 | **ほぼゼロ**（パッシブ） | 小さい | 中 |
 | 交換性 | ケーブルごと交換 | ケーブルごと交換 | **モジュールだけ交換できる** |
@@ -84,7 +92,7 @@ DAC は銅線なので、**レーンあたりの信号速度が上がるほど�
 
 ```text
 25G / レーン  (SFP28、QSFP28 の 4×25G)      : 5m 以上  （802.3by / 802.3bj）
-50G / レーン  (QSFP56、QSFP-DD の 8×50G)    : 3m 以上  （802.3cd）
+50G / レーン  (SFP56、QSFP56 の 4×50G)      : 3m 以上  （802.3cd）
 100G / レーン (SFP112、QSFP112、OSFP など)  : 2m 以上  （802.3ck）
 ```
 
@@ -104,8 +112,8 @@ DAC は銅線なので、**レーンあたりの信号速度が上がるほど�
 
 距離が足りない場合の選択肢です。
 
-- **ACC（Active Copper Cable）** … 信号増幅回路を内蔵した銅ケーブル。DAC より長く（5–10m 程度）、AOC より安い
-- **AOC** … 光ケーブル。3–100m
+- **ACC（Active Copper Cable）** … 信号を増幅する回路を内蔵した銅ケーブル。DAC より長く届く製品がある（距離は製品と速度による）
+- **AOC** … 光ケーブル。DAC より長い距離をつなげる（距離は製品による）
 
 発注前に、**ラック図上で実際のケーブル経路長を測ってください。** 直線距離ではなく、ケーブルマネージャを通す実際の取り回しの長さです。余裕を見すぎると余長が排気を塞ぎ（レッスン 3）、足りないと届きません。
 
@@ -145,15 +153,14 @@ AOC は「光モジュール 2 個 + ファイバ」を一体化したもので�
 
 | 種別 | 通称 | 被覆色 | 用途 |
 | --- | --- | --- | --- |
-| **OM3** | マルチモード | **水色** | `SR` 系、100G で 70m まで |
-| **OM4** | マルチモード | 水色 / 紫 | `SR` 系、100G で 100m まで |
-| OM5 | マルチモード | ライトグリーン | 波長多重に対応 |
+| **OM3** | マルチモード | **水色** | `SR` 系 |
+| **OM4** | マルチモード | 水色 / 紫 | `SR` 系 |
 | **OS2** | シングルモード | **黄色** | `DR` / `FR` / `LR` / `ER`、長距離 |
 
 ```text
-100GBASE-SR4 の到達距離
-  OM3 : 70m
-  OM4 : 100m      ← 新規敷設なら OM4 以上を選ぶ
+100GBASE-SR4 などの 100G のマルチモード規格
+  規格化の目標: MMF で 100m 以上（802.3bm）
+  OM3 / OM4 それぞれでの到達距離 → モジュールのデータシートで確認する
 ```
 
 <Callout type="warning" title="MMF と SMF は互換性がない">
@@ -174,14 +181,15 @@ AOC は「光モジュール 2 個 + ファイバ」を一体化したもので�
 
 | コネクタ | 芯数 | 使われる規格 |
 | --- | --- | --- |
-| **LC**（2 芯 1 組） | 2 | `LR4`、`FR`、`DR`、10G/25G の `SR`/`LR` |
+| **LC**（2 芯 1 組） | 2 | `LR4`、`FR4`、`100GBASE-DR`（1 レーン）、10G/25G の `SR`/`LR` |
 | **MPO-12** | 12（うち 8 使用） | **`100GBASE-SR4`**、`400GBASE-DR4` |
 | MPO-16 | 16 | `400GBASE-SR8` |
 
-レッスン 4 で見た「レーン数」が、そのままコネクタの選択に繋がっています。
+表は代表例です。実際のコネクタはモジュールのデータシートで確認してください。多くの場合、レッスン 4 で見た「レーン数」がコネクタの選択に繋がっています。
 
-- **波長多重するもの（`LR4` など）** → 1 芯に集約できるので **LC**
-- **物理的に並列伝送するもの（`SR4` など）** → レーン数分の芯が必要なので **MPO**
+- **波長多重するもの（`LR4` など）** → 1 組の芯に集約できるので **LC**
+- **1 レーンのもの（`100GBASE-DR` など）** → これも **LC**
+- **物理的に並列伝送するもの（`SR4`、`DR4` など）** → レーン数分の芯が必要なので **MPO**
 
 ---
 
@@ -196,24 +204,26 @@ sudo ethtool -m eth0 | grep -iE 'vendor|part|serial'
 
 <Callout type="pitfall" title="ベンダーロックへの対処">
 
-一部のネットワーク機器は、**EEPROM のベンダー情報を検査し、純正品以外を拒否します**。互換品ベンダーは「どの機器向けにコーディングするか」を指定して出荷するため、**発注時に接続先の機器を伝える必要があります**。
+一部のネットワーク機器は、**純正以外のトランシーバを対応外として扱い、そのポートを使えなくする**ことがあります。
+
+たとえば Cisco の Catalyst 3850 のトラブルシューティング文書は、サードパーティの SFP を動かすための設定として `service unsupported-transceiver` と `no errdisable detect cause gbic-invalid` を挙げ、対応状況は Cisco Optics Interoperability Matrix で確認するよう勧めています。
+
+互換品を使う場合は、**接続先の機器で動作するかを販売元に確認してから発注**します。
 
 ```text
 発注時に伝える情報:
-  ・接続する機器のメーカーと型番（例: Cisco Nexus 9000 向け）
+  ・接続する機器のメーカーと型番
   ・速度と規格（100GBASE-SR4 など）
   ・必要な距離
 ```
 
-**同じ「100G SR4」でも、Cisco 向けと Arista 向けでは別の商品**になります。流用しようとして動かない、というのは互換品でよくある失敗です。
-
-多くの機器には検査を緩める設定もありますが（例: `service unsupported-transceiver`）、**サポート対象外になる**ことが多いため、本番環境では正しくコーディングされた製品を発注するほうが確実です。
+検査を緩める設定を使ったときに機器ベンダーのサポートがどう扱うかは、ベンダーの規定によります。本番環境では事前に確認してください。
 
 </Callout>
 
 <Callout type="note">
 
-品質面では、信頼できる互換品ベンダーの製品であれば実用上の問題はほとんどありません。ただし次の点は留意してください。
+互換品を使うときは、次の点に留意してください。
 
 - **障害時の切り分けで疑われる**。純正・互換を混在させず、記録を残しておく
 - 機器ベンダーのサポートが「まず純正に交換してください」と言ってくる可能性がある
@@ -232,15 +242,17 @@ for i in $(ls /sys/class/net | grep -v lo); do
   printf "%-10s %-24s %-28s %s\n" "$i" \
     "$(echo "$info" | awk -F': *' '/Vendor name/{print $2}')" \
     "$(echo "$info" | awk -F': *' '/Vendor PN/{print $2}')" \
-    "$(echo "$info" | awk -F': *' '/Transceiver type/{print $2; exit}')"
+    "$(echo "$info" | sed -n 's/^[[:space:]]*Transceiver type[[:space:]]*: //p' | head -1)"
 done
 ```
 
 ```text
-eth0       FS                       QSFP28-SR4-100G              100G Base-SR4
-eth1       FS                       QSFP28-SR4-100G              100G Base-SR4
-eno1       Intel Corp.              SFP-10G-SR                   10G Base-SR
+# 出力の例（項目の中身は NIC・ドライバ・モジュールによって変わる）
+eth0       FS                       QSFP28-SR4-100G              100G Ethernet: 100G Base-SR4 or 25GBase-SR
+eno1       Intel Corp.              SFP-10G-SR                   10G Ethernet: 10G Base-SR
 ```
+
+`Vendor name`、`Vendor PN`、`Transceiver type` は、ethtool がモジュールの EEPROM を解読して表示する項目名です（ethtool のソース）。`Transceiver type` は複数行出ることがあるので、ここでは最初の 1 行だけを取っています。
 
 <Callout type="field">
 
@@ -252,7 +264,8 @@ eno1       Intel Corp.              SFP-10G-SR                   10G Base-SR
 
 ```bash
 # 光レベルも含めて記録する
-sudo ethtool -m eth0 | grep -E 'Receiver signal|Laser output|Module temperature'
+# 受信光の項目名は SFP 系が Receiver signal、QSFP 系が Rcvr signal
+sudo ethtool -m eth0 | grep -E 'Receiver signal|Rcvr signal|Laser output|Module temperature'
 ```
 
 構成管理ツールを入れていなくても、cron でこの出力をファイルに残すだけで実用的な台帳になります。
@@ -269,8 +282,8 @@ sudo ethtool -m eth0 | grep -E 'Receiver signal|Laser output|Module temperature'
 - 距離が足りないときは ACC → AOC → モジュール + ファイバ の順で検討
 - **AOC は清掃も極性も不要**で施工ミスが起きにくいが、パッチパネル経由には使えない
 - MMF（水色・`SR`）と SMF（黄色・`LR`/`DR`）は**コネクタが同じでも互換性がない**
-- `SR4` は MPO、`LR4` は LC。**レーン構成がコネクタを決める**
-- 互換品は**接続先の機器を指定して発注する**。流用は効かない
+- 多くの場合、並列伝送（`SR4` など）は MPO、波長多重（`LR4` など）や 1 レーンのものは LC。**レーン構成がコネクタに効く**
+- 機器によっては純正以外のトランシーバを対応外として扱う。互換品は**接続先の機器での動作を確認してから**使う
 - `ethtool -m` の一覧を定期取得すれば、実用的な構成台帳になる
 
 ---
@@ -292,13 +305,13 @@ sudo ethtool -m eth0 | grep -E 'Receiver signal|Laser output|Module temperature'
 
 <Quiz
   id="q2"
-  question="他プロジェクトで余った互換品の 100GBASE-SR4 モジュール（Arista スイッチ向けに購入）を、Cisco のスイッチで使おうとしたところ認識されませんでした。最も妥当な説明はどれですか。"
+  question="他プロジェクトで余った互換品の SFP を Cisco の Catalyst 3850 に挿したところ、ポートが使えませんでした。最初に取る行動として最も適切なものはどれですか。"
   options={[
-    "モジュールが故障している",
-    "互換品は EEPROM のベンダー情報を接続先機器向けにコーディングして出荷されるため、別メーカーの機器では認識されないことがある",
-    "SR4 は Cisco 機器では使用できない",
-    "ファイバの種類が間違っている"
+    "モジュールが故障していると判断して廃棄する",
+    "機器が対応外のトランシーバとして扱っている可能性がある。Cisco の対応表（Optics Interoperability Matrix）で対応状況を確かめ、検査を緩める設定を使うかどうかはサポートへの影響を確認してから決める",
+    "SFP は Catalyst 3850 では使用できない",
+    "ファイバをシングルモードに交換する"
   ]}
   answer={1}
-  explanation="多くのネットワーク機器はトランシーバの EEPROM に書かれたベンダー情報を検査し、想定外の値を拒否します。互換品ベンダーは接続先機器を指定して出荷するため、同じ「100GBASE-SR4」でも Arista 向けと Cisco 向けは別商品になります。機器側に検査を緩める設定がある場合もありますが、サポート対象外になることが多いため、本番では正しくコーディングされた製品を発注するのが確実です。"
+  explanation="一部のネットワーク機器は、純正以外のトランシーバを対応外として扱い、ポートを使えなくすることがあります。Cisco の Catalyst 3850 のトラブルシューティング文書は、サードパーティの SFP を動かす設定として service unsupported-transceiver と no errdisable detect cause gbic-invalid を挙げたうえで、対応状況を Cisco Optics Interoperability Matrix で確認するよう勧めています。故障と決めつける前に対応状況を確かめ、検査を緩める設定を使う場合はサポートへの影響をベンダーの規定で確認します。"
 />
