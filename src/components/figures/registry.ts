@@ -1,5 +1,13 @@
 import type { ComponentType } from "react";
-import { AiStackLayers, IbCreditFlow, K8sDevicePlugin, NcclRingTree, TrainingStep } from "./ai";
+import {
+  AiStackLayers,
+  IbCreditFlow,
+  K8sDevicePlugin,
+  NcclRingTree,
+  NfsVsParallelFs,
+  StorageAccessModels,
+  TrainingStep,
+} from "./ai";
 import { CaHierarchy, OidcCodePkce } from "./auth";
 import { RailOptimized } from "./buildout";
 import {
@@ -55,6 +63,8 @@ export const FIGURES = {
   "ca-hierarchy": CaHierarchy,
   "k8s-device-plugin": K8sDevicePlugin,
   "ai-stack-layers": AiStackLayers,
+  "storage-access-models": StorageAccessModels,
+  "nfs-vs-parallel-fs": NfsVsParallelFs,
   "training-step": TrainingStep,
   "ib-credit-flow": IbCreditFlow,
   "tor-eor-mor": TorEorMor,

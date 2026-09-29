@@ -1,0 +1,300 @@
+---
+title: AI 基盤のストレージ構成
+description: ブロック・ファイル・オブジェクトの違いを「どこにファイルシステムがあるか」から整理し、NFS と並列ファイルシステムの経路の違い、GPU クラスタでのストレージ用ネットワークの分け方を、NVIDIA のリファレンスアーキテクチャを例に見ます。
+order: 7
+minutes: 22
+tags: ["storage", "NFS", "Lustre", "NVMe-oF", "DGX SuperPOD"]
+objectives:
+  - ブロック・ファイル・オブジェクトの違いを、複数ノードから同時に使えるかどうかで説明できる
+  - NFS と並列ファイルシステムの違いを、メタデータとデータの経路で説明できる
+  - GPU クラスタのストレージの分け方（高性能ストレージ / ユーザー用 NFS / ネットワーク）を説明できる
+references:
+  - label: "NVIDIA DGX SuperPOD Rubin NVL8 RA — Key Components（Storage Requirements）"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/dgx-superpod-components.html"
+  - label: "NVIDIA DGX SuperPOD Rubin NVL8 RA — Network Fabrics"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/network-fabrics.html"
+  - label: "NVIDIA DGX SuperPOD Rubin NVL8 RA — High Performance Storage Architecture"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-rubinx86/latest/storage-architecture.html"
+  - label: "Lustre Operations Manual（1 章 アーキテクチャ、19 章 ストライピング）"
+    url: "https://doc.lustre.org/lustre_manual.xhtml"
+  - label: "nfs(5) — Linux manual page（nconnect、proto=rdma）"
+    url: "https://man7.org/linux/man-pages/man5/nfs.5.html"
+  - label: "Linux kernel docs — NFS/RDMA"
+    url: "https://docs.kernel.org/admin-guide/nfs/nfs-rdma.html"
+  - label: "RFC 8881 — NFSv4.1（12 章 pNFS）"
+    url: "https://www.rfc-editor.org/rfc/rfc8881"
+  - label: "RFC 8166 — RPC-over-RDMA Version 1"
+    url: "https://www.rfc-editor.org/rfc/rfc8166"
+  - label: "RFC 7143 — iSCSI Protocol"
+    url: "https://www.rfc-editor.org/rfc/rfc7143"
+  - label: "NVM Express — NVMe over Fabrics Specification"
+    url: "https://nvmexpress.org/specification/nvme-of-specification/"
+  - label: "Red Hat Enterprise Linux 8 — Configuring GFS2 file systems"
+    url: "https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_gfs2_file_systems/assembly_planning-gfs2-deployment-configuring-gfs2-file-systems"
+  - label: "NVIDIA DGX SuperPOD B200 RA — Network Fabrics（ストレージ用ファブリック）"
+    url: "https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html"
+  - label: "Red Hat Enterprise Linux 8 — Overview of available file systems"
+    url: "https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/managing_file_systems/overview-of-available-file-systems_managing-file-systems"
+  - label: "Kubernetes — Persistent Volumes（Access Modes）"
+    url: "https://kubernetes.io/docs/concepts/storage/persistent-volumes/"
+  - label: "Amazon S3 User Guide — What is Amazon S3?"
+    url: "https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html"
+  - label: "NVIDIA GPUDirect Storage Release Notes"
+    url: "https://docs.nvidia.com/gpudirect-storage/release-notes/index.html"
+---
+
+## 3 つの方式は「ファイルシステムがどこにあるか」で分かれる
+
+レッスン 4 では、学習データの読み出しとチェックポイントがストレージにどんな負荷をかけるかを見ました。このレッスンでは逆側、**ストレージをどう構成するか**を扱います。
+
+ストレージの接続方式は、大きく 3 つに分かれます。違いは速度ではなく、**ファイルシステムがノード側にあるか、ストレージ側にあるか**です。
+
+<Figure name="storage-access-models" caption="ファイルシステムがどちら側にあるかで、複数ノードからの共有のしやすさが決まる" />
+
+| 方式 | ノードから見えるもの | 例 |
+| --- | --- | --- |
+| **ブロック** | ディスク（`/dev/sdX`、`/dev/nvmeXnY`） | iSCSI、FC の SAN、NVMe-oF |
+| **ファイル** | マウントしたディレクトリ（`/data`） | NFS、Lustre などの並列ファイルシステム |
+| **オブジェクト** | バケットとキー（HTTP の API） | S3 互換ストレージ |
+
+---
+
+<h2 className="slide-cont">3 つの方式（続き）</h2>
+
+**ブロック**では、ノードが自分でファイルシステム（ext4 や XFS）を載せます。Red Hat はこれを「ローカルファイルシステム」と呼び、単一のサーバーで動くものと説明しています。**複数のサーバーから同じブロックデバイスを直接使うには、GFS2 のようなクラスタファイルシステム**が必要になります。Red Hat は GFS2 を「共通のブロックデバイスを共有する複数ノードの間で整合性を管理する」ファイルシステムと説明しています。整合をとる仕組みを、ファイルシステムの側に別に持たせる必要があるということです。
+
+**ファイル**では、ファイルシステムはストレージ側にあります。ノードはネットワーク越しにファイル操作を送るだけで、下にあるブロックデバイスには触れません（Red Hat）。だから**多数のノードが同じ名前空間を同時に使えます**。
+
+**オブジェクト**は、バケットの中のオブジェクトをキーで指定し、HTTP の REST API で読み書きします（AWS の S3 ユーザーガイド）。更新はキー単位で、同じキーに同時に書き込むと最後の書き込みが勝ちます。ファイルのロックに相当する仕組みはなく、必要ならアプリケーション側で作ります。
+
+### GPU クラスタにとっての意味
+
+分散学習では、**多数のノードが同じデータセットを同時に読みます**。この要件にそのまま合うのはファイルです。Kubernetes の用語でいえば、必要なのは `ReadWriteMany`（多数のノードから読み書きでマウントできる）や `ReadOnlyMany` で、`ReadWriteOnce`（1 ノードだけが読み書きでマウントできる）では足りません。
+
+---
+
+## NVIDIA のリファレンスアーキテクチャでの分け方
+
+具体例として、NVIDIA が公開している **DGX SuperPOD の Rubin NVL8 世代**のリファレンスアーキテクチャ（RA）を見ます。Rubin GPU を 8 基載せた DGX Rubin NVL8 をノードとして並べる構成で、HGX Rubin NVL8 と同じ世代です。
+
+RA は、**用途の違う 2 つのストレージを分けて持つ**前提になっています。
+
+| | 高性能ストレージ（HPS） | ユーザー用ストレージ |
+| --- | --- | --- |
+| 用途 | 学習データ、チェックポイント | ホームディレクトリ、管理用の作業領域、ログ |
+| 形式 | **POSIX 形式のファイルシステム**。複数ノードからの並列な読み書きに最適化 | **NFS** |
+| 接続 | InfiniBand か高速 Ethernet、**RDMA** 対応 | Ethernet（管理用のネットワーク） |
+| 提供元 | NVIDIA の認定を受けたストレージパートナー | **既存の NFS サーバーの流用で足りることが多い** |
+
+HPS には、ノードの RAM とローカルのフラッシュを透過的なキャッシュとして使えることも求められています。レッスン 4 の「ローカル NVMe にキャッシュする」を、ストレージ製品の側で実現する形です。
+
+この RA のストレージとネットワークの節には、**SAN や iSCSI のようなブロックストレージは出てきません。** 学習データの置き場所も管理用の共有領域も、どちらもファイルです。
+
+---
+
+<h2 className="slide-cont">NVIDIA のリファレンスアーキテクチャ（続き）</h2>
+
+### 性能の目安
+
+RA は、ワークロードに応じた 2 段階の目安を示しています（Rubin NVL8 世代の値）。
+
+| | Standard | Enhanced |
+| --- | --- | --- |
+| 想定 | 計算が支配的な LLM やファインチューニング。データセットはノードのメモリキャッシュに収まる | マルチモーダルの学習。データセットがキャッシュに収まらない |
+| 1 ノードの読み出し | 1.25 GB/s | 3.91 GB/s |
+| SU（72 ノード）全体の読み出し | 90 GB/s | 281.25 GB/s |
+
+ほかに RA が挙げている目安は次の 2 つです。
+
+- 高解像度の画像を使う学習（データセットが 30 TB を超えることがある）では、**GPU 1 基あたり 4 GB/s** の読み出しが必要
+- LLM や大規模モデルでは、チェックポイントの間は学習が止まるので、**書き込みの目標を読み出しの推奨値の少なくとも半分**にする
+
+RA 自身も、ワークロードと組織の要件を先に把握してから性能と容量を決めるよう書いています。この表は叩き台です。
+
+---
+
+## NFS: 1 台がすべてを返す
+
+<Figure name="nfs-vs-parallel-fs" caption="NFS は 1 台を通り、並列ファイルシステムはデータを複数のサーバーに分けて直接やりとりする" source="Lustre Operations Manual 1.3 節、RFC 8881 12 章を元に作図" />
+
+NFS では、**1 台のサーバーがメタデータ（名前、属性）もデータも返します。** Red Hat は、クラスタファイルシステムとの違いを「NFS と違って、単一のサーバーがデータやメタデータへのアクセスを提供するのではない」と説明しています。裏返せば、NFS はそのサーバー 1 台が上限になります。
+
+---
+
+<h2 className="slide-cont">NFS（続き）</h2>
+
+NFS の上限を押し上げる手段として、次のものがあります。
+
+| 手段 | 内容 | 出典 |
+| --- | --- | --- |
+| `nconnect=n` | 1 つのマウントでサーバーとの TCP 接続を複数張る（最大 16）。NIC が複数あるときに負荷を分散できる | nfs(5) |
+| NFS over RDMA | RPC を RDMA で運ぶ。Linux では `proto=rdma`（または `rdma`）でマウントする。kernel docs の手順ではポート 20049 を使う | RFC 8166、nfs(5)、kernel docs |
+| pNFS | NFSv4.1 のオプション機能。クライアントがレイアウトを受け取り、データを持つストレージデバイスに直接アクセスする | RFC 8881 |
+
+---
+
+<h2 className="slide-cont">NFS（続き）</h2>
+
+NFS over RDMA でマウントできているかは、`/proc/mounts` の `proto` を見ます（kernel docs の手順）。
+
+```bash
+mount -o rdma,port=20049 nfs-server:/export /mnt/data
+grep /mnt/data /proc/mounts
+```
+
+```text
+# 出力の例（オプションの並びは環境によって変わる）
+nfs-server:/export /mnt/data nfs4 rw,relatime,...,proto=rdma,port=20049,...
+```
+
+`proto=rdma` なら RDMA、`proto=tcp` なら通常の TCP で通信しています。
+
+<Callout type="field" title="ユーザー用ストレージに既存の NFS を回す">
+
+RA のとおり、ホームディレクトリやログは既存の NFS サーバーに新しいエクスポートを切って足りることが多い領域です。ただし RA はユーザー用ストレージにも、**100〜400 Gb/s の Ethernet 接続**と高いメタデータ性能を求め、性能を出すには**最低 100 Gb/s の帯域**が要るとしています。社内の汎用 NFS をそのままつなぐ前に、帯域とメタデータ性能を確認してください。
+
+</Callout>
+
+---
+
+## 並列ファイルシステム: メタデータとデータの経路を分ける
+
+並列ファイルシステムの代表として、Lustre の構成を見ます（Lustre Operations Manual 1 章）。
+
+| 役割 | 何をするか |
+| --- | --- |
+| **MGS** | すべての Lustre ファイルシステムの設定情報を持つ |
+| **MDS / MDT** | ファイル名、ディレクトリ、権限、**ファイルのレイアウト**を持つ |
+| **OSS / OST** | ファイルのデータ本体を持つ。1 つのファイルを複数の OST に分けて置ける |
+| **クライアント** | 計算ノードで動く。ファイルシステムを 1 つの名前空間として見せる |
+
+読み書きは 2 段階です。**クライアントはまず MDT からそのファイルのレイアウトを受け取り、そのあとはデータを持つ OSS と直接やりとりします。** NFS のように 1 台がデータを中継しないので、OSS を足せば帯域が伸びます。
+
+マニュアルは、ファイルシステム全体の帯域を「OSS のネットワーク帯域の合計」と「OST のディスク帯域の合計」の**小さいほう**としています。ディスクを増やしても、ネットワークが細ければ伸びません。
+
+---
+
+<h2 className="slide-cont">並列ファイルシステム（続き）</h2>
+
+### ストライピング: 1 つのファイルを何台に分けるか
+
+1 つのファイルのデータを、複数の OST に RAID 0 のように分けて置くのが**ストライピング**です。何台に分けるかが `stripe_count`、何バイトずつ区切るかが `stripe_size` です。
+
+設定は `lfs getstripe` で確認できます（出力はマニュアルの例）。
+
+```bash
+lfs getstripe /mnt/lustre/new_file
+```
+
+```text
+/mnt/lustre/new_file
+lmm_stripe_count:   1
+lmm_stripe_size:    4194304
+lmm_pattern:        1
+lmm_layout_gen:     0
+lmm_stripe_offset:  1
+obdidx     objid        objid           group
+1          690550       0xa8976         0
+```
+
+`lmm_stripe_count: 1` なので、このファイルは 1 つの OST（`obdidx` が 1 のもの）にだけ置かれています。
+
+<Callout type="pitfall" title="既定値は 1 台">
+
+マニュアルによると、`stripe_count` の既定値は **1**、`stripe_size` の既定値は **1 MB** です。つまり何も設定しなければ、**大きなファイル 1 本は 1 つの OST にしか書かれません。** 1 つのファイルへの帯域が 1 つの OST の帯域を超える場合に、ストライピングが効きます。
+
+チェックポイントを大きなファイルにまとめて書くなら、保存先のディレクトリに `lfs setstripe -c -1` を設定すると、使えるすべての OST に分けて書かれます。ディレクトリに設定したストライプは、そのディレクトリに新しく作るファイルの既定になります（既存のファイルは変わりません）。
+
+</Callout>
+
+---
+
+## ストレージ用のネットワーク
+
+ストレージにつなぐネットワークも、RA の構成を見ます（Rubin NVL8 世代）。
+
+| ネットワーク | 何を通すか | 実装 |
+| --- | --- | --- |
+| **計算ファブリック**（East-West） | GPU どうしの通信 | InfiniBand XDR。各ノードは ConnectX-9 の 8 ポートでつなぐ |
+| **Ethernet ファブリック**（North-South） | ストレージ、管理（in-band）、OOB | Spectrum-4 のスイッチ。各ノードは BlueField-4 DPU でつなぐ |
+
+**GPU どうしの通信と、ストレージへの通信は別のファブリックに分かれています。** 1 つ前の世代の B200 版 RA でも、計算ファブリックとは別にストレージ用のファブリックを定義しています。学習中の集合通信と、データの読み出しやチェックポイントの書き込みが同じリンクを取り合わない構成です。
+
+Ethernet ファブリックの中では、ストレージと管理のトラフィックを **VXLAN で論理的に分けて**、物理的なネットワークは共有しています。優先度の高いストレージのトラフィックを、管理系の通信から切り離すためです。高性能ストレージへのアクセスには **RoCEv2**（GPU ネットワークコースで扱った RDMA over Ethernet）を使います。ユーザー用の NFS は管理用のネットワーク側に置かれます。
+
+ストレージ用のリーフスイッチでは、DGX 側の接続を**アップリンク : ダウンリンク = 2 : 3** のオーバーサブスクリプションで設計しています。一方、高性能ストレージ側をつなぐ専用のリーフスイッチは 1:1（ノンブロッキング）です。
+
+---
+
+## ブロックストレージの居場所
+
+ブロックストレージが不要になったわけではありません。**1 つのノードが専有するボリューム**なら、ブロックはむしろ素直な選択です。
+
+| プロトコル | 何を運ぶか |
+| --- | --- |
+| **iSCSI** | SCSI のコマンドを TCP で運ぶ（RFC 7143） |
+| **NVMe-oF** | NVMe を PCIe 以外の転送路に広げたもの。2016 年の 1.0 で Ethernet、ファイバーチャネル、InfiniBand、RDMA に広がり、**NVMe/TCP は 2019 年の 1.1 で加わった** |
+
+VM のディスク、データベース、Kubernetes の `ReadWriteOnce` のボリュームのように、1 ノードがファイルシステムを載せて専有する使い方なら、ブロックの性質がそのまま合います。合わないのは、**同じデータを多数の GPU ノードが同時に読む**学習データの置き場所です。
+
+### GPUDirect Storage との関係
+
+レッスン 4 の GPUDirect Storage（GDS）は、**ファイルシステムの製品ごとに対応が決まります**。GDS のリリースノートは、対応するサードパーティのストレージとして DDN EXAScaler、IBM Spectrum Scale、NetApp ONTAP、BeeGFS、WekaFS、VAST NFS などを挙げ、完全な一覧はサポートマトリクスを参照するよう書いています。GDS を使う予定なら、製品を選ぶ段階でこの一覧と突き合わせます。
+
+---
+
+## 導入前に決めること
+
+レッスン 4 の負荷の性質と、このレッスンの構成を合わせて、次の表を埋めます。
+
+```text
+□ 学習データ    : 共有ファイルシステムの製品 / 接続（IB or RoCE） / GDS 対応
+□ チェックポイント: 書き込みの目標（読み出しの半分以上） / ストライプ設定
+□ ホーム・ログ  : NFS（既存を流用するか） / 帯域 100 Gb/s 以上あるか
+□ データの原本  : オブジェクトストレージ（レッスン 4）
+□ ノードのキャッシュ: ローカル NVMe の容量と、誰がどう消すか
+□ 性能目標      : 1 ノードあたりの読み出し（RA の Standard / Enhanced を叩き台に）
+□ ネットワーク  : 計算ファブリックと分けるか / ストレージ用リーフの比率
+```
+
+---
+
+## まとめ
+
+- ブロック・ファイル・オブジェクトの違いは、**ファイルシステムがどちら側にあるか**。ブロックはノード側にあり、共有するにはクラスタファイルシステムが要る
+- 多数のノードが同じデータを同時に読む学習データには、**ファイル**が合う
+- NVIDIA の RA（Rubin NVL8 世代）は、**高性能ストレージ（POSIX 形式・RDMA）とユーザー用の NFS** を分けて持つ構成。ブロックストレージは出てこない
+- **NFS は 1 台がメタデータもデータも返す。** nconnect、NFS over RDMA、pNFS で上限を押し上げられる
+- **Lustre はレイアウトを MDT から受け取り、データは OSS と直接やりとりする。** `stripe_count` の既定は 1
+- RA では**計算ファブリックとストレージ用のネットワークを分けている**。高性能ストレージには RoCEv2
+- ブロックは、**1 ノードが専有するボリューム**に使う
+
+---
+
+<Quiz
+  id="q1"
+  question="64 台の GPU ノードに同じ学習データセットを読ませるため、iSCSI で 1 つの LUN を全ノードに見せ、それぞれのノードで ext4 としてマウントする案が出ました。この案の評価として正しいものはどれですか。"
+  options={[
+    "iSCSI は高速なので、この構成で問題ない",
+    "ext4 は単一のサーバーで使うローカルファイルシステムで、ノード間の整合をとる仕組みを持たない。共有するならファイルストレージ（NFS や並列ファイルシステム）か、GFS2 のようなクラスタファイルシステムが要る",
+    "読み出しだけなら何台でマウントしても整合性の問題は起きない",
+    "FC の SAN に変えれば、ext4 のままで共有できる"
+  ]}
+  answer={1}
+  explanation="ブロックストレージでは、ファイルシステムはノード側にあります。ext4 や XFS は単一のサーバーで動くローカルファイルシステムです。複数のサーバーが同じブロックデバイスに直接アクセスするには、GFS2 のように複数ノードの間で整合性を管理するクラスタファイルシステムが必要です。多数のノードで同じデータを読むなら、ファイルシステムがストレージ側にあるファイルストレージのほうが素直な選択です。転送路を FC に変えても、ファイルシステムの性質は変わりません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Lustre に数百 GB のチェックポイントを 1 ファイルで書き出すと、OST を何十台も持つシステムなのに書き込み帯域が伸びません。保存先のディレクトリを lfs getstripe で見ると lmm_stripe_count は 1 でした。最初に試すべき対策はどれですか。"
+  options={[
+    "MDS を増設する",
+    "保存先ディレクトリのストライプ数を増やし（例: lfs setstripe -c -1）、新しく書くファイルを複数の OST に分ける",
+    "stripe_size を 1 MB から 64 KB に下げる",
+    "クライアントの nconnect を増やす"
+  ]}
+  answer={1}
+  explanation="stripe_count が 1 だと、1 つのファイルのデータは 1 つの OST にしか置かれません。OST が何十台あっても、そのファイルへの書き込みは 1 台の帯域が上限です。ストライプ数を増やせばデータが複数の OST に分かれ、クライアントはそれぞれの OSS と並列にやりとりできます。MDS はレイアウトとメタデータを扱うだけでデータは中継しないので、増やしても書き込み帯域は伸びません。nconnect は NFS のマウントオプションです。"
+/>

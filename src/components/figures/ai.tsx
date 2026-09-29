@@ -312,3 +312,95 @@ export function IbCreditFlow() {
     </svg>
   );
 }
+
+/**
+ * ブロック / ファイル / オブジェクト。違いは「ファイルシステムがどちら側にあるか」で、
+ * それが「複数ノードから同時に使えるか」を決めることを示す。
+ */
+export function StorageAccessModels() {
+  const col = (
+    x: number,
+    title: string,
+    client: string,
+    wire: string,
+    store: string,
+    storeSub: string,
+    note1: string,
+    note2: string,
+  ) => (
+    <g>
+      <Band x={x} y={24} w={248} h={250} label={title} />
+      <Box x={x + 14} y={52} w={104} h={52} label="GPU ノード" sub={client} size={12.5} />
+      <Box x={x + 130} y={52} w={104} h={52} label="GPU ノード" sub={client} size={12.5} />
+      <Arrow from={[x + 66, 106]} to={[x + 110, 176]} color={C.subtle} />
+      <Arrow from={[x + 182, 106]} to={[x + 138, 176]} color={C.subtle} />
+      <T x={x + 124} y={140} size={12} fill={C.fg} weight={600} anchor="middle" middle>
+        {wire}
+      </T>
+      <Box x={x + 34} y={180} w={180} h={62} label={store} sub={storeSub} size={13} tone="accent" />
+      <T x={x + 124} y={298} size={12} fill={C.fg} weight={600} anchor="middle">
+        {note1}
+      </T>
+      <T x={x + 124} y={318} size={12} anchor="middle">
+        {note2}
+      </T>
+    </g>
+  );
+
+  return (
+    <svg viewBox="0 0 800 334" role="img" aria-label="ブロック、ファイル、オブジェクトの違い">
+      {col(16, "ブロック", "ext4 / XFS", "SCSI / NVMe コマンド", "LUN / Namespace", "ただのブロックの列", "FS はノード側にある", "共有にはクラスタ FS が要る")}
+      {col(276, "ファイル", "/data をマウント", "ファイル操作（NFS など）", "ファイルサーバー", "FS はこちら側", "FS はサーバー側にある", "多数のノードで同じ名前空間")}
+      {col(536, "オブジェクト", "SDK / HTTP", "PUT / GET（キー単位）", "バケット", "キー → オブジェクト", "API で呼ぶ", "キー単位で丸ごと読み書き")}
+    </svg>
+  );
+}
+
+/**
+ * NFS と並列ファイルシステム。NFS は 1 台がメタデータもデータも返すが、
+ * Lustre はレイアウトだけを MDS から受け取り、データは OSS と直接やりとりする。
+ */
+export function NfsVsParallelFs() {
+  const clients = (x: number) =>
+    [0, 1, 2].map((i) => (
+      <Box key={i} x={x} y={64 + i * 62} w={96} h={44} label={`クライアント ${i + 1}`} size={12} />
+    ));
+
+  return (
+    <svg viewBox="0 0 800 330" role="img" aria-label="NFS と並列ファイルシステムの経路の違い">
+      <Band x={16} y={24} w={360} h={250} label="NFS" />
+      <Band x={400} y={24} w={384} h={250} label="並列ファイルシステム（Lustre）" align="right" />
+
+      {clients(32)}
+      <Box x={196} y={96} w={164} h={76} label="NFS サーバー" sub="メタデータ + データ" size={13} tone="accent" />
+      {[0, 1, 2].map((i) => (
+        <Arrow key={i} from={[128, 86 + i * 62]} to={[194, 134]} color={C.subtle} />
+      ))}
+      <Box x={220} y={200} w={116} h={40} label="ディスク" size={12.5} tone="ghost" />
+      <Arrow from={[278, 172]} to={[278, 198]} color={C.subtle} />
+
+      {clients(416)}
+      <Box x={628} y={48} w={140} h={50} label="MDS / MDT" sub="名前とレイアウト" size={12.5} tone="accent" />
+      {[0, 1, 2].map((i) => (
+        <Box key={i} x={628} y={118 + i * 50} w={140} h={40} label={`OSS / OST ${i + 1}`} size={12.5} />
+      ))}
+      <Arrow from={[514, 80]} to={[626, 72]} color={C.accent} dashed />
+      <T x={566} y={62} size={12} fill={C.accent} weight={600} anchor="middle">
+        ① レイアウト
+      </T>
+      {[0, 1, 2].map((i) => (
+        <Arrow key={i} from={[514, 150]} to={[626, 138 + i * 50]} color={C.ok} width={2} />
+      ))}
+      <T x={566} y={266} size={12} fill={C.ok} weight={600} anchor="middle">
+        ② データは直接
+      </T>
+
+      <T x={196} y={300} size={12} anchor="middle">
+        すべての要求が 1 台を通る
+      </T>
+      <T x={592} y={300} size={12} anchor="middle">
+        データの読み書きは OSS の台数ぶん並列になる
+      </T>
+    </svg>
+  );
+}
