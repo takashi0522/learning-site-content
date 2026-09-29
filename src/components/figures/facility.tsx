@@ -447,3 +447,119 @@ export function SpineLeaf() {
     </svg>
   );
 }
+
+/**
+ * 液冷の 3 つのループ。CDU が「施設の水」と「IT 側の冷却液」を分ける境界であることを、
+ * 管理者の違いとあわせて示す。サーバーから空気へ出る残りの熱も描いておく。
+ */
+export function LiquidCoolingLoops() {
+  const pipe = (x1: number, x2: number) => (
+    <g>
+      <Arrow from={[x1, 104]} to={[x2, 104]} color={C.ok} width={2.5} head={8} />
+      <Arrow from={[x2, 152]} to={[x1, 152]} color={C.ng} width={2.5} head={8} />
+    </g>
+  );
+
+  return (
+    <svg viewBox="0 0 800 352" role="img" aria-label="施設の水、CDU、IT 側の冷却液の 3 つのループ">
+      <Band x={16} y={40} w={352} h={200} label="施設側 — 施設チームが管理" />
+      <Band x={400} y={40} w={384} h={200} label="IT 側 — 管理者を決めておく" align="right" />
+
+      <Box x={32} y={92} w={132} h={72} label="冷却塔 / チラー" sub="建物の外へ捨てる" size={13} />
+      <Box x={296} y={76} w={176} h={104} tone="accent" />
+      <T x={384} y={100} size={15} weight={700} fill={C.fg} anchor="middle" middle>
+        CDU
+      </T>
+      <T x={384} y={128} size={12} anchor="middle" middle>
+        熱交換器（液体→液体）
+      </T>
+      <T x={384} y={150} size={12} anchor="middle" middle>
+        ポンプ・フィルタ・温度制御
+      </T>
+
+      <Box x={612} y={62} w={156} h={134} />
+      <T x={690} y={80} size={12} weight={700} fill={C.subtle} anchor="middle" middle>
+        ラック
+      </T>
+      <Box x={624} y={94} w={132} h={40} label="HGX サーバー" size={12.5} />
+      <Box x={624} y={144} w={132} h={40} label="HGX サーバー" size={12.5} />
+
+      {pipe(164, 296)}
+      {pipe(472, 612)}
+      <T x={230} y={90} size={12.5} weight={700} fill={C.fg} anchor="middle">
+        FWS（1 次側）
+      </T>
+      <T x={542} y={90} size={12.5} weight={700} fill={C.fg} anchor="middle">
+        TCS（2 次側）
+      </T>
+      <T x={230} y={176} size={12} anchor="middle">
+        施設の水
+      </T>
+      <T x={542} y={176} size={12} anchor="middle">
+        IT 側の冷却液
+      </T>
+
+      <Arrow from={[690, 200]} to={[690, 268]} color={C.ng} width={2} head={7} dashed />
+      <T x={690} y={288} size={12} weight={600} fill={C.ng} anchor="middle">
+        残りの熱は空気へ
+      </T>
+      <T x={690} y={306} size={12} anchor="middle">
+        → 室内の空調が受け持つ
+      </T>
+
+      <T x={24} y={272} size={12} fill={C.ok} weight={600}>
+        → 冷たい供給
+      </T>
+      <T x={24} y={292} size={12} fill={C.ng} weight={600}>
+        ← 温まった戻り
+      </T>
+      <T x={400} y={340} size={12} fill={C.subtle} anchor="middle">
+        2 つのループは CDU の中で混ざらない — 熱だけが板越しに渡る
+      </T>
+    </svg>
+  );
+}
+
+/**
+ * 施設に水が来ているかどうかで、熱の行き先が変わる。
+ * 液体→空気の熱交換器は「部屋に熱を戻す」ので、空調の余力を食う。
+ */
+export function LiquidToLiquidVsAir() {
+  const panel = (x: number, hx: string, hxSub: string, dest: string, destSub: string, tone: "plain" | "ng") => (
+    <g>
+      <Box x={x + 16} y={80} w={96} h={110} label="ラック" sub="コールドプレート" size={13} />
+      <Box x={x + 136} y={100} w={104} h={70} label={hx} sub={hxSub} size={13} tone="accent" />
+      <Box x={x + 264} y={100} w={96} h={70} label={dest} sub={destSub} size={13} tone={tone} />
+      <Arrow from={[x + 112, 122]} to={[x + 136, 122]} color={C.ng} width={2} head={6} />
+      <Arrow from={[x + 136, 150]} to={[x + 112, 150]} color={C.ok} width={2} head={6} />
+      <Arrow from={[x + 240, 122]} to={[x + 264, 122]} color={C.ng} width={2} head={6} />
+      <Arrow from={[x + 264, 150]} to={[x + 240, 150]} color={C.ok} width={2} head={6} />
+    </g>
+  );
+
+  return (
+    <svg viewBox="0 0 800 318" role="img" aria-label="施設の水に捨てる方式と、部屋の空気に捨てる方式の比較">
+      <Band x={16} y={40} w={376} h={176} label="施設に水が来ている" />
+      <Band x={408} y={40} w={376} h={176} label="施設に水が来ていない" align="right" />
+
+      {panel(16, "CDU", "液体→液体", "施設の水", "建物の外へ", "plain")}
+      {panel(408, "熱交換器", "液体→空気", "室内の空気", "空調へ", "ng")}
+
+      <T x={204} y={244} size={12.5} weight={600} fill={C.fg} anchor="middle">
+        熱は施設の水で建物の外へ出る
+      </T>
+      <T x={204} y={266} size={12} anchor="middle">
+        施設側の配管工事が前提
+      </T>
+      <T x={596} y={244} size={12.5} weight={600} fill={C.fg} anchor="middle">
+        熱は部屋に戻り、空調の余力を食う
+      </T>
+      <T x={596} y={266} size={12} anchor="middle">
+        空気は熱を運びにくく、効率は下がる
+      </T>
+      <T x={400} y={304} size={12} fill={C.subtle} anchor="middle">
+        サーバー側の冷却は同じ液冷でも、熱の最終的な行き先が違う
+      </T>
+    </svg>
+  );
+}
