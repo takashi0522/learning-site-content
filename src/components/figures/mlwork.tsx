@@ -70,7 +70,7 @@ export function ModelStateBytes() {
   });
 
   return (
-    <svg viewBox="0 0 800 270" role="img" aria-label="混合精度の Adam でパラメータ 1 個あたりに必要なメモリの内訳">
+    <svg viewBox="0 0 800 240" role="img" aria-label="混合精度の Adam でパラメータ 1 個あたりに必要なメモリの内訳">
       {placed.map((p) => (
         <Box key={p.label} x={p.x} y={60} w={p.w} h={64} label={p.label} sub={`${p.sub}・${p.b} B`} size={13} tone={p.tone} r={4} />
       ))}
@@ -92,9 +92,6 @@ export function ModelStateBytes() {
       </T>
       <T x={x0} y={226} size={12}>
         推論だけなら FP16 の重み 2 B × 7B = 14 GB で済む（KV キャッシュは別）
-      </T>
-      <T x={400} y={258} size={12} fill={C.subtle} anchor="middle">
-        出典: ZeRO（Rajbhandari et al.）の混合精度 Adam の内訳
       </T>
     </svg>
   );
@@ -230,7 +227,7 @@ export function ParallelismLayout() {
     </g>
   );
   return (
-    <svg viewBox="0 0 800 316" role="img" aria-label="テンソル並列・パイプライン並列・データ並列の組み合わせ">
+    <svg viewBox="0 0 800 292" role="img" aria-label="テンソル並列・パイプライン並列・データ並列の組み合わせ">
       {replica(16, "モデルの複製 A")}
       {replica(424, "モデルの複製 B")}
 
@@ -248,8 +245,152 @@ export function ParallelismLayout() {
       <T x={24} y={278} size={12}>
         データ並列 … 同じ構成の複製を並べ、別々のデータを処理させる。段どうし・複製どうしの通信はネットワークを通る
       </T>
-      <T x={400} y={308} size={12} fill={C.subtle} anchor="middle">
-        Megatron-LM（Narayanan et al., 2021）の組み合わせ方を元に作図
+    </svg>
+  );
+}
+
+/**
+ * 再開用のチェックポイントと、重みだけの保存の違い。
+ * 何を入れるかで、大きさと「そこから再開できるか」が決まる。
+ */
+export function CheckpointContents() {
+  const item = (x: number, y: number, w: number, label: string, sub: string, tone: "accent" | "plain" | "ghost") => (
+    <Box x={x} y={y} w={w} h={40} label={label} sub={sub} size={12.5} tone={tone} r={4} />
+  );
+  return (
+    <svg viewBox="0 0 800 270" role="img" aria-label="再開用のチェックポイントと重みだけの保存の違い">
+      <T x={200} y={30} size={14} fill={C.fg} weight={700} anchor="middle">
+        再開用のチェックポイント
+      </T>
+      {item(40, 48, 320, "重み", "モデルの state_dict", "accent")}
+      {item(40, 94, 320, "オプティマイザの状態", "Adam なら m と v", "plain")}
+      {item(40, 140, 154, "スケジューラ", "学習率の進み具合", "plain")}
+      {item(206, 140, 154, "乱数の状態", "データの並びなど", "plain")}
+      {item(40, 186, 320, "ステップ数・エポック", "どこまで進んだか", "plain")}
+      <T x={200} y={252} size={12.5} fill={C.ok} weight={600} anchor="middle">
+        途中から、同じ状態で再開できる
+      </T>
+
+      <T x={600} y={30} size={14} fill={C.fg} weight={700} anchor="middle">
+        重みだけ
+      </T>
+      {item(440, 48, 320, "重み", "モデルの state_dict", "accent")}
+      <Box x={440} y={94} w={320} h={132} tone="ghost" dashed />
+      <T x={600} y={152} size={12} anchor="middle" middle>
+        オプティマイザ・スケジューラ・乱数は持たない
+      </T>
+      <T x={600} y={174} size={12} anchor="middle" middle>
+        → ずっと小さい
+      </T>
+      <T x={600} y={252} size={12.5} fill={C.ng} weight={600} anchor="middle">
+        推論には使えるが、学習はオプティマイザが最初から
+      </T>
+
+    </svg>
+  );
+}
+
+/**
+ * 分散チェックポイント (DCP)。各ランクが自分の担当分を並列に書き、
+ * 読むときは別の GPU 数に分け直せる。
+ */
+export function DcpShards() {
+  return (
+    <svg viewBox="0 0 800 258" role="img" aria-label="各ランクが自分の分を並列に書き、別の GPU 数で読み直す">
+      <T x={130} y={28} size={13} fill={C.fg} weight={700} anchor="middle">
+        保存: 8 ランク
+      </T>
+      {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
+        <g key={i}>
+          <Box x={30 + (i % 4) * 52} y={46 + Math.floor(i / 4) * 52} w={44} h={40} label={`R${i}`} size={12} tone="accent" r={4} />
+        </g>
+      ))}
+      <Arrow from={[244, 96]} to={[318, 96]} color={C.accent} width={2.5} />
+      <T x={281} y={82} size={12} fill={C.accent} weight={600} anchor="middle">
+        並列に書く
+      </T>
+
+      <Box x={322} y={36} w={156} h={124} tone="ghost" />
+      <T x={400} y={54} size={12.5} fill={C.fg} weight={700} anchor="middle" middle>
+        共有ストレージ
+      </T>
+      {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
+        <rect key={i} x={336 + (i % 4) * 34} y={74 + Math.floor(i / 4) * 38} width={26} height={30} rx={3} fill={C.surface2} stroke={C.border} />
+      ))}
+      <T x={400} y={174} size={12} anchor="middle">
+        ランクごとに 1 つ以上のファイル
+      </T>
+
+      <Arrow from={[482, 96]} to={[556, 96]} color={C.ok} width={2.5} />
+      <T x={519} y={82} size={12} fill={C.ok} weight={600} anchor="middle">
+        読む
+      </T>
+      <T x={670} y={28} size={13} fill={C.fg} weight={700} anchor="middle">
+        再開: 4 ランク
+      </T>
+      {[0, 1, 2, 3].map((i) => (
+        <Box key={i} x={562 + (i % 2) * 108} y={46 + Math.floor(i / 2) * 52} w={100} h={40} label={`R${i}`} sub="担当が 2 倍" size={12} tone="ok" r={4} />
+      ))}
+
+      <T x={24} y={222} size={12}>
+        torch.save で 1 つのファイルにまとめる代わりに、各ランクが自分の担当分だけを同時に書く
+      </T>
+      <T x={24} y={244} size={12}>
+        読むときに分け直す（resharding）ので、保存したときと違う GPU 数でも再開できる
+      </T>
+    </svg>
+  );
+}
+
+/**
+ * LoRA。元の重み W は凍結し、横に足した小さな 2 つの行列 (A, B) だけを学習する。
+ * 学習後は B·A を W に足し込める (マージ) ので、推論の経路は元と同じになる。
+ */
+export function LoraAdapter() {
+  return (
+    <svg viewBox="0 0 800 290" role="img" aria-label="LoRA は元の重みを凍結し、小さな行列だけを学習する">
+      <Box x={40} y={110} w={90} h={44} label="入力 x" size={13} />
+      <Arrow from={[130, 132]} to={[176, 92]} color={C.subtle} />
+      <Arrow from={[130, 132]} to={[176, 186]} color={C.subtle} />
+
+      <Box x={180} y={36} w={240} h={110} tone="ghost" />
+      <T x={300} y={74} size={15} fill={C.fg} weight={700} anchor="middle" middle>
+        元の重み W
+      </T>
+      <T x={300} y={100} size={12} anchor="middle" middle>
+        凍結（学習しない）
+      </T>
+      <T x={300} y={122} size={12} anchor="middle" middle>
+        勾配もオプティマイザの状態も持たない
+      </T>
+
+      <Box x={180} y={168} w={66} h={60} label="A" sub="r × k" size={14} tone="accent" />
+      <Box x={264} y={168} w={66} h={60} label="B" sub="d × r" size={14} tone="accent" />
+      <Arrow from={[246, 198]} to={[262, 198]} color={C.subtle} head={5} />
+      <T x={300} y={248} size={12} fill={C.accent} weight={600} anchor="middle">
+        ここだけ学習する（r は小さい）
+      </T>
+
+      <Arrow from={[420, 92]} to={[486, 126]} color={C.subtle} />
+      <Arrow from={[330, 198]} to={[486, 140]} color={C.accent} />
+      <circle cx={500} cy={132} r={14} fill={C.surface2} stroke={C.border} strokeWidth={1.5} />
+      <T x={500} y={132} size={15} fill={C.fg} weight={700} anchor="middle" middle>
+        +
+      </T>
+      <Arrow from={[514, 132]} to={[560, 132]} color={C.subtle} />
+      <Box x={564} y={110} w={196} h={44} label="出力 = Wx + BAx" size={13} />
+
+      <T x={540} y={192} size={12} fill={C.fg} weight={600}>
+        学習後の選択肢
+      </T>
+      <T x={540} y={214} size={12}>
+        ・BA を W に足し込む（遅延は増えない）
+      </T>
+      <T x={540} y={236} size={12}>
+        ・A と B だけを別に配り、差し替える
+      </T>
+      <T x={400} y={280} size={12} fill={C.subtle} anchor="middle">
+        保存して配るのは A と B だけで済むが、推論には元の重み W が別に要る
       </T>
     </svg>
   );

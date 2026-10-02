@@ -28,7 +28,16 @@ import { CudaStack, GpuContainerStack, GpuInterconnectPaths } from "./gpu";
 import { DcqcnLoop, EcmpVsAdaptive, PfcPause } from "./gpunet";
 import { NumaTopology, PcieNuma, PowerLossProtection } from "./hardware";
 import { ContainerParts, DemandPaging, FdToInode, SyscallBoundary } from "./linux";
-import { DdpOverlap, ModelStateBytes, ParallelismLayout, TrainingLoop, TwoCheckpoints } from "./mlwork";
+import {
+  CheckpointContents,
+  DcpShards,
+  DdpOverlap,
+  LoraAdapter,
+  ModelStateBytes,
+  ParallelismLayout,
+  TrainingLoop,
+  TwoCheckpoints,
+} from "./mlwork";
 import { LvmStack } from "./ops";
 import { RxPacketPath, TcpQueues, TcpTeardown, TlsHandshakeRtt } from "./network";
 import {
@@ -74,6 +83,9 @@ export const FIGURES = {
   "two-checkpoints": TwoCheckpoints,
   "ddp-overlap": DdpOverlap,
   "parallelism-layout": ParallelismLayout,
+  "checkpoint-contents": CheckpointContents,
+  "dcp-shards": DcpShards,
+  "lora-adapter": LoraAdapter,
   "nfs-vs-parallel-fs": NfsVsParallelFs,
   "training-step": TrainingStep,
   "ib-credit-flow": IbCreditFlow,

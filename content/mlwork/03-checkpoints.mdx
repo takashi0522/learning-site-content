@@ -1,0 +1,208 @@
+---
+title: チェックポイントの実物 — 何が入り、どう再開するか
+description: 「チェックポイント」は言葉としては知っていても、中に何が入っていて、どう書かれ、どう読み戻されるのかは見えにくいものです。再開に必要な中身、分散学習での書き方、プリエンプションへの備えを、ストレージと基盤の側から整理します。
+order: 3
+minutes: 20
+tags: ["checkpoint", "state_dict", "DCP", "safetensors", "resume", "preemption"]
+objectives:
+  - 学習を再開するために、チェックポイントに何が入っている必要があるかを説明できる
+  - 分散チェックポイントが、ファイルの数と書き方をどう変えるかを説明できる
+  - 中断（SIGTERM）や非同期保存が、基盤側の設定にどう関わるかを説明できる
+references:
+  - label: "PyTorch Tutorials — Saving and Loading Models（General Checkpoint）"
+    url: "https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html"
+  - label: "PyTorch — Serialization semantics（torch.load の weights_only）"
+    url: "https://docs.pytorch.org/docs/stable/notes/serialization.html"
+  - label: "PyTorch — Distributed Checkpoint（torch.distributed.checkpoint）"
+    url: "https://docs.pytorch.org/docs/stable/distributed.checkpoint.html"
+  - label: "PyTorch Tutorials — Getting Started with Distributed Checkpoint (DCP)"
+    url: "https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html"
+  - label: "PyTorch Tutorials — Asynchronous Saving with Distributed Checkpoint (DCP)"
+    url: "https://docs.pytorch.org/tutorials/recipes/distributed_async_checkpoint_recipe.html"
+  - label: "PyTorch — torch.optim.Adam（1 次・2 次モーメント）"
+    url: "https://docs.pytorch.org/docs/stable/generated/torch.optim.Adam.html"
+  - label: "Hugging Face Transformers — Trainer（TrainingArguments の save_* 引数。main ブランチ、2026 年 10 月時点）"
+    url: "https://huggingface.co/docs/transformers/main/en/main_classes/trainer"
+  - label: "Hugging Face Transformers — Trainer recipes（Resume training / JIT checkpointing）"
+    url: "https://github.com/huggingface/transformers/blob/main/docs/source/en/trainer_recipes.md"
+  - label: "Kubernetes — Pod Lifecycle（Termination of Pods）"
+    url: "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/"
+  - label: "Hugging Face — Safetensors"
+    url: "https://huggingface.co/docs/safetensors/index"
+---
+
+## 再開に要るのは、重みだけではない
+
+レッスン 1 で見たとおり、学習中の GPU には重みのほかに、オプティマイザの状態などが載っています。**途中から同じ状態で再開する**には、それらも保存しておく必要があります。
+
+PyTorch のチュートリアルは、推論にも再開にも使える「一般的なチェックポイント」として、次のものを 1 つの辞書にまとめて `torch.save()` で保存する例を示しています。
+
+```python
+torch.save({
+    "epoch": epoch,
+    "model_state_dict": model.state_dict(),          # 重み
+    "optimizer_state_dict": optimizer.state_dict(),  # オプティマイザの状態
+    "loss": loss,
+}, PATH)
+```
+
+チュートリアルによると、オプティマイザの `state_dict` には学習とともに更新されるバッファやパラメータが入っているので、**モデルだけでなくこれも保存しなければならない**。そのため、このチェックポイントは**モデル単体の 2〜3 倍の大きさになることが多い**、としています。
+
+---
+
+<h2 className="slide-cont">再開に要るのは、重みだけではない（続き）</h2>
+
+<Figure name="checkpoint-contents" caption="何を入れるかで、大きさと「そこから再開できるか」が決まる" source="PyTorch のチュートリアルと Hugging Face Trainer（save_only_model）の説明を元に作図" />
+
+Hugging Face の Trainer は、この違いを設定 1 つで切り替えます。`save_only_model=True` にすると、**オプティマイザ・スケジューラ・乱数の状態を保存せず、重みだけ**を保存します。ドキュメントは「チェックポイントのサイズが大きく減るが、そこから学習を再開できなくなる」と書いています。
+
+Trainer で再開すると、オプティマイザ・スケジューラ・乱数の状態が復元されます。それらのファイルがチェックポイントに無い場合は、**オプティマイザが最初からやり直し**になります。
+
+<Callout type="pitfall" title="「チェックポイントはあるのに再開できない」">
+
+ストレージを節約しようとして重みだけを残す設定にすると、ファイルはあっても学習は元の状態に戻れません。利用者に「チェックポイントを消してよいか」「小さくしてよいか」を聞かれたら、**それが再開用か、配布用（重みだけ）か**を先に確かめます。
+
+</Callout>
+
+---
+
+## ディレクトリの実物と、ストレージの容量
+
+Hugging Face の Trainer は、出力先のディレクトリの下にチェックポイントのディレクトリを作ります。ドキュメントの再開の例では `out/checkpoint-1000` を指定しています。
+
+```text
+# 例: 500 ステップごとに保存した場合
+out/
+  checkpoint-500/
+  checkpoint-1000/
+  checkpoint-1500/
+  ...
+```
+
+保存の間隔と数は、次の引数で決まります。
+
+| 引数 | 意味（Trainer のドキュメント） |
+| --- | --- |
+| `save_strategy` | いつ保存するか。既定は `"steps"`（一定ステップごと） |
+| `save_steps` | 何ステップごとに保存するか。**既定は 500** |
+| `save_total_limit` | 残すチェックポイントの数。超えると**古いものから消す** |
+| `save_on_each_node` | 複数ノードのとき、各ノードに保存するか（既定は主ノードだけ）。全ノードが同じストレージを使う場合は有効にしない |
+
+`save_total_limit` は、残す数に上限を設けて古いものを消すための引数です。基盤の側から見ると、**1 回あたりの大きさ × 残す数**が、1 つのジョブが共有ストレージに置く量の目安になります。上限を決めていないジョブがあれば、保存のたびに使用量が増えていくものとして見積もります。
+
+---
+
+## 分散学習では、全員が同時に書く
+
+レッスン 2 の FSDP のように、重みや状態を**プロセスごとに分割して持っている**場合のために、PyTorch には **Distributed Checkpoint（DCP）**があります。DCP のドキュメントによると、各ランクは**自分が持っている担当分だけ**を保存し、保存も読み込みも複数のランクで並列に行います。
+
+<Figure name="dcp-shards" caption="各ランクが自分の担当分を同時に書き、読むときに分け直す" source="PyTorch — Distributed Checkpoint のドキュメントとチュートリアルを元に作図" />
+
+---
+
+<h2 className="slide-cont">分散学習では、全員が同時に書く（続き）</h2>
+
+DCP のドキュメントとチュートリアルは、DCP の性質を次のように説明しています。
+
+- **全ランクが並列に**保存し、並列に読み込む
+- 1 つのチェックポイントが**複数のファイル**になり、**ランクごとに少なくとも 1 つ**ある
+- 読み込むときに分け直す（resharding）ので、**保存したときと違う GPU 数でも読める**
+- 形式は `torch.save` の形式と違う。相互に変換する関数（`dcp_to_torch_save` など）が用意されている
+
+基盤から見ると、DCP の保存は「**多数のノードが、同じ時刻に、それぞれ別のファイルを書く**」負荷です。AI 基盤コース レッスン 7 で見た並列ファイルシステムは、こうした同時の書き込みを多数のサーバーに分けて受けるための仕組みです。
+
+---
+
+## 保存の間、学習は止まる
+
+保存中は、書き終わるまで次のステップに進めません。DCP の非同期保存のチュートリアルは、チェックポイントの保存が分散学習の**クリティカルパス上のボトルネックになりやすく、モデルと GPU 数が大きくなるほどコストが増える**と書いています。
+
+非同期保存（`async_save`）は、まず重みと状態を**CPU 側のバッファにコピー**し、ストレージへの書き込みは裏で進めます。コピーが終われば学習を再開できます。
+
+ただし、チュートリアルは代償も挙げています。
+
+- CPU メモリの使用量が **1 ランクあたりのチェックポイントの大きさ × ランク数**だけ増える
+- コピーを速くするためにピン留めメモリ（ページロックメモリ）を使うと、通常のメモリより確保しにくい資源を使う
+
+基盤の側では、**GPU ノードのホストメモリに、この分の余裕があるか**を確かめておきます。保存の頻度と学習の止まる時間の関係は、AI 基盤コース レッスン 4 で扱いました。
+
+---
+
+## 中断に備える: SIGTERM と猶予時間
+
+一定間隔の保存では、最後の保存から中断までの進みは失われます。Hugging Face の Trainer のドキュメントは、ジョブがいつでも止められうる（プリエンプションのある）共有クラスタでは、その差が何時間分もの計算の無駄になりうると書いています。
+
+そのための仕組みが **JIT（Just-In-Time）チェックポイント**です（`enable_jit_checkpoint=True`）。新しい引数なので、このレッスンでは Transformers の main ブランチのドキュメント（2026 年 10 月時点）で確認しました。使う版にこの引数があるかは、その版のドキュメントで確かめてください。
+
+1. Trainer が **SIGTERM** を受け取る
+2. 今のステップが終わるのを待つ
+3. チェックポイントを保存して、学習を止める
+
+保存を始めるときに目印のファイル `checkpoint-is-incomplete.txt` を書き、書き終えたら消します。ディレクトリにこのファイルが残っていれば、保存が途中で切れたということです。Trainer はこれを自動では確かめないので、**再開の前に自分で確認する**必要があります。
+
+<Callout type="warning" title="猶予時間が短いと、保存が終わる前に殺される">
+
+Trainer のドキュメントは、オーケストレーターの側で保存が終わるだけの時間を確保するよう警告しています。**Kubernetes の既定の猶予時間は 30 秒**で、大きなモデルでは足りないのが普通です。
+
+Kubernetes のドキュメントによると、Pod を止めるときはまずコンテナに TERM シグナルが送られ、**猶予時間（`terminationGracePeriodSeconds`、既定 30 秒）**が過ぎてもまだ動いているプロセスには **SIGKILL** が送られます。JIT チェックポイントを使うジョブには、保存にかかる時間を見積もったうえで、この猶予時間を伸ばしておきます（AI 基盤コース レッスン 6 のジョブの停止と再開の話と合わせて見てください）。
+
+</Callout>
+
+---
+
+## 学習用と配布用で、形式を分ける
+
+学習を終えたモデルを推論に回すときは、再開用の情報は要りません。重みだけを、別の形式で渡すことがよくあります。
+
+`torch.save` の形式は、Python の pickle を使っています。PyTorch のドキュメントによると、`torch.load` は **2.6 以降、既定で `weights_only=True`** になり、読み込み時に実行できる処理を、重みの復元に必要なものだけに絞ります。これはリモートコード実行の攻撃面を狭めるための設定です。
+
+Hugging Face の **safetensors** は、テンソルを**pickle を使わずに安全に保存する**ための形式で、ゼロコピーで速く読めます。必要な一部のテンソルだけを読むこともできます。
+
+| | 主な用途 | 中身 |
+| --- | --- | --- |
+| 再開用チェックポイント | 学習の続き | 重み＋オプティマイザ＋スケジューラ＋乱数＋進捗 |
+| 配布用の重み | 推論・ファインチューニング（レッスン 4〜6） | 重みだけ（safetensors など） |
+
+学習が終わった重みが推論サービスに届くまでの流れは、レッスン 6 で扱います。
+
+---
+
+## まとめ
+
+- 再開には、**重みに加えてオプティマイザ・スケジューラ・乱数の状態と進捗**が要る。PyTorch のチュートリアルは、こうしたチェックポイントはモデル単体の 2〜3 倍になることが多いとしている
+- Trainer の `save_only_model` は重みだけを保存する。小さくなるが、そこからは再開できない
+- `save_steps`（既定 500）と `save_total_limit` が、**チェックポイントの数と共有ストレージの使用量**を決める
+- **DCP** は全ランクが自分の担当分を並列に書き、別の GPU 数でも読み戻せる。基盤には「多数のノードが同時に書く」負荷になる
+- 非同期保存は学習の停止を短くするが、**ホストメモリを 1 ランクあたりの大きさ × ランク数**だけ使う
+- JIT チェックポイントは SIGTERM で保存する。**Kubernetes の既定の猶予 30 秒では足りない**ことが多い
+- 推論に渡すのは重みだけ。safetensors は pickle を使わない安全な形式
+
+---
+
+<Quiz
+  id="q1"
+  question="ストレージの容量を節約するため、Trainer の save_only_model を True にした学習ジョブが、ノード障害で止まりました。最新のチェックポイントから再開すると、何が起きますか。"
+  options={[
+    "重みも状態もすべて保存されているので、止まる直前と同じ状態で再開できる",
+    "重みは戻るが、オプティマイザ・スケジューラ・乱数の状態が保存されていないため、オプティマイザは最初からやり直しになる",
+    "チェックポイントが読み込めず、学習はステップ 0 から始まる",
+    "save_only_model はファイル形式を変えるだけで、中身は変わらない"
+  ]}
+  answer={1}
+  explanation="Trainer のドキュメントによると、save_only_model は重みだけを保存し、オプティマイザ・スケジューラ・乱数の状態を保存しません。サイズは大きく減りますが、そのチェックポイントから学習を再開することはできなくなります。再開時にオプティマイザとスケジューラの状態のファイルが無い場合、オプティマイザは最初からやり直しになります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Kubernetes 上で JIT チェックポイント（enable_jit_checkpoint=True）を有効にした大きなモデルの学習ジョブが、プリエンプションのたびにチェックポイントを残せずに止まっています。チェックポイントのディレクトリには checkpoint-is-incomplete.txt が残っていました。最初に見直すべきものはどれですか。"
+  options={[
+    "save_steps を小さくして、保存の頻度を上げる",
+    "Pod の終了の猶予時間。既定の 30 秒では保存が終わる前に強制終了されている可能性が高いので、保存にかかる時間に合わせて伸ばす",
+    "save_total_limit を増やして、残すチェックポイントの数を増やす",
+    "torch.load の weights_only を False にする"
+  ]}
+  answer={1}
+  explanation="JIT チェックポイントは SIGTERM を受けてから今のステップを終え、保存してから止まります。保存の開始時に checkpoint-is-incomplete.txt を書き、書き終えたら消すので、このファイルが残っているのは保存が途中で切れた証拠です。Trainer のドキュメントは、Kubernetes の既定の猶予時間 30 秒は大きなモデルには足りないのが普通だとし、オーケストレーターの側で保存が終わるだけの時間を確保するよう警告しています。"
+/>
