@@ -145,3 +145,112 @@ export function TwoCheckpoints() {
   );
 }
 
+
+/**
+ * DDP の backward。勾配はバケット単位で all-reduce され、バケットが埋まった順に
+ * 通信が始まるので、計算と通信が重なる。最後のバケットの通信だけが計算の後ろにはみ出す。
+ */
+export function DdpOverlap() {
+  const x0 = 140;
+  const u = 52;
+  const layers = ["層 8", "層 7", "層 6", "層 5", "層 4", "層 3", "層 2", "層 1"];
+  return (
+    <svg viewBox="0 0 800 270" role="img" aria-label="DDP で backward の計算と勾配の all-reduce が重なる様子">
+      <T x={24} y={78} size={13} fill={C.fg} weight={700} middle>
+        GPU の計算
+      </T>
+      <T x={24} y={148} size={13} fill={C.fg} weight={700} middle>
+        GPU 間の通信
+      </T>
+
+      {layers.map((name, i) => (
+        <Box key={name} x={x0 + i * u} y={58} w={u - 4} h={40} label={name} size={12} tone="accent" r={4} />
+      ))}
+      <Box x={x0 + 10 * u} y={58} w={100} h={40} label="step" size={12.5} r={4} />
+
+      {[
+        { from: 3, label: "バケット 1" },
+        { from: 6, label: "バケット 2" },
+        { from: 8, label: "バケット 3" },
+      ].map((b) => (
+        <g key={b.label}>
+          <Box x={x0 + b.from * u} y={128} w={u * 2 - 8} h={40} label={`all-reduce`} sub={b.label} size={12} r={4} />
+          <Arrow from={[x0 + b.from * u - 2, 100]} to={[x0 + b.from * u + 6, 126]} color={C.subtle} head={5} />
+        </g>
+      ))}
+
+      <line x1={x0 + 8 * u} y1={44} x2={x0 + 8 * u} y2={186} stroke={C.ng} strokeWidth={1.5} strokeDasharray="4 4" />
+      <T x={x0 + 8 * u - 6} y={206} size={12} fill={C.ng} weight={600} anchor="end">
+        backward が終わった時点
+      </T>
+      <T x={x0 + 8 * u + 6} y={206} size={12} fill={C.ng} weight={600}>
+        → 全バケットの通信を待ってから step
+      </T>
+
+      <T x={x0} y={30} size={12}>
+        backward は出力側の層から順に進む → 勾配がそろったバケットから通信を始める
+      </T>
+      <T x={400} y={254} size={12} fill={C.subtle} anchor="middle">
+        計算と重なった通信は待ち時間として表に出にくい。重なりきらない分が待ち時間になる
+      </T>
+    </svg>
+  );
+}
+
+/**
+ * テンソル並列・パイプライン並列・データ並列の組み合わせ (Megatron-LM の PTD-P)。
+ * どの並列をどの通信路に載せるかが、基盤の構成とそのまま対応する。
+ */
+export function ParallelismLayout() {
+  const node = (x: number, y: number, stage: string) => (
+    <g>
+      <Box x={x} y={y} w={168} h={98} tone="ghost" />
+      <T x={x + 84} y={y + 16} size={12} fill={C.fg} weight={700} anchor="middle" middle>
+        {stage}
+      </T>
+      {[0, 1, 2, 3].map((g) => (
+        <Box key={g} x={x + 10 + g * 38} y={y + 32} w={32} h={30} label={`G${g}`} size={12} tone="accent" r={4} />
+      ))}
+      <T x={x + 84} y={y + 80} size={12} anchor="middle" middle>
+        NVLink 内でテンソル並列
+      </T>
+    </g>
+  );
+  const replica = (x: number, name: string) => (
+    <g>
+      <T x={x + 186} y={28} size={13} fill={C.fg} weight={700} anchor="middle">
+        {name}
+      </T>
+      {node(x, 40, "ノード 1: 層 1〜16")}
+      {node(x + 204, 40, "ノード 2: 層 17〜32")}
+      <Arrow from={[x + 170, 89]} to={[x + 202, 89]} color={C.accent} width={2} />
+      <T x={x + 186} y={158} size={12} fill={C.accent} weight={600} anchor="middle">
+        パイプライン並列: 活性化を次の段へ
+      </T>
+    </g>
+  );
+  return (
+    <svg viewBox="0 0 800 316" role="img" aria-label="テンソル並列・パイプライン並列・データ並列の組み合わせ">
+      {replica(16, "モデルの複製 A")}
+      {replica(424, "モデルの複製 B")}
+
+      <Arrow from={[200, 180]} to={[608, 180]} color={C.ok} width={2} bidi />
+      <T x={404} y={200} size={12.5} fill={C.ok} weight={600} anchor="middle">
+        データ並列: 複製どうしで勾配を揃える
+      </T>
+
+      <T x={24} y={234} size={12}>
+        テンソル並列 … 1 つの層の行列を分ける。層ごとに all-reduce が要るので、一般にサーバーの中（NVLink）に留める
+      </T>
+      <T x={24} y={256} size={12}>
+        パイプライン並列 … 層の並びを段に分ける。通信は段の境目だけ（1 対 1）だが、段が空いて待つ時間が出る
+      </T>
+      <T x={24} y={278} size={12}>
+        データ並列 … 同じ構成の複製を並べ、別々のデータを処理させる。段どうし・複製どうしの通信はネットワークを通る
+      </T>
+      <T x={400} y={308} size={12} fill={C.subtle} anchor="middle">
+        Megatron-LM（Narayanan et al., 2021）の組み合わせ方を元に作図
+      </T>
+    </svg>
+  );
+}

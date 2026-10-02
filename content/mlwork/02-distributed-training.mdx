@@ -1,0 +1,216 @@
+---
+title: GPU を増やすと何が変わるか — DDP・FSDP・モデル並列
+description: 1 枚の GPU で動いていた学習を N 枚に広げるとき、利用者のコードと実行の中で何が増えるのか。データ並列（DDP・FSDP）とモデル並列（テンソル・パイプライン）を、基盤から見える通信と結びつけて整理します。
+order: 2
+minutes: 22
+tags: ["distributed", "DDP", "FSDP", "tensor-parallel", "pipeline-parallel", "torchrun"]
+objectives:
+  - torchrun が起動する複数のプロセスが、どう役割を分けているかを説明できる
+  - DDP が勾配をどう揃え、なぜ通信が計算の陰に隠れるのかを説明できる
+  - FSDP・テンソル並列・パイプライン並列が、何を分けて何を通信するのかを区別できる
+references:
+  - label: "PyTorch — torchrun (Elastic Launch)（環境変数）"
+    url: "https://docs.pytorch.org/docs/stable/elastic/run.html"
+  - label: "PyTorch — torch.utils.data（DistributedSampler）"
+    url: "https://docs.pytorch.org/docs/stable/data.html"
+  - label: "PyTorch — DistributedDataParallel（API リファレンス）"
+    url: "https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html"
+  - label: "PyTorch — Distributed Data Parallel（Internal Design）"
+    url: "https://docs.pytorch.org/docs/stable/notes/ddp.html"
+  - label: "PyTorch Tutorials — Getting Started with Fully Sharded Data Parallel (FSDP2)"
+    url: "https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html"
+  - label: "Rajbhandari et al., ZeRO: Memory Optimizations Toward Training Trillion Parameter Models"
+    url: "https://arxiv.org/abs/1910.02054"
+  - label: "Zhao et al., PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel（2023）"
+    url: "https://arxiv.org/abs/2304.11277"
+  - label: "Shoeybi et al., Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism（2019）"
+    url: "https://arxiv.org/abs/1909.08053"
+  - label: "Narayanan et al., Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM（SC21）"
+    url: "https://arxiv.org/abs/2104.04473"
+  - label: "Huang et al., GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism（2019）"
+    url: "https://arxiv.org/abs/1811.06965"
+---
+
+## N 枚の GPU には N 個のプロセスが付く
+
+分散学習でまず変わるのは、**プロセスの数**です。PyTorch では `torchrun` が、ノードごとに指定した数のプロセスを起動します。DDP のドキュメントは、N 枚の GPU を持つホストでは **N 個のプロセスを起動し、それぞれが 1 枚の GPU だけを使う**ようにと書いています。
+
+どのプロセスも**同じスクリプト**を実行します。違うのは、`torchrun` が環境変数で渡す「自分が何番目か」だけです。
+
+| 環境変数 | 意味（PyTorch のドキュメント） |
+| --- | --- |
+| `RANK` | ジョブ全体の中での自分の番号 |
+| `LOCAL_RANK` | そのノードの中での番号。どの GPU を使うかに使う |
+| `WORLD_SIZE` | ジョブ全体のプロセス数 |
+| `MASTER_ADDR` / `MASTER_PORT` | 番号 0 のプロセスが動いているホストとポート。最初に集合するための待ち合わせ場所 |
+
+起動のしかたとジョブの割り当ては AI 基盤コース レッスン 6 で扱いました。このレッスンでは、起動したあと**プロセスどうしが何を分担し、何をやりとりするか**を見ます。
+
+---
+
+## データ並列: 同じモデルで別々のデータを読む
+
+最も基本的な分け方は**データ並列**です。全プロセスが同じモデルを丸ごと持ち、**データを分けて**別々のバッチを処理します。
+
+データの分け方は、PyTorch の `DistributedSampler` が受け持ちます。ドキュメントによると、各プロセスは**データセットのうち自分専用の一部**だけを読みます。エポックごとに `set_epoch()` を呼ばないと、毎エポック同じ並び順で読むことになります。
+
+### DDP は勾配の平均で複製を揃える
+
+PyTorch の DDP（DistributedDataParallel）のドキュメントは、1 ステップを次のように説明しています。
+
+1. **構築時**: 番号 0 のプロセスの重みを全プロセスに配り（broadcast）、全員が同じ状態から始める
+2. **backward 中**: 各プロセスの勾配を all-reduce で**平均**し、全員が同じ勾配を持つ
+3. **optimizer.step**: 全員が同じ状態から始め、毎ステップ同じ平均の勾配で更新するので、複製はずっと揃ったまま
+
+DDP の API リファレンスも、**パラメータを毎回プロセス間で配り直すことはない**と書いています。毎ステップ揃えるのは勾配で、ほかに配られるのは BatchNorm の統計のようなバッファ（番号 0 から毎イテレーション）だけです。
+
+つまり DDP の通信は、**毎ステップ、勾配と同じ量のデータを all-reduce する**ことです。これが、AI 基盤コースや GPU 基盤の導入コースで「データ並列は毎イテレーション全プロセスが all-reduce に参加する」と書いてきた中身です。
+
+---
+
+<h2 className="slide-cont">データ並列（続き）</h2>
+
+### 通信は backward の途中から始まる
+
+DDP は、勾配を**バケット**という塊にまとめて all-reduce します。backward は出力に近い層から順に進むので、DDP はパラメータをおおむね逆順にバケットへ詰めておき、**バケットの勾配がそろった時点で、そのバケットの all-reduce を非同期に始めます**。
+
+<Figure name="ddp-overlap" caption="勾配がそろったバケットから通信を始めるので、通信を backward の計算と重ねられる" source="PyTorch — Distributed Data Parallel（Internal Design）を元に作図" />
+
+全バケットの勾配がそろうと、DDP は**すべての all-reduce の完了を待ち**、平均した勾配を各パラメータの `.grad` に書き戻します。そのあと `optimizer.step()` に進みます。
+
+DDP のドキュメントは、勾配がそろう順番がバケットの詰め方の想定と違うと、通信を最も早い時点で始められず、backward が遅くなることがあるとも書いています。
+
+---
+
+<h2 className="slide-cont">データ並列（続き）</h2>
+
+<Callout type="field" title="基盤から見える「GPU を増やしても速くならない」">
+
+DDP は通信を計算と重ねる設計なので、重なった分の通信は待ち時間として表に出にくくなります。逆に、**計算と重なりきらずにはみ出した通信は、そのまま待ち時間**になります。
+
+利用者が「GPU を倍にしたのに速くならない」と言うとき、まず疑うのはこのはみ出しです。AI 基盤コース レッスン 3 の nccl-tests で、ノード間の all-reduce の帯域を実測するところから始めます。
+
+</Callout>
+
+---
+
+## FSDP: モデルが 1 枚に載らないとき
+
+DDP では、どのプロセスもモデルを**丸ごと**持ちます。レッスン 1 で見たとおり、学習にはパラメータ 1 個あたり約 16 バイトが要るので、大きなモデルは 1 枚の GPU に載りません。
+
+**FSDP**（Fully Sharded Data Parallel）は、データ並列のまま、**重み・勾配・オプティマイザの状態を全プロセスで分割して持つ**方式です。PyTorch のチュートリアルは、その動きを次のように説明しています。
+
+| いつ | 何が起きるか |
+| --- | --- |
+| forward / backward の外 | 重みは分割されたまま（各プロセスは自分の担当分だけ） |
+| forward / backward の直前 | 分割された重みを **all-gather** で集め、一時的に完全な重みにする |
+| backward の中 | 勾配を **reduce-scatter** で合計しつつ、担当分だけを受け取る |
+| optimizer.step | 担当分の重みを、担当分の勾配で更新する（状態も担当分だけ） |
+
+チュートリアルは、FSDP を「DDP の all-reduce を、reduce-scatter と all-gather に分解したもの」と表現しています。
+
+---
+
+<h2 className="slide-cont">FSDP（続き）</h2>
+
+### メモリと通信の引き換え
+
+ZeRO の論文は、この分割を 3 段階で整理しています。
+
+| 分割するもの | 1 プロセスあたりの「モデルの状態」のメモリ |
+| --- | --- |
+| オプティマイザの状態だけ | 最大で 4 分の 1 |
+| ＋ 勾配 | 最大で 8 分の 1 |
+| ＋ 重み | **データ並列の数に比例して減る** |
+
+FSDP も、チュートリアルのとおり重み・勾配・状態のすべてを分割します。なお PyTorch の FSDP の論文（Zhao et al., 2023）は、設計は ZeRO に着想を得たものの、FSDP は本質的に別物だとしています。
+
+重みを分割すると、その代わりに **forward と backward の直前に重みを集め直す通信（all-gather）**が加わります。チュートリアルの例では、各層に `fully_shard` をかけ、層の forward の間は**ほかの層を分割したまま**にしてメモリを抑えています。つまり FSDP の通信は、ステップの中で層ごとに入ります。
+
+---
+
+## モデル並列: 1 つのモデルを分けて持つ
+
+データ並列（DDP・FSDP）は、計算の上では**どのプロセスもモデル全体を通して**処理します。これとは別に、**モデルそのものを分けて、別々の GPU に別々の部分を計算させる**のがモデル並列です。分け方は 2 つあります。
+
+### テンソル並列: 1 つの層を分ける
+
+Megatron-LM の論文（2019）は、Transformer の層の中の行列の掛け算を GPU 間で分割する方法を示しました。この分け方では、1 つの層につき **forward で 2 回、backward で 2 回の all-reduce** が要ります。
+
+**層ごとに通信が入る**ので、通信の速さがそのまま効きます。Megatron-LM の 2021 年の論文（A100 世代の DGX で実験）は、この all-reduce は**サーバーをまたぐと高くつきうる**とし、g 枚の GPU を持つサーバーでは、**テンソル並列は一般に g まで（サーバーの中）**に留め、それより大きなモデルはパイプライン並列でサーバーをまたぐ、という指針を示しています。サーバー内の GPU は、サーバー間のリンクより帯域の大きい NVLink でつながっているからです。
+
+### パイプライン並列: 層の並びを分ける
+
+**パイプライン並列**は、層 1〜16 をこの GPU、層 17〜32 をあの GPU、というように**層の並びを段に分けます**。段と段の間で受け渡すのは、境目の活性化だけです。Megatron-LM の 2021 年の論文は、パイプライン並列の通信を「より安い 1 対 1 の通信」と書いています。
+
+---
+
+<h2 className="slide-cont">モデル並列（続き）</h2>
+
+その代わり、段が順番に働くので**手の空く段**が出ます。GPipe の論文（2019）は、バッチを**マイクロバッチ**に細かく分けて、複数の段が別々のマイクロバッチを同時に処理する方法を示しました。勾配はマイクロバッチ全体で足し合わせ、バッチの最後に 1 回だけ更新します。
+
+それでも段が待つ時間は残ります。Megatron-LM の論文はこれを**パイプラインバブル**と呼び、できるだけ小さくしたいものとしています。
+
+### 3 つを組み合わせる
+
+大きなモデルの学習では、これらを組み合わせます。Megatron-LM の 2021 年の論文は、**サーバーの中でテンソル並列、サーバーをまたいでパイプライン並列、その外側でデータ並列**という組み合わせを示しています。
+
+<Figure name="parallelism-layout" caption="通信の多い並列ほど、通信路の速い範囲に閉じ込める" source="Narayanan et al., 2021 を元に作図" />
+
+---
+
+## 基盤から見える通信の違い
+
+同じ「分散学習」でも、並列の種類によって基盤にかかる負荷の形が違います。
+
+| 並列のしかた | 何を分けるか | 何を通信するか | 通信の経路 |
+| --- | --- | --- | --- |
+| **DDP** | データ | 毎ステップ、勾配の all-reduce | ノードをまたぐ分はネットワーク |
+| **FSDP** | データ＋重み・勾配・状態 | 層ごとの all-gather と reduce-scatter | ノードをまたぐ分はネットワーク |
+| **テンソル並列** | 1 つの層の行列 | 層ごとの all-reduce | サーバー内（NVLink）に留めるのが指針 |
+| **パイプライン並列** | 層の並び | 段の境目の活性化（1 対 1） | サーバーをまたぐ（ネットワーク） |
+
+GPU ネットワークコースや GPU 基盤の導入コースで、計算用のネットワークをノンブロッキングに組み、レール最適化で経路を短くしてきたのは、この表で「ネットワーク」を通る通信を速くするためです。
+
+利用者に「どの並列を使っていますか」と聞けば、そのジョブがネットワークのどこにどんな負荷をかけるかの見当がつきます。
+
+---
+
+## まとめ
+
+- N 枚の GPU には、通常 N 個のプロセスが付く。`torchrun` が `RANK` などの環境変数で役割を渡す
+- **DDP** は同じモデルで別々のデータを読み、勾配を all-reduce で平均して複製を揃える
+- DDP の通信は**バケット単位で backward の途中から始まる**ので、計算と重ねられる。重なりきらない分が待ち時間になる
+- **FSDP** は重み・勾配・状態を分割してメモリを減らす。代わりに層ごとの all-gather と reduce-scatter が入る
+- **テンソル並列**は層ごとに all-reduce が要るので一般にサーバーの中（NVLink）に留め、**パイプライン並列**は 1 対 1 の通信でサーバーをまたぐ
+- 並列の種類が分かれば、ジョブが基盤のどこに負荷をかけるかが分かる
+
+---
+
+<Quiz
+  id="q1"
+  question="DDP で学習しているジョブを 8 GPU から 16 GPU（2 ノード）に広げたところ、1 ステップの時間が大きく伸びました。最初に疑うべきことはどれですか。"
+  options={[
+    "DistributedSampler がデータを分けていないので、全プロセスが同じデータを読んでいる",
+    "ノード間の all-reduce が backward の計算より長くなり、はみ出した通信の時間を待っている",
+    "optimizer.step が 16 回実行されている",
+    "番号 0 のプロセスが毎ステップ全員に重みを配り直している"
+  ]}
+  answer={1}
+  explanation="DDP は勾配がそろったバケットから all-reduce を始め、通信を backward の計算と重ねる設計です。ノードをまたぐと all-reduce がネットワークを通るようになり、計算と重なりきらずにはみ出した通信は、そのまま待ち時間になります。重みを番号 0 から配るのは DDP の構築時の 1 回だけで、DDP の API リファレンスはパラメータを毎回配り直すことはないと書いています。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="1 台 8 GPU（NVLink 接続）のサーバーを 4 台使う学習で、テンソル並列を 32 GPU 全体にかける設定が提案されました。この設定の評価として正しいものはどれですか。"
+  options={[
+    "テンソル並列は通信が少ないので、GPU の数が多いほど効率が上がる",
+    "テンソル並列は層ごとに all-reduce が要るので、サーバー間のリンクを通すと遅くなる。サーバー内（NVLink の範囲）に収め、サーバーをまたぐ分はパイプライン並列やデータ並列にする",
+    "テンソル並列はデータを分ける方式なので、どこにかけても通信量は DDP と同じ",
+    "テンソル並列を使うと勾配の同期が不要になる"
+  ]}
+  answer={1}
+  explanation="Megatron-LM のテンソル並列は、1 つの層につき forward で 2 回、backward で 2 回の all-reduce を必要とします。Megatron-LM の 2021 年の論文（A100 世代の DGX で実験）は、この all-reduce はサーバーをまたぐと高くつきうるとし、g 枚の GPU を持つサーバーではテンソル並列を一般に g まで（サーバーの中）に留め、サーバー間はパイプライン並列、その外側はデータ並列という組み合わせを示しています。"
+/>
