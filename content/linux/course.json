@@ -5,5 +5,11 @@
   "order": 1,
   "accent": "linux",
   "level": "基礎 → 実務",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "プロセス・仮想メモリ・ファイルシステムが、カーネルの中でどう扱われているかを説明できる",
+    "strace・free・journalctl などの出力から、何が起きているかを読み取れる",
+    "systemd と namespace / cgroup が、サービスとコンテナをどう成り立たせているかを説明できる"
+  ],
+  "prerequisites": []
 }

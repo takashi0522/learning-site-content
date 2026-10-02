@@ -27,6 +27,10 @@ export default async function CoursePage({ params }: { params: Promise<{ course:
   if (!course) notFound();
 
   const lessons = getLessons(courseId);
+  const goals = course.goals ?? [];
+  const prerequisites = (course.prerequisites ?? [])
+    .map((id) => getCourse(id))
+    .filter((pre): pre is NonNullable<typeof pre> => pre !== null);
   const rows: LessonRow[] = lessons.map((lesson) => ({
     courseId: lesson.courseId,
     slug: lesson.slug,
@@ -56,6 +60,43 @@ export default async function CoursePage({ params }: { params: Promise<{ course:
         <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">{course.title}</h1>
         <p className="mt-3 leading-relaxed text-fg-muted">{course.description}</p>
       </header>
+
+      {(goals.length > 0 || prerequisites.length > 0) && (
+        <section className="grid gap-4 rounded-2xl border border-border bg-surface p-5 sm:grid-cols-[minmax(0,1fr)_14rem]">
+          {goals.length > 0 && (
+            <div>
+              <h2 className="mb-2 text-xs font-bold tracking-widest text-fg-subtle">このコースで学べること</h2>
+              <ul className="flex flex-col gap-1.5 text-sm leading-relaxed">
+                {goals.map((goal) => (
+                  <li key={goal} className="flex gap-2">
+                    <span className="text-accent" aria-hidden>
+                      →
+                    </span>
+                    {goal}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {prerequisites.length > 0 && (
+            <div>
+              <h2 className="mb-2 text-xs font-bold tracking-widest text-fg-subtle">先に読むと良いコース</h2>
+              <ul className="flex flex-col gap-1.5 text-sm">
+                {prerequisites.map((pre) => (
+                  <li key={pre.id} data-accent={pre.accent}>
+                    <Link href={`/courses/${pre.id}/`} className="font-bold text-accent hover:underline">
+                      {pre.title}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+              <Link href="/map/" className="mt-3 inline-block text-xs text-fg-subtle hover:text-fg">
+                全体の地図を見る →
+              </Link>
+            </div>
+          )}
+        </section>
+      )}
 
       <CourseProgressHeader
         lessonKeys={rows.map((row) => `${row.courseId}/${row.slug}`)}

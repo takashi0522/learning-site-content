@@ -5,5 +5,14 @@
   "order": 8,
   "accent": "gpunet",
   "level": "応用",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "AI のトラフィックが一般の業務通信と違う理由を説明できる",
+    "PFC・ECN / DCQCN・ECMP / 適応ルーティングが、それぞれ何を解いているかを説明できる",
+    "RoCE ファブリックの設計項目を、順番に決められる"
+  ],
+  "prerequisites": [
+    "network",
+    "ai"
+  ]
 }

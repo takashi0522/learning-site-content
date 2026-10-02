@@ -5,5 +5,11 @@
   "order": 3,
   "accent": "hardware",
   "level": "基礎 → 実務",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "メモリ階層・CPU・PCIe のレイテンシと帯域を、桁の感覚で見積もれる",
+    "SSD と RAID の書き込み特性から、ストレージの性能と耐障害性を判断できる",
+    "BMC と SEL を使って、ハードウェア障害の予兆を読み取れる"
+  ],
+  "prerequisites": []
 }

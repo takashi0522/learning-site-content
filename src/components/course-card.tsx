@@ -2,18 +2,25 @@
 
 import Link from "next/link";
 import type { Course } from "@/lib/content";
-import { useCourseProgress } from "@/lib/progress";
+import { useCourseProgress, useProgress } from "@/lib/progress";
 import { ProgressBar } from "./progress-bar";
 
-export type CourseSummary = {
-  course: Course;
-  /** このコースに属する全レッスンの lessonKey */
-  lessonKeys: string[];
+export type CourseCardLesson = {
+  /** lessonKey (`courseId/slug`)。既読の判定に使う */
+  key: string;
+  title: string;
   minutes: number;
 };
 
-export function CourseCard({ course, lessonKeys, minutes }: CourseSummary) {
-  const { done, total, hydrated } = useCourseProgress(lessonKeys);
+export type CourseSummary = {
+  course: Course;
+  lessons: CourseCardLesson[];
+  minutes: number;
+};
+
+export function CourseCard({ course, lessons, minutes }: CourseSummary) {
+  const { done, total, hydrated } = useCourseProgress(lessons.map((lesson) => lesson.key));
+  const { state } = useProgress();
   const draft = course.status === "draft";
 
   return (
@@ -63,6 +70,40 @@ export function CourseCard({ course, lessonKeys, minutes }: CourseSummary) {
       </dl>
 
       {total > 0 && <ProgressBar done={done} total={total} hydrated={hydrated} />}
+
+      {/*
+        カード全体が 1 つのリンク (before:absolute inset-0) なので、
+        一覧はその上 (z-10) に置いてクリックを受け取れるようにする
+      */}
+      {total > 0 && (
+        <details className="group/list relative z-10 -mx-2 text-sm">
+          <summary className="cursor-pointer list-none rounded-md px-2 py-1 font-mono text-[0.7rem] font-bold text-fg-subtle transition hover:text-fg">
+            <span className="inline-block transition group-open/list:rotate-90" aria-hidden>
+              ›
+            </span>{" "}
+            レッスン一覧
+          </summary>
+          <ol className="mt-1 flex flex-col">
+            {lessons.map((lesson, i) => {
+              const read = hydrated && Boolean(state.completed[lesson.key]);
+              return (
+                <li key={lesson.key}>
+                  <Link
+                    href={`/courses/${lesson.key}/`}
+                    className="flex items-baseline gap-2 rounded-md px-2 py-1 transition hover:bg-surface-2"
+                  >
+                    <span className="w-5 shrink-0 font-mono text-[0.7rem] text-fg-subtle">{i + 1}</span>
+                    <span className={`flex-1 ${read ? "text-fg-subtle" : "text-fg-muted"}`}>{lesson.title}</span>
+                    <span className="shrink-0 font-mono text-[0.65rem] text-fg-subtle">
+                      {read ? "読了" : `${lesson.minutes} 分`}
+                    </span>
+                  </Link>
+                </li>
+              );
+            })}
+          </ol>
+        </details>
+      )}
     </article>
   );
 }

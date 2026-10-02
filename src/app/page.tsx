@@ -56,7 +56,11 @@ export default function HomePage() {
               <CourseCard
                 key={course.id}
                 course={course}
-                lessonKeys={lessons.map((lesson) => `${course.id}/${lesson.slug}`)}
+                lessons={lessons.map((lesson) => ({
+                  key: `${course.id}/${lesson.slug}`,
+                  title: lesson.title,
+                  minutes: lesson.minutes,
+                }))}
                 minutes={lessons.reduce((sum, lesson) => sum + lesson.minutes, 0)}
               />
             );

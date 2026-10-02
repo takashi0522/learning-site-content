@@ -5,5 +5,14 @@
   "order": 10,
   "accent": "middleware",
   "level": "実務",
-  "status": "draft"
+  "status": "draft",
+  "goals": [
+    "Web サーバー・DB・キャッシュ・メッセージングを、プロセスモデルとリソースから説明できる",
+    "タイムアウト・接続数・メモリの設定値を、根拠を持って決められる",
+    "メトリクス・ログ・トレースで、症状ベースの監視を組み立てられる"
+  ],
+  "prerequisites": [
+    "linux",
+    "network"
+  ]
 }

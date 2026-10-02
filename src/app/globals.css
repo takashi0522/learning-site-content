@@ -575,6 +575,36 @@ body {
   background: rgb(0 0 0 / 0.7);
 }
 
+/*
+ * サイト内検索。.figure-dialog と同じ理由で margin: auto を明示する。
+ * 画面上寄せにしたいので、margin-top だけ固定値で上書きする。
+ */
+.search-dialog {
+  position: fixed;
+  inset: 0;
+  margin: 10vh auto auto;
+  width: min(42rem, 94%);
+  max-height: 76vh;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  background: var(--surface);
+  padding: 0;
+  color: var(--fg);
+}
+.search-dialog::backdrop {
+  background: rgb(0 0 0 / 0.55);
+}
+.search-dialog-inner {
+  display: flex;
+  max-height: 76vh;
+  flex-direction: column;
+}
+.search-dialog-results {
+  flex: 1;
+  overflow-y: auto;
+}
+
 .figure-dialog-inner {
   display: flex;
   max-height: inherit;

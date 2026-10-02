@@ -5,5 +5,15 @@
   "order": 9,
   "accent": "buildout",
   "level": "実務",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "NVIDIA のリファレンスアーキテクチャを読み、自分の構成に当てはめられる",
+    "ネットワーク・電力・冷却・ソフトウェアを、導入の順番に沿って決められる",
+    "受け入れ検証で「性能が出ている」ことを確かめ、運用に引き渡せる"
+  ],
+  "prerequisites": [
+    "ai",
+    "gpunet",
+    "facility"
+  ]
 }

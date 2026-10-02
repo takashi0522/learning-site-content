@@ -32,6 +32,10 @@ export type Course = {
     | "gpunet";
   level: string;
   status: CourseStatus;
+  /** コースページ冒頭の「このコースで学べること」。各レッスンの到達目標を 3〜4 項目にまとめたもの */
+  goals?: string[];
+  /** 先に読むと良いコースの id。コースページと /map/ の矢印に使う */
+  prerequisites?: string[];
 };
 
 export type VideoRef = {

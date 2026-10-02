@@ -1,8 +1,10 @@
 import Link from "next/link";
+import { SiteSearch } from "./site-search";
 import { ThemeToggle } from "./theme-toggle";
 
 const NAV = [
   { href: "/courses/", label: "コース" },
+  { href: "/map/", label: "地図" },
   { href: "/labs/", label: "ラボ" },
   { href: "/resources/", label: "一次情報" },
 ];
@@ -33,7 +35,8 @@ export function SiteHeader() {
           ))}
         </nav>
 
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          <SiteSearch />
           <ThemeToggle />
         </div>
       </div>

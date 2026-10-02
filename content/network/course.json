@@ -5,5 +5,13 @@
   "order": 5,
   "accent": "network",
   "level": "基礎 → 実務",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "パケットが NIC からアプリに届くまでの経路と、各段のカウンタを読める",
+    "L2・IP・TCP・DNS・TLS の各層で起きる典型的な障害を切り分けられる",
+    "ロードバランサやボンディングが、性能と送信元 IP にどう効くかを説明できる"
+  ],
+  "prerequisites": [
+    "linux"
+  ]
 }

@@ -5,5 +5,14 @@
   "order": 4,
   "accent": "gpu",
   "level": "基礎 → 実務",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "GPU の構造とドライバ / CUDA の階層を説明し、バージョンの組み合わせを判断できる",
+    "Xid エラーや性能指標から、GPU サーバーの障害と性能のボトルネックを切り分けられる",
+    "マルチ GPU 通信と推論サービングの仕組みを、律速要因から説明できる"
+  ],
+  "prerequisites": [
+    "hardware",
+    "linux"
+  ]
 }

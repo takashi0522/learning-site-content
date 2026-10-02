@@ -5,5 +5,13 @@
   "order": 6,
   "accent": "facility",
   "level": "基礎 → 実務",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "電力・冷却（空冷 / 液冷）の容量から、ラックに載せられる台数を見積もれる",
+    "Ethernet の規格名とレーン構成から、光モジュール・ケーブル・ブレイクアウトを選べる",
+    "配線とエアフローの設計が、性能と保守性にどう効くかを説明できる"
+  ],
+  "prerequisites": [
+    "hardware"
+  ]
 }

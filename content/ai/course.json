@@ -5,5 +5,14 @@
   "order": 7,
   "accent": "ai",
   "level": "実務",
-  "status": "ready"
+  "status": "ready",
+  "goals": [
+    "学習と推論で、GPU 基盤への要求がどう違うかを説明できる",
+    "InfiniBand・NCCL・ストレージのどこが分散学習のボトルネックになるかを切り分けられる",
+    "Kubernetes や Slurm で、GPU ジョブを動かす仕組みを説明できる"
+  ],
+  "prerequisites": [
+    "gpu",
+    "network"
+  ]
 }
