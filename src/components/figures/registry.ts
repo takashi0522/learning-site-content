@@ -28,6 +28,7 @@ import { CudaStack, GpuContainerStack, GpuInterconnectPaths } from "./gpu";
 import { DcqcnLoop, EcmpVsAdaptive, PfcPause } from "./gpunet";
 import { NumaTopology, PcieNuma, PowerLossProtection } from "./hardware";
 import { ContainerParts, DemandPaging, FdToInode, SyscallBoundary } from "./linux";
+import { ModelStateBytes, TrainingLoop, TwoCheckpoints } from "./mlwork";
 import { LvmStack } from "./ops";
 import { RxPacketPath, TcpQueues, TcpTeardown, TlsHandshakeRtt } from "./network";
 import {
@@ -68,6 +69,9 @@ export const FIGURES = {
   "k8s-device-plugin": K8sDevicePlugin,
   "ai-stack-layers": AiStackLayers,
   "storage-access-models": StorageAccessModels,
+  "training-loop": TrainingLoop,
+  "model-state-bytes": ModelStateBytes,
+  "two-checkpoints": TwoCheckpoints,
   "nfs-vs-parallel-fs": NfsVsParallelFs,
   "training-step": TrainingStep,
   "ib-credit-flow": IbCreditFlow,

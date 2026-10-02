@@ -36,6 +36,7 @@ COURSES = {
     "buildout": "scaffolding frame, stacked platforms, blueprint planes",
     "middleware": "interlocking pipes, tubes, conduits, layered connections",
     "auth": "interlocking rings, concentric circles, geometric lock shape",
+    "mlwork": "repeating loop of curved arrows, spiral iterations, rising steps",
 }
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_raw", "course")

@@ -122,6 +122,10 @@
   --accent: oklch(53% 0.17 35);
   --accent-soft: oklch(94% 0.05 35);
 }
+[data-accent="mlwork"] {
+  --accent: oklch(55% 0.14 60);
+  --accent-soft: oklch(94% 0.05 60);
+}
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) [data-accent="linux"] {
@@ -179,6 +183,11 @@
     --accent-soft: oklch(30% 0.05 35);
     --accent-fg: oklch(17% 0.02 265);
   }
+  :root:not([data-theme="light"]) [data-accent="mlwork"] {
+    --accent: oklch(80% 0.13 60);
+    --accent-soft: oklch(30% 0.05 60);
+    --accent-fg: oklch(17% 0.02 265);
+  }
 }
 
 :root[data-theme="dark"] [data-accent="linux"] {
@@ -234,6 +243,11 @@
 :root[data-theme="dark"] [data-accent="gpunet"] {
   --accent: oklch(77% 0.14 35);
   --accent-soft: oklch(30% 0.05 35);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="mlwork"] {
+  --accent: oklch(80% 0.13 60);
+  --accent-soft: oklch(30% 0.05 60);
   --accent-fg: oklch(17% 0.02 265);
 }
 

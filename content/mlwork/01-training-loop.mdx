@@ -1,0 +1,210 @@
+---
+title: 学習ループの中で起きていること
+description: 学習は「予測して、外れ具合を測り、重みを少し直す」の繰り返しです。その 1 周で GPU のメモリに何が載り、何が消えるのかを、基盤から見える現象と結びつけて整理します。
+order: 1
+minutes: 20
+tags: ["training", "forward", "backward", "optimizer", "mixed-precision", "MFU"]
+objectives:
+  - 学習の 1 ステップ（forward・backward・optimizer.step）で何が計算されるかを説明できる
+  - 重み・勾配・オプティマイザの状態・活性化が、それぞれなぜメモリに必要かを説明できる
+  - 混合精度と activation checkpointing が、何を何と引き換えにしているかを説明できる
+references:
+  - label: "PyTorch Tutorials — Optimizing Model Parameters（学習ループ）"
+    url: "https://docs.pytorch.org/tutorials/beginner/basics/optimization_tutorial.html"
+  - label: "PyTorch — Autograd mechanics（Saved tensors）"
+    url: "https://docs.pytorch.org/docs/stable/notes/autograd.html"
+  - label: "PyTorch — torch.optim.Adam"
+    url: "https://docs.pytorch.org/docs/stable/generated/torch.optim.Adam.html"
+  - label: "Kingma and Ba, Adam: A Method for Stochastic Optimization（2014）"
+    url: "https://arxiv.org/abs/1412.6980"
+  - label: "PyTorch — Automatic Mixed Precision package（Gradient Scaling）"
+    url: "https://docs.pytorch.org/docs/stable/amp.html"
+  - label: "PyTorch — Automatic Mixed Precision examples"
+    url: "https://docs.pytorch.org/docs/stable/notes/amp_examples.html"
+  - label: "PyTorch — torch.utils.checkpoint（activation checkpointing）"
+    url: "https://docs.pytorch.org/docs/stable/checkpoint.html"
+  - label: "Rajbhandari et al., ZeRO: Memory Optimizations Toward Training Trillion Parameter Models（3.1 節）"
+    url: "https://arxiv.org/abs/1910.02054"
+  - label: "Micikevicius et al., Mixed Precision Training（ICLR 2018）"
+    url: "https://arxiv.org/abs/1710.03740"
+  - label: "Chen et al., Training Deep Nets with Sublinear Memory Cost（2016）"
+    url: "https://arxiv.org/abs/1604.06174"
+  - label: "Chowdhery et al., PaLM: Scaling Language Modeling with Pathways（MFU の定義）"
+    url: "https://arxiv.org/abs/2204.02311"
+---
+
+## 学習は「予測 → 測る → 直す」の繰り返し
+
+基盤の側からは、学習ジョブは「GPU を何日も使い続けるプロセス」に見えます。その中で起きていることは、短い周期の繰り返しです。
+
+PyTorch のチュートリアルは、学習を次のように説明しています。各回で、モデルが出力を予測し、外れ具合（**loss**）を計算し、パラメータ（**重み**）ごとの微分（**勾配**）を集め、その勾配で重みを直す。この 1 周が **1 ステップ**です。
+
+<Figure name="training-loop" caption="1 ステップの 4 段。計算の順番とメモリの出入りが、同じ周期で回っている" />
+
+| 用語 | 意味（PyTorch チュートリアルの定義） |
+| --- | --- |
+| **バッチサイズ** | 重みを 1 回更新するまでに、モデルに通すデータの数 |
+| **エポック** | データセット全体を 1 回なめること |
+| **学習率** | 1 回の更新で重みをどれだけ動かすか。小さいと学習が遅く、大きいと不安定になる |
+
+これらは**ハイパーパラメータ**と呼ばれ、学習を始める前に人が決める値です。
+
+---
+
+<h2 className="slide-cont">学習は「予測 → 測る → 直す」の繰り返し（続き）</h2>
+
+### コードでは 4 行
+
+PyTorch で書くと、1 ステップの中心はこれだけです（チュートリアルのループを短くしたもの）。
+
+```python
+pred = model(X)              # forward: 予測する
+loss = loss_fn(pred, y)      # 外れ具合を測る
+loss.backward()              # backward: 勾配を計算する
+optimizer.step()             # 勾配で重みを直す
+optimizer.zero_grad()        # 勾配を 0 に戻す
+```
+
+最後の `zero_grad()` には理由があります。チュートリアルによると、PyTorch の勾配は**既定で足し込まれていく**ので、ステップごとに明示的に 0 に戻さないと二重に数えてしまいます。
+
+基盤の側から見ると、このループは**データローダが次のバッチを用意できる限り、止まらずに回り続けます**。AI 基盤コース レッスン 1 で見た「GPU が待たされる時間」は、このループの ① の段（バッチを読む）が遅れている状態です。
+
+---
+
+## 1 ステップで GPU の上に何が載るか
+
+学習中の GPU メモリには、性質の違う 4 種類のものが載っています。
+
+| 中身 | いつできるか | なぜ要るか |
+| --- | --- | --- |
+| **重み** | 学習の最初から最後まで | モデルそのもの |
+| **活性化**（中間結果） | forward の途中 | backward で勾配を計算するときに使う |
+| **勾配** | backward | 重みをどちらにどれだけ動かすかを示す |
+| **オプティマイザの状態** | 学習の間ずっと持ち続ける | 過去の勾配の情報を持ち越すため |
+
+**活性化**は、forward の計算で作られた中間結果です。PyTorch の autograd は、backward で勾配を計算するために一部の中間結果を保存しておきます（たとえば `x²` の勾配を求めるには `x` が要る）。保存した値は、backward が終わると解放されます。
+
+**オプティマイザの状態**は、更新の方法によって量が変わります。広く使われる Adam は、パラメータごとに**勾配の移動平均（1 次モーメント `m`）**と**勾配の 2 乗の移動平均（2 次モーメント `v`）**を持ち続けます。
+
+---
+
+<h2 className="slide-cont">1 ステップで GPU の上に何が載るか（続き）</h2>
+
+### 重みの 8 倍のメモリが要る
+
+ZeRO の論文は、混合精度（次の節）で Adam を使う場合の内訳を、パラメータ 1 個あたり次のように示しています。
+
+<Figure name="model-state-bytes" caption="forward と backward が触るのは 4 バイトだけ。残りの 12 バイトは重みを更新するためにある" source="Rajbhandari et al., ZeRO（3.1 節）" />
+
+FP16 の重み（2 バイト）に対して、合計 16 バイトです。ZeRO の論文の例では、15 億パラメータの GPT-2 で、FP16 の重みは 3 GB なのに、学習には少なくとも 24 GB が要ります。**重みが載る GPU でも、学習の状態までは載らないことがある**のはこのためです。AI 基盤コース レッスン 1 の VRAM の見積もりは、この内訳を使っています。
+
+さらに、ここには**活性化が含まれていません**。活性化は 1 回に流すデータが多いほど増えるので、バッチサイズを上げると、ある所で GPU のメモリが足りなくなります。
+
+---
+
+## 混合精度: 速く計算し、精度は控えで守る
+
+**混合精度学習**は、計算の大部分を半精度で行い、精度が要る部分だけを単精度（FP32）で持つ方法です。ZeRO の論文は、パラメータと活性化を FP16 で持つことで、NVIDIA GPU の高スループットな Tensor コアを使えると説明しています。PyTorch の自動混合精度（AMP）は、半精度の型として FP16 と BF16 のどちらも使えます。
+
+Micikevicius らの論文（ICLR 2018）は、**FP16 で**学習しても精度を落とさないための工夫を挙げています。
+
+- **重みの FP32 の控え**を持ち、更新はそちらに積み上げる（forward と backward には FP16 に丸めたものを使う）
+- **loss のスケーリング**で、小さな勾配が 0 に潰れないようにする
+
+### loss のスケーリング
+
+PyTorch のドキュメントによると、FP16 では小さすぎる勾配の値が表せずに **0 に潰れ（アンダーフロー）**、その重みの更新が失われます。そこで loss に倍率を掛けてから backward し、勾配を大きくしたうえで、更新の前に元の大きさに戻します。
+
+PyTorch の `GradScaler` は、戻した勾配に無限大や NaN が含まれていると、**そのステップの `optimizer.step()` を飛ばします**。PyTorch のドキュメントは、FP16 でのこの一式（autocast と GradScaler）を「自動混合精度学習」の通常の使い方として示しています。
+
+---
+
+## activation checkpointing: 計算でメモリを買う
+
+活性化を全部取っておく代わりに、**一部を捨てて、backward のときに計算し直す**方法があります。これが **activation checkpointing** です。
+
+PyTorch のドキュメントは、これを「計算をメモリと引き換えにする手法」と説明しています。指定した部分の forward では中間結果を保存せず、backward でその部分の forward をもう一度実行して取り戻します。Chen らの論文（2016）は、層の数 n に対してメモリを O(√n) に抑え、その代わりにミニバッチごとに forward を 1 回余分に行う方法を示しています。
+
+つまり、有効にすると**メモリが減り、1 ステップの計算時間が増えます**。
+
+<Figure name="two-checkpoints" caption="同じ「checkpoint」でも、片方は GPU メモリの節約、もう片方は途中からの再開のための保存" />
+
+---
+
+## 速さを何で測るか
+
+利用者が学習の速さを語るときは、**1 秒あたりのステップ数**や、言語モデルなら **1 秒あたりに処理したトークン数**を使います。
+
+ただ、これだけでは「GPU をどれだけ使い切れているか」は分かりません。そこで PaLM の論文は **MFU（Model FLOPs Utilization）**という指標を提案しました。
+
+```text
+MFU = 観測したスループット（トークン/秒）
+      ÷ その GPU（チップ）がピーク性能で計算し続けた場合の理論上のスループット
+```
+
+PaLM の論文は、TPU v4 6,144 チップで PaLM 540B を学習したときの MFU を **46.2%** と報告しています。理論上の上限に対する割合なので、100% にはなりません。
+
+PaLM の論文は、MFU とは別に、実際に実行した演算で数える **hardware FLOPs utilization** も挙げています（同じ学習で 57.8%）。後者は activation checkpointing のような**再計算の分も数えてしまう**ので、実装によって値が変わる、というのが MFU を提案した理由です。
+
+<Callout type="field" title="基盤の指標と、利用者の指標をつなぐ">
+
+GPU コース レッスン 4 で見たとおり、`nvidia-smi` の GPU 使用率は「何かのカーネルが動いていた時間の割合」で、演算器が働いている度合いではありません。利用者が「MFU が低い」と言ったら、**GPU 使用率ではなく、SM や Tensor コアの稼働率**の側で突き合わせます。
+
+</Callout>
+
+---
+
+## 基盤から見ると、どこで何が起きているか
+
+このループの各段は、基盤の側では次のように見えます。
+
+| ループの段 | 基盤から見える現象 | 扱っているところ |
+| --- | --- | --- |
+| ① バッチを読む | ストレージの読み出し、CPU の前処理 | AI 基盤コース レッスン 4 |
+| ② forward / ③ backward | GPU の演算（Tensor コアの稼働） | GPU コース レッスン 4 |
+| ③ のあと（複数 GPU のとき） | 勾配を GPU 間で揃える通信 | レッスン 2 |
+| ④ optimizer.step | 重みとオプティマイザの状態の更新 | このレッスン |
+| 一定の間隔で | 学習の状態をファイルに書き出す | レッスン 3 |
+
+1 枚の GPU で学習しているうちは、③ のあとの通信はありません。GPU を増やしたときに何が加わるかが、次のレッスンの主題です。
+
+---
+
+## まとめ
+
+- 学習は「**forward で予測 → loss を計算 → backward で勾配 → optimizer.step で重みを直す**」の繰り返し。1 周が 1 ステップ
+- 勾配は既定で足し込まれるので、ステップごとに `zero_grad()` で 0 に戻す
+- GPU のメモリには**重み・活性化・勾配・オプティマイザの状態**が載る。混合精度の Adam では、活性化を除いてパラメータ 1 個あたり **16 バイト**（ZeRO）
+- **混合精度**は半精度（FP16 / BF16）で速く計算する。FP16 では FP32 の控えと loss のスケーリングで精度を守る
+- **activation checkpointing** はメモリを減らす代わりに計算を増やす。チェックポイントの保存とは別物
+- 速さはステップ / 秒やトークン / 秒で語られる。GPU を使い切れているかは **MFU** で見る（再計算の分は数えない）
+
+---
+
+<Quiz
+  id="q1"
+  question="学習スクリプトから optimizer.zero_grad() の呼び出しが抜けていました。何が起きますか。"
+  options={[
+    "勾配が計算されなくなり、重みが更新されない",
+    "PyTorch の勾配は既定で足し込まれるので、前のステップの勾配が残ったまま加算され、意図より大きな更新がかかる",
+    "GPU のメモリが毎ステップ増え続け、すぐにメモリ不足で止まる",
+    "影響はない。zero_grad は速度のための最適化にすぎない"
+  ]}
+  answer={1}
+  explanation="PyTorch のチュートリアルにあるとおり、勾配は既定で足し込まれていきます。zero_grad で毎ステップ 0 に戻さないと、前のステップまでの勾配に今回の勾配が加算され、二重に数えた値で重みが更新されます。勾配のテンソル自体は同じ場所に足し込まれるので、メモリが増え続けるわけではありません。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="利用者から「activation checkpointing を有効にしたら、GPU メモリの使用量は減ったが、1 ステップが遅くなった」と相談されました。正しい説明はどれですか。"
+  options={[
+    "チェックポイントをストレージに書き出すようになったので、書き込み待ちで遅くなっている",
+    "中間結果の一部を保存せず、backward のときに forward を再実行して取り戻しているので、メモリが減る代わりに計算が増えている",
+    "混合精度が無効になり、FP32 で計算するようになった",
+    "勾配の同期が増えて、GPU 間の通信が遅くなっている"
+  ]}
+  answer={1}
+  explanation="activation checkpointing は、PyTorch のドキュメントが言うとおり「計算をメモリと引き換えにする」手法です。指定した部分の中間結果を保存しない代わりに、backward でその部分の forward をもう一度実行します。ストレージへの書き出しを伴う「チェックポイントの保存」とは名前が同じだけの別物で、ファイルは何も書きません。"
+/>
