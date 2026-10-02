@@ -395,3 +395,138 @@ export function LoraAdapter() {
     </svg>
   );
 }
+
+/**
+ * 文章の生成は 1 トークンずつのループ。出したトークンを入力の後ろに足して、
+ * 終わりの記号か上限の長さに達するまで繰り返す。
+ */
+export function GenerationLoop() {
+  return (
+    <svg viewBox="0 0 800 250" role="img" aria-label="文章の生成は 1 トークンずつのループ">
+      <Box x={16} y={70} w={120} h={56} label="入力の文章" sub="プロンプト" size={13} />
+      <Arrow from={[136, 98]} to={[170, 98]} color={C.subtle} />
+      <Box x={172} y={70} w={120} h={56} label="トークナイザ" sub="文章 → ID の列" size={13} />
+      <Arrow from={[292, 98]} to={[326, 98]} color={C.subtle} />
+      <Box x={328} y={62} w={150} h={72} label="モデル" sub="次の 1 トークンを予測" size={14} tone="accent" />
+      <Arrow from={[478, 98]} to={[512, 98]} color={C.subtle} />
+      <Box x={514} y={70} w={120} h={56} label="次のトークン" sub="選び方は設定で決まる" size={13} tone="accent" />
+      <Elbow
+        points={[
+          [574, 126],
+          [574, 168],
+          [403, 168],
+          [403, 136],
+        ]}
+        color={C.accent}
+        width={2}
+      />
+      <T x={488} y={188} size={12} fill={C.accent} weight={600} anchor="middle">
+        入力の後ろに足して、もう一度
+      </T>
+      <Arrow from={[634, 98]} to={[668, 98]} color={C.subtle} dashed />
+      <Box x={670} y={70} w={114} h={56} label="文章に戻す" sub="終わったら" size={13} />
+      <T x={727} y={150} size={12} anchor="middle">
+        終わりの記号（EOS）か
+      </T>
+      <T x={727} y={168} size={12} anchor="middle">
+        上限の長さで止まる
+      </T>
+      <T x={400} y={232} size={12} fill={C.subtle} anchor="middle">
+        出力が長いほど、このループの回数（＝GPU でモデルを通す回数）が増える
+      </T>
+    </svg>
+  );
+}
+
+/**
+ * vLLM の構成。クライアントは OpenAI 互換の HTTP API を叩き、
+ * サーバーは GPU メモリの決めた割合の中に、重みと KV キャッシュを置く。
+ */
+export function VllmServing() {
+  const x0 = 470;
+  const w = 300;
+  return (
+    <svg viewBox="0 0 800 280" role="img" aria-label="vLLM の構成と GPU メモリの使い方">
+      <Box x={16} y={40} w={150} h={64} label="アプリ" sub="curl / OpenAI SDK" size={13} />
+      <Arrow from={[166, 72]} to={[222, 72]} color={C.subtle} bidi />
+      <T x={194} y={58} size={12} anchor="middle">
+        HTTP
+      </T>
+      <Box x={224} y={24} w={200} h={96} tone="accent" />
+      <T x={324} y={46} size={14} fill={C.fg} weight={700} anchor="middle" middle>
+        vllm serve
+      </T>
+      <T x={324} y={70} size={12} anchor="middle" middle>
+        :8000 で OpenAI 互換の API
+      </T>
+      <T x={324} y={92} size={12} anchor="middle" middle>
+        リクエストをまとめて GPU へ
+      </T>
+      <Arrow from={[424, 72]} to={[466, 72]} color={C.subtle} />
+
+      <T x={x0} y={16} size={13} fill={C.fg} weight={700}>
+        GPU メモリ
+      </T>
+      <rect x={x0} y={28} width={w} height={88} rx={6} fill="none" stroke={C.border} strokeWidth={1.5} />
+      <rect x={x0} y={28} width={w * 0.92} height={88} rx={6} fill={C.accentSoft} stroke={C.accent} strokeWidth={1.5} strokeDasharray="5 4" />
+      <Box x={x0 + 8} y={40} w={150} h={64} label="重み" sub="変わらない" size={13} />
+      <Box x={x0 + 166} y={40} w={102} h={64} label="KV キャッシュ" sub="この枠の残り" size={12} tone="accent" />
+      <T x={x0 + w * 0.92} y={134} size={12} fill={C.accent} weight={600} anchor="end">
+        gpu-memory-utilization（既定 0.92）の線 ↑
+      </T>
+
+      <T x={24} y={176} size={12} fill={C.fg} weight={600}>
+        PagedAttention の論文の例（13B のモデルを A100 40GB で動かした場合）
+      </T>
+      <rect x={24} y={190} width={752 * 0.65} height={30} rx={4} fill={C.surface2} stroke={C.border} />
+      <T x={24 + (752 * 0.65) / 2} y={205} size={12} fill={C.fg} anchor="middle" middle>
+        重み 約 65%
+      </T>
+      <rect x={24 + 752 * 0.65} y={190} width={752 * 0.3} height={30} rx={4} fill={C.accentSoft} stroke={C.accent} />
+      <T x={24 + 752 * 0.65 + (752 * 0.3) / 2} y={205} size={12} fill={C.fg} anchor="middle" middle>
+        KV キャッシュ 約 30%
+      </T>
+      <T x={24} y={246} size={12}>
+        重みはサービング中ずっと同じだが、KV キャッシュはリクエストごとに伸び縮みする
+      </T>
+    </svg>
+  );
+}
+
+/**
+ * 学習から推論への受け渡し。どの段で何が生まれ、どこに置かれるかを並べる。
+ * 上の段が「もの」、下の段が「置き場所」。
+ */
+export function HandoverPipeline() {
+  const stage = (x: number, n: number, label: string, sub: string, place: string, tone: "plain" | "accent") => (
+    <g>
+      <Step x={x + 10} y={30} n={n} />
+      <Box x={x} y={42} w={170} h={64} label={label} sub={sub} size={13} tone={tone} />
+      <T x={x + 85} y={130} size={12} anchor="middle">
+        {place}
+      </T>
+    </g>
+  );
+  return (
+    <svg viewBox="0 0 800 250" role="img" aria-label="学習のチェックポイントが推論サーバーに届くまで">
+      {stage(16, 1, "再開用チェックポイント", "重み＋状態（DCP など）", "学習用の共有ストレージ", "plain")}
+      {stage(214, 2, "配布用の重み", "safetensors＋インデックス", "変換して書き出す", "accent")}
+      {stage(412, 3, "マージ・量子化", "必要なときだけ", "LoRA なら元のモデルも", "plain")}
+      {stage(610, 4, "推論サーバー", "vLLM などが読み込む", "モデルの置き場から読む", "accent")}
+      <Arrow from={[186, 74]} to={[212, 74]} color={C.subtle} />
+      <Arrow from={[384, 74]} to={[410, 74]} color={C.subtle} />
+      <Arrow from={[582, 74]} to={[608, 74]} color={C.subtle} />
+
+      <line x1={16} y1={154} x2={784} y2={154} stroke={C.border} strokeWidth={1} />
+      <T x={24} y={180} size={12} fill={C.fg} weight={600}>
+        ① は学習を続けるためのもので、大きく、オプティマイザの状態を含む
+      </T>
+      <T x={24} y={202} size={12} fill={C.fg} weight={600}>
+        ② 以降は推論のためのもので、重みだけ。② を作った時点で ① は消してよいかを決められる
+      </T>
+      <T x={24} y={224} size={12}>
+        どの段のファイルがどのストレージにあり、誰が消すのかを決めておくと、容量の見積もりが立つ
+      </T>
+    </svg>
+  );
+}

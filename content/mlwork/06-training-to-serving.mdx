@@ -1,0 +1,194 @@
+---
+title: 学習から推論への受け渡し
+description: 学習の成果物は、そのままでは推論サーバーに載りません。再開用のチェックポイントから配布用の重みを作り、必要ならマージや量子化をして、推論サーバーが読める形にするまでの流れを、どのファイルがどこに置かれるかとあわせて整理します。
+order: 6
+minutes: 18
+tags: ["safetensors", "sharding", "LoRA", "merge", "quantization", "vLLM"]
+objectives:
+  - 学習用のチェックポイントと配布用の重みの違いを、中身と置き場所で説明できる
+  - 分割された重みのファイル群（シャードとインデックス）が何を表しているかを説明できる
+  - LoRA のアダプタを推論に使う 2 つの方法と、それぞれで基盤に必要なものを説明できる
+references:
+  - label: "Rajbhandari et al., ZeRO（学習 16 バイト / パラメータ、FP16 の重みだけなら 1.5B で 3 GB）"
+    url: "https://arxiv.org/abs/1910.02054"
+  - label: "PyTorch — Distributed Checkpoint（format_utils の dcp_to_torch_save）"
+    url: "https://docs.pytorch.org/docs/stable/distributed.checkpoint.html"
+  - label: "Hugging Face Transformers — Loading models（Sharded checkpoints）"
+    url: "https://huggingface.co/docs/transformers/main/en/models"
+  - label: "Hugging Face PEFT — PEFT checkpoint format（adapter_model・adapter_config・merge）"
+    url: "https://huggingface.co/docs/peft/developer_guides/checkpoint"
+  - label: "vLLM — LoRA Adapters（--enable-lora / --lora-modules）"
+    url: "https://docs.vllm.ai/en/latest/features/lora.html"
+  - label: "vLLM — Quantization（対応している形式）"
+    url: "https://docs.vllm.ai/en/latest/features/quantization/index.html"
+  - label: "vLLM — Online Quantization"
+    url: "https://docs.vllm.ai/en/latest/features/quantization/online.html"
+  - label: "vLLM — Parallelism and Scaling"
+    url: "https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html"
+---
+
+## 学習の成果物は、そのままでは推論に載らない
+
+レッスン 3 で見たとおり、学習中に保存するのは**再開用のチェックポイント**です。重みのほかにオプティマイザの状態などを含み、分散学習なら DCP のように**ランクごとに分かれたファイル**になっています。
+
+推論サーバーが必要とするのは、**重みだけ**です。そこで、学習が終わったら（あるいは区切りの良いところで）、再開用のチェックポイントから**配布用の重み**を作ります。
+
+<Figure name="handover-pipeline" caption="学習用の成果物から、推論サーバーが読む重みを作る" />
+
+基盤の側から見ると、この流れは「**どの段のファイルが、どのストレージに、どれだけの大きさで置かれ、いつ消されるか**」の話です。学習用の共有ストレージ（AI 基盤コース レッスン 7）と、推論サーバーがモデルを読む場所が別なら、その間の転送も発生します。
+
+---
+
+## ① → ②: 再開用から配布用へ
+
+分散学習の DCP 形式のチェックポイントは、`torch.save` の形式とは違います。PyTorch のドキュメントは、`torch.save` 形式でモデルをやり取りしたい人向けに、オフラインで形式を変換する関数を用意していると書いています。PyTorch は、DCP 形式を `torch.save` 形式に変換する関数（`dcp_to_torch_save`）を用意しています。レッスン 3 で見たとおりです。
+
+たとえば Hugging Face の形式で書き出す場合、Transformers のドキュメントは次のように説明しています。
+
+- `from_pretrained` は、**safetensors** のファイルがあればそれを読む。pickle を使う従来の形式より安全で、読み込みも速い。ドキュメントの `save_pretrained` の例でも、出力は safetensors のファイルになっている
+- `save_pretrained` は（main ブランチのドキュメント、2026 年 10 月時点）、**50 GB を超える**チェックポイントは、自動で複数のファイル（**シャード**）に分割する。上限は `max_shard_size` で変えられる
+- どのパラメータがどのシャードに入っているかを示す**インデックスのファイル**も作る
+
+```text
+# 6 つのシャードに分かれたモデルの例（ドキュメントの例を元にしたファイル名）
+model-00001-of-00006.safetensors
+model-00002-of-00006.safetensors
+...
+model-00006-of-00006.safetensors
+model.safetensors.index.json      ← パラメータ名 → シャードのファイル名の対応
+```
+
+インデックスの `weight_map` は、たとえば `model.embed_tokens.weight` が `model-00001-of-00006.safetensors` にある、という対応を持っています。ドキュメントによると、パラメータは並列に読み込まれ、読み込み時のピークのメモリはモデルの大きさだけで決まります。
+
+<Callout type="pitfall" title="シャードは組で扱う">
+
+配布用の重みは**複数のファイルの組**です。インデックスは、各パラメータがどのシャードにあるかを指しています（ドキュメントの例では `lm_head.weight` が `model-00006-of-00006.safetensors` にある）。どれか 1 つのシャードが欠ければ、インデックスが指す先のファイルがそろいません。
+
+モデルを置き場所へ移すときは、**ディレクトリごと**扱い、ファイル数とサイズを確かめます。
+
+</Callout>
+
+---
+
+## LoRA の成果物を推論に使う 2 つの方法
+
+レッスン 4 の LoRA でファインチューニングした場合、成果物は**アダプタ**です。PEFT のドキュメントによると、アダプタは主に次の 2 つのファイルで保存されます。
+
+| ファイル | 中身 |
+| --- | --- |
+| `adapter_model.safetensors` | アダプタの重みだけ。**元のモデルの重みは含まない** |
+| `adapter_config.json` | アダプタの設定。元のモデルが Transformers の事前学習済みモデルなら、**元のモデルの名前**（`base_model_name_or_path`）が入る |
+
+PEFT のドキュメントは大きさの違いの例として（bert-base-uncased と IA³ アダプタの組み合わせ）、通常の BERT のモデルが約 420 MB なのに対し、その上の IA³ アダプタ（LoRA と同じ PEFT の一種）は約 260 KB だと書いています。
+
+推論に使うには、2 つの方法があります。
+
+---
+
+<h2 className="slide-cont">LoRA の成果物を推論に使う 2 つの方法（続き）</h2>
+
+**(a) マージして 1 つのモデルにする**
+
+PEFT の `merge_and_unload()` を呼ぶと、アダプタの重みを元の重みに足し込んだ、**普通のモデル**になります。PEFT のドキュメントによると、マージしたあとは PEFT 固有の機能が使えず、**マージを戻すことも、複数のアダプタを同時に読むこともできません**。推論サーバーには、通常のモデルとして配ります。
+
+**(b) 元のモデルの上にアダプタを載せて配信する**
+
+vLLM は、元のモデルを読み込んだうえで、**アダプタをリクエストごとに切り替えて**配信できます。ドキュメントによると、アダプタは少ないオーバーヘッドでリクエスト単位に使い分けられます。
+
+```bash
+vllm serve meta-llama/Llama-3.2-3B-Instruct \
+    --enable-lora \
+    --lora-modules sql-lora=jeeejeee/llama32-3b-text2sql-spider
+```
+
+クライアントは、モデル名として `sql-lora` のようなアダプタの名前を指定します（vLLM のドキュメントの例）。
+
+| | (a) マージ | (b) 元のモデル＋アダプタ |
+| --- | --- | --- |
+| 推論サーバーに置くもの | マージしたモデル 1 つ | 元のモデル＋アダプタ（複数可） |
+| 用途ごとに | モデルを丸ごと用意する | アダプタだけを足す |
+| 基盤から見ると | モデルの数だけ大きなファイル | 大きなファイルは 1 つ、小さなファイルが複数 |
+
+---
+
+## ③ 量子化して軽くする
+
+推論では、重みの精度を落として**メモリを減らす**こともよく行われます。vLLM のドキュメントは、量子化を「モデルの精度と引き換えに、メモリの使用量を減らすもの」と説明し、対応している形式として AutoAWQ、BitsAndBytes、GPTQModel、LLM Compressor（FP8、INT8、INT4 など）、NVIDIA Model Optimizer などを挙げています。
+
+量子化の効果は、AI 基盤コース レッスン 1 の推論の VRAM の見積もりで見たとおり、重み 1 個あたりのバイト数の違いとして効きます。必要な GPU の数が変わるので、**推論サーバーの台数の見積もりは、どの形式で配るかが決まってから**行います。
+
+量子化には、事前に量子化したモデルを作って配る形式のほかに、vLLM の **Online Quantization** のように、BF16 / FP16 のモデルを**読み込むときに**量子化する方式もあります。vLLM のドキュメントによると、この方式は事前に量子化したチェックポイントを必要としません。事前に量子化する場合は、配布用の重みが「元の精度のもの」と「量子化したもの」の 2 系統に増えるので、置き場所の見積もりに入れておきます。
+
+---
+
+## ④ 推論サーバーに載せる
+
+最後に、推論サーバーが配布用の重みを読み込みます。何枚の GPU に載せるかは、レッスン 5 で見た vLLM の指針で決まります。
+
+| モデルの大きさ | 推論で使う GPU |
+| --- | --- |
+| 1 枚に載る | 1 枚 |
+| 1 枚には載らないが 1 ノードに載る | テンソル並列でノード内の複数枚 |
+| 1 ノードにも載らない | テンソル並列＋パイプライン並列で複数ノード |
+
+学習に多くの GPU を使ったモデルでも、推論は重みと KV キャッシュが載れば動きます。レッスン 1 で見たとおり、学習にはパラメータ 1 個あたり 16 バイト（混合精度の Adam）が要るのに対し、FP16 の重みだけなら 2 バイトです（ZeRO の論文の例では、15 億パラメータの FP16 の重みが 3 GB）。**学習用の GPU の構成と、推論用の GPU の構成は、別々に見積もる**必要があります。
+
+---
+
+## 受け渡しの前に決めておくこと
+
+ここまでの流れを、基盤の側で決めておくべきことにまとめます。
+
+```text
+□ 再開用チェックポイント : どこに置くか / いくつ残すか / いつ消すか
+□ 配布用の重み         : 誰がいつ作るか / safetensors で書き出すか
+□ モデルの置き場所       : 推論サーバーから読める場所か / 転送の経路と時間
+□ LoRA                   : マージして配るか / 元のモデル＋アダプタで配るか
+□ 量子化                 : どの形式で配るか（GPU の台数が変わる）
+□ 推論の構成             : 何枚の GPU に、どの並列で載せるか
+□ 世代の管理             : どの学習から作った重みか、を後から辿れるようにする
+```
+
+最後の「世代の管理」は、どのツールを使うかより、**学習のジョブ・チェックポイント・配布用の重み・推論サーバーの設定が、後から 1 本につながる**ことが大事です。推論の結果がおかしいと言われたとき、「このサーバーは、どの学習の、どの重みを使っているか」に答えられるようにしておきます。
+
+---
+
+## まとめ
+
+- 推論サーバーが必要とするのは**重みだけ**。再開用のチェックポイントから**配布用の重み**を作る
+- DCP 形式は `dcp_to_torch_save` で `torch.save` 形式に変換できる
+- `save_pretrained` は **50 GB を超えるとシャードに分け、インデックスを作る**。`from_pretrained` は safetensors があればそれを読む。シャードは組で扱う
+- LoRA のアダプタは**元のモデルを含まない**。`adapter_config.json` に元のモデルの名前が入る（元が Transformers のモデルの場合）
+- 推論に使うには、**マージして 1 つのモデルにする**か、**vLLM で元のモデルの上にアダプタを載せて配信する**
+- 量子化は精度と引き換えにメモリを減らす。形式が決まってから推論の GPU の台数を見積もる
+- 学習と推論の GPU の構成は別々に見積もる。成果物の**世代を後から辿れる**ようにしておく
+
+---
+
+<Quiz
+  id="q1"
+  question="利用者から LoRA のアダプタ（adapter_model.safetensors と adapter_config.json）を受け取り、vLLM で配信するよう頼まれました。推論サーバーの準備として正しいものはどれですか。"
+  options={[
+    "アダプタのファイルだけを置けば、vLLM はそれだけで推論できる",
+    "アダプタには元のモデルの重みが含まれないので、adapter_config.json が指す元のモデルを用意し、その上で --enable-lora と --lora-modules でアダプタを載せる（またはマージしたモデルを受け取る）",
+    "adapter_config.json はアダプタの学習にしか使わないので、推論サーバーには不要",
+    "vLLM は LoRA に対応していないので、必ずマージしてから配る必要がある"
+  ]}
+  answer={1}
+  explanation="PEFT のドキュメントによると、アダプタの state_dict にはアダプタの重みしか入っておらず、元のモデルの重みは含まれません。adapter_config.json には、元のモデルの名前（base_model_name_or_path）が入っています。vLLM は元のモデルを読み込んだうえで、--enable-lora と --lora-modules でアダプタを載せて配信できます。マージして 1 つのモデルにしてから配る方法もあります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="配布用の重みを推論サーバーの置き場所へコピーしたあと、ディレクトリを確かめると model-00001-of-00006.safetensors から model-00005-of-00006.safetensors と model.safetensors.index.json がありました。この状態の評価として正しいものはどれですか。"
+  options={[
+    "そろっている。インデックスがあれば、シャードの数は関係ない",
+    "6 つに分割されたシャードのうち 1 つ（00006）が無く、インデックスが指すファイルがそろっていない。コピーをやり直す",
+    "インデックスのファイルは不要なので、消せば読める",
+    "シャードは 1 つずつ別のサーバーに置く必要がある"
+  ]}
+  answer={1}
+  explanation="Transformers の save_pretrained は、大きなモデルを複数のシャードに分け、どのパラメータがどのシャードにあるかをインデックス（weight_map）に書きます。ドキュメントの例では、lm_head.weight は model-00006-of-00006.safetensors にあります。00006 が無ければ、インデックスが指すファイルがそろっていません。重みはディレクトリごと、ファイルの組として扱います。"
+/>

@@ -32,11 +32,14 @@ import {
   CheckpointContents,
   DcpShards,
   DdpOverlap,
+  GenerationLoop,
+  HandoverPipeline,
   LoraAdapter,
   ModelStateBytes,
   ParallelismLayout,
   TrainingLoop,
   TwoCheckpoints,
+  VllmServing,
 } from "./mlwork";
 import { LvmStack } from "./ops";
 import { RxPacketPath, TcpQueues, TcpTeardown, TlsHandshakeRtt } from "./network";
@@ -86,6 +89,9 @@ export const FIGURES = {
   "checkpoint-contents": CheckpointContents,
   "dcp-shards": DcpShards,
   "lora-adapter": LoraAdapter,
+  "generation-loop": GenerationLoop,
+  "vllm-serving": VllmServing,
+  "handover-pipeline": HandoverPipeline,
   "nfs-vs-parallel-fs": NfsVsParallelFs,
   "training-step": TrainingStep,
   "ib-credit-flow": IbCreditFlow,

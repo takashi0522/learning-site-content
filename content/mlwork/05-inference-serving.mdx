@@ -1,0 +1,175 @@
+---
+title: 推論 — 学習済みモデルが API になるまで
+description: 学習を終えた重みは、推論サーバーに読み込まれて API になります。文章が 1 トークンずつ生成される仕組みと、vLLM を例に、サービングエンジンが GPU メモリをどう使い、基盤から何が見えるのかを整理します。
+order: 5
+minutes: 20
+tags: ["inference", "serving", "vLLM", "PagedAttention", "KV-cache", "OpenAI-API"]
+objectives:
+  - 文章の生成が 1 トークンずつのループで進むことを説明できる
+  - vLLM のようなサービングエンジンが、GPU メモリを重みと KV キャッシュにどう割り振るかを説明できる
+  - 推論サーバーの設定（GPU メモリの割合・並列）と指標を、基盤の運用と結びつけて説明できる
+references:
+  - label: "Hugging Face Transformers — Text generation（LLM tutorial）"
+    url: "https://huggingface.co/docs/transformers/main/en/llm_tutorial"
+  - label: "Hugging Face Transformers — Generation strategies"
+    url: "https://huggingface.co/docs/transformers/main/en/generation_strategies"
+  - label: "Kwon et al., Efficient Memory Management for Large Language Model Serving with PagedAttention（SOSP 2023）"
+    url: "https://arxiv.org/abs/2309.06180"
+  - label: "vLLM — Quickstart（Online Serving。latest、2026 年 10 月時点）"
+    url: "https://docs.vllm.ai/en/latest/getting_started/quickstart.html"
+  - label: "vLLM — Engine Arguments（--gpu-memory-utilization など）"
+    url: "https://docs.vllm.ai/en/latest/configuration/engine_args.html"
+  - label: "vLLM — Optimization and Tuning（Preemption）"
+    url: "https://docs.vllm.ai/en/latest/configuration/optimization.html"
+  - label: "vLLM — Parallelism and Scaling"
+    url: "https://docs.vllm.ai/en/latest/serving/parallelism_scaling.html"
+  - label: "vLLM — Metrics"
+    url: "https://docs.vllm.ai/en/latest/design/metrics.html"
+---
+
+## 文章は 1 トークンずつ生まれる
+
+学習が終わったモデルは、推論のために使われます。言語モデルの推論で何が起きているかを、Hugging Face の説明から見ます。
+
+言語モデルは、**それまでの文章（プロンプトと、自分がすでに出した部分）から、次の 1 トークンを予測する**ように学習されています。推論では、これを**決めた長さに達するか、終わりを表すトークン（EOS）が出るまで**繰り返します。
+
+<Figure name="generation-loop" caption="出したトークンを入力の後ろに足して、もう一度モデルに通す" source="Hugging Face Transformers の LLM tutorial を元に作図" />
+
+文章とトークンの変換は**トークナイザ**が受け持ちます。入力の文章をトークンの ID の列にし、生成し終えたら ID の列を文章に戻します。
+
+次のトークンの選び方にも種類があります。Hugging Face のドキュメントによると、既定は**最も確率の高いトークンを選ぶ（greedy search）**方法で、ほかに確率に従ってランダムに選ぶ方法（サンプリング）などがあります。
+
+基盤から見ると、**出力が長いほど、モデルを通す回数が増える**ということです。GPU コース レッスン 5 で見た prefill（入力をまとめて処理する段）と decode（1 トークンずつ出す段）は、このループの最初の 1 回とその後の繰り返しに当たります。
+
+---
+
+## サービングエンジンが足しているもの
+
+1 人の利用者が 1 つずつ生成するだけなら、このループを回せば済みます。推論サーバーでは、**多数のリクエストを同時に**さばく必要があります。そこで使われるのが vLLM のようなサービングエンジンです。
+
+vLLM の土台になった PagedAttention の論文（2023）は、推論中の GPU メモリの使われ方を次のように示しています（13B のモデルを A100 40GB で動かした例）。
+
+- 約 **65%** はモデルの重みで、サービング中は変わらない
+- 約 **30%** は **KV キャッシュ**（生成中のリクエストが持つ途中の状態）
+
+KV キャッシュは、リクエストごとに**生成が進むにつれて伸び、終われば消えます**。論文によると、従来のシステムはリクエストごとに連続した領域を先に確保していたため、予約しただけで使わない部分や断片化でメモリが無駄になっていました。PagedAttention は KV キャッシュを**小さなブロックに分け、物理的に連続していない場所にも置ける**ようにしました。論文は、同程度のレイテンシで、当時の最先端のシステムと比べてスループットが **2〜4 倍**になったと報告しています。
+
+---
+
+## vLLM を立てると、何が起きるか
+
+vLLM のクイックスタートは、次の 1 行でサーバーを起動する例を示しています。
+
+```bash
+vllm serve Qwen/Qwen2.5-1.5B-Instruct
+```
+
+既定では `http://localhost:8000` で待ち受け、**OpenAI の API と同じ形**のエンドポイントを提供します。ドキュメントは、OpenAI の API を使うアプリケーションの置き換え（drop-in replacement）として使えると書いており、例では OpenAI のクライアントの接続先を vLLM に向けています。
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Qwen/Qwen2.5-1.5B-Instruct",
+        "messages": [{"role": "user", "content": "Who won the world series in 2020?"}]
+    }'
+```
+
+ドキュメントによると、このサーバーは**一度に 1 つのモデル**を扱います。`--api-key` を付けると、ヘッダーの API キーを確かめるようになります。また既定では、モデルのリポジトリにある `generation_config.json` を読み、サンプリングの既定値をモデルの作者の推奨値で上書きします。
+
+---
+
+## GPU メモリの割合が、1 インスタンスの上限になる
+
+<Figure name="vllm-serving" caption="vLLM は GPU メモリの決めた割合の中に、重みと KV キャッシュを置く" source="vLLM のドキュメントと PagedAttention の論文を元に作図" />
+
+vLLM の `--gpu-memory-utilization` は、**GPU メモリのうち、このインスタンスが使う割合**です。このレッスンで確認したドキュメント（latest、2026 年 10 月時点）では、**既定値は 0.92** です。KV キャッシュの大きさは、既定ではこの割合をもとに自動で決まります。
+
+ドキュメントは、これが**インスタンスごとの上限**であることを強調しています。同じ GPU で 2 つの vLLM を動かすなら、それぞれ 0.5 にする、という例が挙がっています。
+
+<Callout type="field" title="1 枚の GPU を複数の推論サーバーで分けるとき">
+
+既定の 0.92 のまま同じ GPU に 2 つのインスタンスを置くと、割合の合計は 0.92 × 2 で 1 を超えます。GPU を共有する設計（GPU コース レッスン 4 の MIG や time-slicing）を考えるときは、**推論エンジンの側のこの設定**も合わせて決めます。
+
+</Callout>
+
+---
+
+<h2 className="slide-cont">GPU メモリの割合（続き）</h2>
+
+### KV キャッシュが足りないとき
+
+vLLM のドキュメントによると、KV キャッシュの空きが足りなくなると、vLLM は一部のリクエストを**一時的に退避（preempt）**させ、空きができてから**計算し直します**。このとき「KV キャッシュが足りないので preempt した」という警告がログに出て、全体の性能に響きます。ドキュメントは対策として、`gpu_memory_utilization` を上げるか、`tensor_parallel_size` を増やして KV キャッシュに使えるメモリを増やすことを挙げています。
+
+---
+
+## 大きなモデルは複数の GPU に分ける
+
+1 枚に載らないモデルは、推論でも複数の GPU に分けます。vLLM のドキュメントの指針は、レッスン 2 の学習の場合とよく似ています。
+
+| モデルの大きさ | vLLM のドキュメントの指針 |
+| --- | --- |
+| 1 枚の GPU に載る | 分散させずに、その GPU で動かす |
+| 1 枚には載らないが、1 ノードに載る | **テンソル並列**。4 GPU のノードなら `--tensor-parallel-size 4` |
+| 1 ノードにも載らない | **テンソル並列とパイプライン並列を組み合わせる**。テンソル並列をノード内の GPU 数、パイプライン並列をノード数にする |
+
+vLLM のテンソル並列には、Megatron-LM のアルゴリズムが含まれています。vLLM のドキュメントは、**ノードの GPU が NVLink でつながっていない場合（例: L40S）は、テンソル並列の代わりにパイプライン並列を使う**よう勧めています。また `tensor_parallel_size` を上げると、同期のオーバーヘッドが増えうるとも書いています。テンソル並列の通信が多い理由は、レッスン 2 で見たとおりです。
+
+---
+
+## 基盤から見る指標
+
+vLLM は、Prometheus 形式の指標を `/metrics` で公開します。ドキュメントが挙げる例から、基盤の監視で使いやすいものを抜き出します。
+
+| 指標 | 意味 |
+| --- | --- |
+| `vllm:num_requests_running` | いま処理中のリクエストの数 |
+| `vllm:kv_cache_usage_perc` | KV キャッシュのブロックの使用率（0〜1） |
+| `vllm:time_to_first_token_seconds` | 最初のトークンが出るまでの時間（TTFT） |
+| `vllm:inter_token_latency_seconds` | 続けて出るトークンの間隔 |
+| `vllm:e2e_request_latency_seconds` | リクエスト全体のレイテンシ |
+
+KV キャッシュの使用率が高止まりし、preempt の警告が出ているなら、メモリの割り当てか GPU の数を見直す合図です。TTFT とトークン間隔の関係は、GPU コース レッスン 5 で扱いました。
+
+---
+
+## まとめ
+
+- 言語モデルは**次の 1 トークンを予測する**ように学習されていて、推論では EOS か上限の長さまでこれを繰り返す
+- 既定の選び方は**最も確率の高いトークン（greedy）**。サンプリングなどの方法もある
+- 推論中の GPU メモリは、**変わらない重み**と、**リクエストごとに伸び縮みする KV キャッシュ**に分かれる（PagedAttention の論文の例で約 65% と約 30%）
+- `vllm serve` は **OpenAI 互換の API** を `:8000` で提供する
+- `--gpu-memory-utilization`（このレッスンで確認した版では既定 0.92）は**インスタンスごとの上限**。同じ GPU で複数動かすなら分け合う
+- KV キャッシュが足りないと **preempt と再計算**が起き、性能に響く
+- 大きなモデルは、ノード内でテンソル並列、ノード間でパイプライン並列
+- `/metrics` で KV キャッシュの使用率や TTFT を監視できる
+
+---
+
+<Quiz
+  id="q1"
+  question="1 枚の GPU で 2 つの vLLM インスタンスを動かす計画です。どちらも --gpu-memory-utilization を指定しないつもりでした。どう設定するのが適切ですか。"
+  options={[
+    "指定しなくてよい。2 つ目のインスタンスは、1 つ目が使っていない分だけを自動で使う",
+    "--gpu-memory-utilization はインスタンスごとの上限なので、2 つの合計が GPU のメモリに収まるように、それぞれに割合を指定する（例: 0.5 ずつ）",
+    "--tensor-parallel-size を 2 にする",
+    "max_tokens を小さくして、生成する長さを短くする"
+  ]}
+  answer={1}
+  explanation="vLLM のドキュメントによると、--gpu-memory-utilization はそのインスタンスが使う GPU メモリの割合で、インスタンスごとの上限です。同じ GPU でほかのインスタンスが動いているかどうかは考慮されません。指定しなければ、このレッスンで確認した版では 0.92 が使われるので、2 つ置けば割合の合計が 1 を超えます。ドキュメントは、同じ GPU で 2 つ動かす場合にそれぞれ 0.5 にする例を挙げています。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="vLLM のログに、KV キャッシュが足りないためにリクエストを preempt したという警告が頻繁に出ています。vLLM のドキュメントが挙げる対策として正しいものはどれですか。"
+  options={[
+    "--gpu-memory-utilization を下げて、ほかのプロセスに GPU メモリを譲る",
+    "--gpu-memory-utilization を上げるか、--tensor-parallel-size を増やして、KV キャッシュに使えるメモリを増やす",
+    "警告は無視してよい。性能には影響しない",
+    "/metrics を無効にして、オーバーヘッドを減らす"
+  ]}
+  answer={1}
+  explanation="vLLM は KV キャッシュの空きが足りなくなると、一部のリクエストを preempt し、空きができてから計算し直します。ドキュメントは、これが全体の性能に響くとしたうえで、gpu_memory_utilization を上げるか tensor_parallel_size を増やして、KV キャッシュに使えるメモリを増やすよう勧めています。"
+/>

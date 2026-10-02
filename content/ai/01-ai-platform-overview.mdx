@@ -9,6 +9,8 @@ objectives:
   - AI 基盤の構成要素と、それぞれがどの制約を解くのかを整理できる
   - 性能が出ないときに、どの層を疑うべきか順序立てて考えられる
 references:
+  - label: "Rajbhandari et al., ZeRO: Memory Optimizations Toward Training Trillion Parameter Models（混合精度 Adam で 16 バイト / パラメータ）"
+    url: "https://arxiv.org/abs/1910.02054"
   - label: "NVIDIA — Deep Learning Performance Guide"
     url: "https://docs.nvidia.com/deeplearning/performance/index.html"
   - label: "NVIDIA DGX SuperPOD Reference Architecture"
@@ -114,6 +116,8 @@ Adam オプティマイザ + 混合精度の典型的な内訳（パラメータ
 ```
 
 **推論で 140GB だったものが、学習では 1.1TB になります。** さらに活性化値（中間結果）のメモリが加わります。
+
+この 16 バイトの内訳は ZeRO の論文（Rajbhandari et al.）が示したものです。それぞれがなぜ要るのかは、GPU の使われ方コース レッスン 1 で扱います。
 
 ---
 
