@@ -8,6 +8,7 @@ import { Quiz } from "./quiz";
 import { Callout } from "./callout";
 import { VideoEmbed } from "./video-embed";
 import { Figure } from "./figure";
+import { withBase } from "@/lib/base-path";
 
 const prettyCodeOptions: PrettyCodeOptions = {
   // 明暗 2 テーマを同時に出力し、CSS 変数側で切り替える (globals.css を参照)
@@ -20,7 +21,7 @@ function Anchor({ href = "", ...props }: AnchorHTMLAttributes<HTMLAnchorElement>
   const external = /^https?:\/\//.test(href);
   return (
     <a
-      href={href}
+      href={withBase(href)}
       {...(external ? { target: "_blank", rel: "noreferrer noopener" } : {})}
       {...props}
     />

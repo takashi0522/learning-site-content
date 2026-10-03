@@ -160,6 +160,12 @@ export function WalkLab({ lab }: { lab: Lab }) {
           </ol>
         </div>
 
+        {step.code ? (
+          <pre className="mb-4 overflow-x-auto rounded-xl border border-border bg-surface-2 px-4 py-3 font-mono text-xs leading-relaxed text-fg">
+            {step.code}
+          </pre>
+        ) : null}
+
         <p className="text-base font-bold leading-relaxed text-fg">{step.prompt}</p>
 
         <ul className="mt-4 flex flex-col gap-2">

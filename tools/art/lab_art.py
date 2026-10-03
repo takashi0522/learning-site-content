@@ -15,6 +15,7 @@ LABS = {
     "rack-gpu": "tall frame with dense heavy blocks stacked in the lower half",
     "rack-cabling": "bundles of long cables sweeping downward, curved strands",
     "gpu-placement": "grid of cells with a few cells highlighted, sparse placement",
+    "pytorch-training": "a looping conveyor of small identical blocks feeding into a dense machine and back",
 }
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_raw", "lab")

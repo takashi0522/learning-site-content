@@ -6,6 +6,9 @@ const nextConfig: NextConfig = {
   output: "export",
   // 静的ホスティングでのパス解決を安定させる (/foo -> /foo/index.html)
   trailingSlash: true,
+  // GitHub Pages はリポジトリ名の下に置かれる (/learning-site-content/)。
+  // 自宅サーバー向けのビルドでは未設定のまま (ルート直下)。
+  basePath: process.env.NEXT_PUBLIC_BASE_PATH || undefined,
   eslint: {
     // Lint は npm run lint で独立して回す (Flat Config を直接使うため)
     ignoreDuringBuilds: true,

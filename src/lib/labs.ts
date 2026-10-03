@@ -25,7 +25,8 @@ export type LabNode = {
   w: number;
   /** 段。0 が最上段。省略時は 1 列に並べる (packet-walk のような直線トポロジ) */
   row?: number;
-  kind: "host" | "switch" | "router" | "spine" | "leaf";
+  /** storage / cpu / gpu は「どこで動くか」を示す (学習の手順を追うラボで使う) */
+  kind: "host" | "switch" | "router" | "spine" | "leaf" | "storage" | "cpu" | "gpu";
   label: string;
   sub?: string;
 };
@@ -61,6 +62,8 @@ export type LabStep = {
   path?: string[];
   /** この手順で停止しているノード。障害の手順で使う */
   down?: string[];
+  /** この手順で注目するコード。問いの上に等幅で出す */
+  code?: string;
   prompt: string;
   options: LabOption[];
   explain: string;
@@ -256,6 +259,7 @@ const ORDER: Record<string, number> = {
   "rack-gpu": 5,
   "rack-cabling": 6,
   "gpu-placement": 7,
+  "pytorch-training": 8,
 };
 
 export function getLabs(): Lab[] {

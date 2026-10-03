@@ -1,0 +1,165 @@
+{
+  "id": "pytorch-training",
+  "title": "PyTorch で学習を回す",
+  "subtitle": "データの読み込みから保存まで、1 行ずつ",
+  "goal": "PyTorch の公式チュートリアルの学習コードを 1 段ずつ追い、各行が何をしていて、それが CPU・GPU・ストレージのどこで起きているのかを確かめる。",
+  "minutes": 15,
+  "status": "ready",
+  "mode": "walk",
+  "accent": "mlwork",
+  "intro": {
+    "title": "はじめに — 題材にするコード",
+    "body": [
+      "題材は PyTorch の公式チュートリアル（Quickstart と Optimizing Model Parameters）です。衣類の画像 6 万枚（FashionMNIST）を 10 種類に分類する小さなモデルを学習します。小さいので 1 枚の GPU で、手元の PC でも動きます。",
+      "上の図は、学習の 1 ステップでデータが通る順番です。下に書いてあるのは、その段階が主にどこで動くかです。データはストレージから CPU 側の DataLoader に読まれ、GPU に送られて、モデルの計算・loss・逆伝播・重みの更新が GPU の上で行われます。最後に結果をストレージに保存します。",
+      "コースの「GPU の使われ方 — 学習と推論」のレッスン 1 で見た学習ループを、実際のコードで追う演習です。先にレッスン 1 を読んでおくと迷いにくくなります。",
+      "コードはチュートリアルのものを短く抜き出しています。PyTorch の版で書き方が変わることがあるので、手元で動かすときはチュートリアルの最新版を見てください（このラボは 2026 年 10 月時点の版で確認しています）。"
+    ]
+  },
+  "nodes": [
+    { "id": "data", "x": 22, "w": 104, "kind": "storage", "label": "データ", "sub": "FashionMNIST" },
+    { "id": "loader", "x": 144, "w": 104, "kind": "cpu", "label": "DataLoader", "sub": "batch 64" },
+    { "id": "forward", "x": 266, "w": 104, "kind": "gpu", "label": "順伝播", "sub": "model(X)" },
+    { "id": "loss", "x": 388, "w": 104, "kind": "gpu", "label": "loss", "sub": "loss_fn" },
+    { "id": "backward", "x": 510, "w": 104, "kind": "gpu", "label": "逆伝播", "sub": ".backward()" },
+    { "id": "step", "x": 632, "w": 104, "kind": "gpu", "label": "重みの更新", "sub": ".step()" },
+    { "id": "save", "x": 754, "w": 104, "kind": "storage", "label": "保存", "sub": "torch.save" }
+  ],
+  "steps": [
+    {
+      "id": "batch",
+      "at": "loader",
+      "code": "train_dataloader = DataLoader(training_data, batch_size=64)\n\nfor batch, (X, y) in enumerate(train_dataloader):\n    ...",
+      "prompt": "ループの 1 回で、DataLoader から取り出される X と y は何ですか。",
+      "options": [
+        { "label": "データセット全体（6 万枚の画像とラベル）", "hint": "全部を一度に渡すなら、batch_size を指定する意味がありません。" },
+        { "label": "64 枚の画像（X）と、その 64 個の正解ラベル（y）", "correct": true, "hint": "" },
+        { "label": "画像 1 枚と、その正解ラベル 1 個", "hint": "batch_size=64 を指定しています。1 回に何個ずつ渡すかを決める引数です。" }
+      ],
+      "explain": "Quickstart によると、DataLoader は Dataset を包んで、まとめて取り出す（バッチ化）・順番を混ぜる・複数プロセスで読むといった機能を足します。batch_size=64 なので、1 回に 64 個の画像とラベルの組が出てきます。6 万枚を 64 個ずつ読むので、1 エポック（データを 1 周）は約 940 回のループになります。基盤から見ると、学習データの読み込みはこの DataLoader の中で起きています。"
+    },
+    {
+      "id": "device",
+      "at": "forward",
+      "code": "device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else \"cpu\"\nmodel = NeuralNetwork().to(device)\n\nfor batch, (X, y) in enumerate(dataloader):\n    pred = model(X)    # ← ここで動かない",
+      "prompt": "model は GPU に移しました。ところが model(X) の行でエラーになります。足りないのは何ですか。",
+      "options": [
+        { "label": "X と y も、ループの中で毎回 X.to(device), y.to(device) として GPU に送る", "correct": true, "hint": "" },
+        { "label": "model をもう一度 .to(device) する", "hint": "model はすでに GPU にあります。DataLoader から出てきたばかりのデータはどこにあるでしょうか。" },
+        { "label": "batch_size を小さくする", "hint": "大きさの問題ではありません。計算に使う 2 つが、別々の場所にあります。" }
+      ],
+      "explain": "Quickstart のコードは、ループの中で X, y = X.to(device), y.to(device) として、バッチを毎回 GPU に送っています。DataLoader が返すデータは CPU 側のメモリにあり、モデルの重みは GPU にあるので、そのままでは同じ計算に使えません。device の行は、使える GPU などのアクセラレータがあればそれを、無ければ CPU を選びます。基盤から見ると、ここが CPU 側のメモリから GPU のメモリへのコピーです。"
+    },
+    {
+      "id": "loss",
+      "at": "loss",
+      "code": "loss_fn = nn.CrossEntropyLoss()\n\npred = model(X)\nloss = loss_fn(pred, y)",
+      "prompt": "loss_fn(pred, y) が返す loss は何を表していますか。",
+      "options": [
+        { "label": "モデルの予測（pred）と正解（y）がどれだけずれているか。学習ではこれを小さくしていく", "correct": true, "hint": "" },
+        { "label": "モデルの正解率（%）", "hint": "正解率は、チュートリアルでは学習とは別の評価のループで数えています。loss は大きいほど悪い値です。" },
+        { "label": "GPU の使用率", "hint": "loss は計算の結果そのものから出る値で、ハードウェアの状態とは関係しません。" }
+      ],
+      "explain": "Optimizing Model Parameters のチュートリアルによると、loss 関数は得られた結果と目標の値がどれだけ違うかを測り、学習ではこれを最小にしようとします。分類の問題なので、ここでは CrossEntropyLoss を使っています。利用者が「loss が下がらない」と言うときは、この値の推移を見ています。"
+    },
+    {
+      "id": "backward",
+      "at": "backward",
+      "code": "loss.backward()",
+      "prompt": "loss.backward() を実行した直後、モデルの重みはどうなっていますか。",
+      "options": [
+        { "label": "まだ変わっていない。各重みについて、loss をどちらに動かせば減るか（勾配）が計算されて溜められただけ", "correct": true, "hint": "" },
+        { "label": "勾配の分だけ、重みがすでに更新されている", "hint": "重みを動かす役は別にいます。backward が計算するのは、動かす向きと大きさです。" },
+        { "label": "loss が 0 になるように、重みが直接書き換えられている", "hint": "1 回で loss を 0 にする方法はありません。backward は「どちらに動かすか」を求めるだけです。" }
+      ],
+      "explain": "チュートリアルによると、loss.backward() は、各パラメータについての loss の勾配を求めて、パラメータのところに置きます（PyTorch では各パラメータの .grad に入ります）。重みはまだ変わっていません。勾配は重みと同じ数だけ置かれるので、その分の GPU メモリを使います（コースのレッスン 1 で見た内訳）。"
+    },
+    {
+      "id": "step",
+      "at": "step",
+      "code": "optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)\n\nloss.backward()\noptimizer.step()",
+      "prompt": "optimizer.step() は何をしますか。",
+      "options": [
+        { "label": "backward で求めた勾配を使って、重みを少し動かす", "correct": true, "hint": "" },
+        { "label": "次のバッチを DataLoader から読み込む", "hint": "次のバッチを取り出すのは for の行です。optimizer を作るときに何を渡したかを見てください。" },
+        { "label": "モデルをファイルに保存する", "hint": "保存は torch.save の役目です。optimizer には model.parameters() が渡されています。" }
+      ],
+      "explain": "チュートリアルによると、optimizer を作るときに学習させるパラメータ（model.parameters()）と学習率（lr）を渡しておき、step() で、逆伝播で集めた勾配に従ってパラメータを調整します。ここでは SGD ですが、Adam などほかのアルゴリズムも選べます。optimizer の種類によっては、学習につれて更新される状態を別に持ち、その分のメモリも要ります（Adam の場合の内訳は、コースのレッスン 1 の「16 バイト」で見ました）。"
+    },
+    {
+      "id": "zero-grad",
+      "at": "step",
+      "code": "loss.backward()\noptimizer.step()\noptimizer.zero_grad()   # ← これを消すと？",
+      "prompt": "optimizer.zero_grad() を書き忘れると、どうなりますか。",
+      "options": [
+        { "label": "何も変わらない。勾配は backward のたびに上書きされる", "hint": "PyTorch の勾配は、既定では上書きではありません。" },
+        { "label": "前のバッチの勾配に今回の勾配が足し込まれていき、重みの動かし方がおかしくなる", "correct": true, "hint": "" },
+        { "label": "GPU のメモリが解放されず、すぐにメモリ不足で止まる", "hint": "勾配を入れる場所は重みごとに 1 つで、増えていくのは場所ではなく、そこに入っている値です。" }
+      ],
+      "explain": "チュートリアルによると、勾配は既定では足し上がっていくので、二重に数えないように毎回明示的に 0 に戻します。書き忘れてもエラーにはならないので、loss がうまく下がらないという形で現れることがあります。"
+    },
+    {
+      "id": "log",
+      "at": "loss",
+      "code": "if batch % 100 == 0:\n    loss, current = loss.item(), batch * batch_size + len(X)\n    print(f\"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]\")\n\n# 出力の例（チュートリアルより）\nloss: 2.149592  [57664/60000]",
+      "prompt": "出力の loss: 2.149592  [57664/60000] は何を表していますか。",
+      "options": [
+        { "label": "このエポックで 6 万枚中 57,664 枚まで読んだ時点の、そのバッチの loss", "correct": true, "hint": "" },
+        { "label": "学習全体の進み具合が 96%（57664/60000）で、loss の平均が 2.149592", "hint": "60000 は学習データの枚数（size）です。エポックが変わるとどうなるでしょうか。" },
+        { "label": "57,664 回の重みの更新が終わった", "hint": "current は batch × batch_size で計算しています。数えているのは更新の回数ではありません。" }
+      ],
+      "explain": "コードのとおり、100 バッチごとに、いまのバッチの loss と、このエポックで読んだ枚数（batch × batch_size + len(X)）を出しています。エポックが変わると [64/60000] から数え直します。チュートリアルの出力では、エポックが進むにつれて loss が下がり、テストの正解率が上がっていきます（1 エポック目で 39.6%、5 エポック目で 65.1% という例が載っています。実行ごとに値は変わります）。"
+    },
+    {
+      "id": "eval",
+      "at": "forward",
+      "code": "model.eval()\nwith torch.no_grad():\n    for X, y in test_dataloader:\n        pred = model(X)\n        test_loss += loss_fn(pred, y).item()",
+      "prompt": "テストデータで評価するとき、torch.no_grad() で囲んでいるのはなぜですか。",
+      "options": [
+        { "label": "評価では重みを更新しないので、勾配の計算を止めて、計算とメモリを減らすため", "correct": true, "hint": "" },
+        { "label": "テストデータで学習してしまわないように、重みの更新を禁止するため", "hint": "このループには backward も step もありません。囲まなくても重みは更新されません。では何が省けるでしょうか。" },
+        { "label": "GPU を使わず CPU で評価するため", "hint": "no_grad はデバイスを変えません。止めるのは計算のある種類です。" }
+      ],
+      "explain": "チュートリアルによると、torch.no_grad() で囲むと勾配が計算されなくなり、不要な勾配の計算とメモリの使用が減ります。model.eval() は、ドロップアウトやバッチ正規化のように、学習と評価で動きが変わる層を評価用にします（このモデルには無いが、習慣として書いている、とチュートリアルは注記しています）。推論サーバーでモデルを動かすときも、勾配は要りません。"
+    },
+    {
+      "id": "save",
+      "at": "save",
+      "code": "torch.save(model.state_dict(), \"model.pth\")",
+      "prompt": "このファイルで推論はできます。では、学習を途中から再開するには足りますか。",
+      "options": [
+        { "label": "足りる。重みさえあれば、続きから学習できる", "hint": "optimizer.step() が何を使って重みを動かしていたかを思い出してください。Adam なら、重みのほかにも状態を持っています。" },
+        { "label": "足りない。optimizer の state_dict や、いまのエポックなども一緒に保存する必要がある", "correct": true, "hint": "" },
+        { "label": "足りない。DataLoader も保存しないと、データが読めなくなる", "hint": "データはストレージに元のまま残っています。足りないのは学習の側の状態です。" }
+      ],
+      "explain": "Quickstart のこの行は、モデルのパラメータ（state_dict）だけを保存します。推論にはこれで足ります。PyTorch の Saving and Loading Models によると、学習の再開にも使う一般的なチェックポイントでは、optimizer の state_dict（学習につれて更新されるバッファやパラメータを含む）や、どのエポックまで進んだか、直近の loss なども辞書にまとめて保存します。そのためモデルだけの場合より 2〜3 倍大きくなることが多い、とされています。コースのレッスン 3 の「重みだけでは再開できない」は、この違いです。"
+    },
+    {
+      "id": "loader-workers",
+      "at": "loader",
+      "code": "train_dataloader = DataLoader(training_data, batch_size=64)\n# num_workers の既定は 0、pin_memory の既定は False",
+      "prompt": "GPU の使用率が低いまま上がらないと相談されました。データの読み込みが追いついていないのではと疑うとき、DataLoader で見る設定はどれですか。",
+      "options": [
+        { "label": "num_workers を正の数にして別プロセスで読ませ、pin_memory=True で GPU への転送を速くする", "correct": true, "hint": "" },
+        { "label": "batch_size を 1 にして、1 枚ずつ素早く渡す", "hint": "1 回あたりの GPU の仕事が小さくなるだけで、読み込みの待ちは減りません。" },
+        { "label": "DataLoader の設定は性能に関係しない。GPU のドライバを更新する", "hint": "既定の num_workers=0 で、データの読み込みがどのプロセスで行われるかを考えてください。" }
+      ],
+      "explain": "DataLoader のドキュメントによると、num_workers の既定は 0 で、データはメインのプロセスで読まれます。この場合、読み込みが計算を止めることがあります。num_workers を正の数にすると、複数のプロセスで読み込みます。また pin_memory=True にすると、読み込んだデータをページロックされたメモリに置き、CUDA に対応した GPU への転送を速くできます。GPU の使用率が低い原因はほかにもありえますが、読み込みを疑うなら、まずこの 2 つの設定が既定のままかを見ます。"
+    }
+  ],
+  "summary": [
+    "DataLoader はデータを batch_size 個ずつまとめて渡す。読み込みは CPU 側で、既定（num_workers=0）ではメインのプロセスで行われる",
+    "モデルを .to(device) で GPU に置いたら、バッチも毎回 .to(device) で送る。ここが CPU から GPU への転送になる",
+    "1 ステップは「順伝播 → loss → backward（勾配を求める）→ step（重みを動かす）→ zero_grad（勾配を 0 に戻す）」",
+    "勾配は既定で足し上がる。zero_grad を忘れてもエラーにはならず、loss が下がらない形で現れることがある",
+    "評価は model.eval() と torch.no_grad() で。勾配を計算しないぶん、計算とメモリが減る",
+    "推論には model.state_dict() だけで足りるが、学習の再開には optimizer の状態やエポックも一緒に保存する"
+  ],
+  "next": [
+    { "label": "コース「GPU の使われ方」レッスン 1 — 学習ループの中で起きていること", "href": "/courses/mlwork/training-loop/" },
+    { "label": "PyTorch — Quickstart", "href": "https://docs.pytorch.org/tutorials/beginner/basics/quickstart_tutorial.html" },
+    { "label": "PyTorch — Optimizing Model Parameters", "href": "https://docs.pytorch.org/tutorials/beginner/basics/optimization_tutorial.html" },
+    { "label": "PyTorch — Saving and Loading Models", "href": "https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html" },
+    { "label": "PyTorch — torch.utils.data（DataLoader）", "href": "https://docs.pytorch.org/docs/stable/data.html" }
+  ]
+}

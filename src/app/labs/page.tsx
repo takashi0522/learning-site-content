@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { getLabs } from "@/lib/labs";
+import { withBase } from "@/lib/base-path";
 
 export const metadata: Metadata = {
   title: "ラボ",
@@ -41,7 +42,7 @@ export default function LabsPage() {
               {ready && (
                 <div
                   className="card-art absolute inset-0 -z-10"
-                  style={{ backgroundImage: `url(/lab-art/${lab.id}.jpg)` }}
+                  style={{ backgroundImage: `url(${withBase(`/lab-art/${lab.id}.jpg`)})` }}
                   aria-hidden="true"
                 />
               )}

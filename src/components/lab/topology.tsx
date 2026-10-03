@@ -13,6 +13,9 @@ const KIND_LABEL: Record<LabNode["kind"], string> = {
   router: "ルータ",
   spine: "スパイン",
   leaf: "リーフ",
+  storage: "ストレージ",
+  cpu: "CPU",
+  gpu: "GPU",
 };
 
 /**

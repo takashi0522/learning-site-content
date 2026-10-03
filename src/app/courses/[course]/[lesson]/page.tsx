@@ -5,6 +5,7 @@ import { getAllLessonParams, getCourse, getLesson, getLessonNeighbors } from "@/
 import { Mdx } from "@/components/mdx";
 import { LessonShell } from "@/components/lesson-shell";
 import { VideoEmbed } from "@/components/video-embed";
+import { withBase } from "@/lib/base-path";
 
 export const dynamicParams = false;
 
@@ -38,7 +39,7 @@ export default async function LessonPage({
     <div data-accent={course.accent} className="mx-auto flex max-w-3xl flex-col gap-8">
       <div
         className="lesson-band lesson-intro -mb-2"
-        style={{ backgroundImage: `url(/course-band/${courseId}.jpg)` }}
+        style={{ backgroundImage: `url(${withBase(`/course-band/${courseId}.jpg`)})` }}
         aria-hidden="true"
       />
 

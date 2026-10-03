@@ -4,7 +4,13 @@
 
 同じ教材を **記事モード** と **スライドモード** の両方で読め、確認クイズと進捗トラッキングが付いています。
 
-## 使い方
+## Web で読む
+
+https://takashi0522.github.io/learning-site-content/
+
+`main` に push すると GitHub Actions がビルドして、GitHub Pages に出し直します（`.github/workflows/pages.yml`）。
+
+## 手元で動かす
 
 [Node.js](https://nodejs.org/) 18.18 以上が必要です（24 で動作を確認しています）。
 
@@ -66,6 +72,7 @@ npm run start      # 生成物をローカルで確認
 | ファブリックのどこを通るのか | スパインが 2 台あるとき何が経路を選ぶか。ECMP とオーバーサブスクリプション |
 | GPU クラスタのネットワーク | なぜ 4 系統に分けるのか。計算ファブリックのノンブロッキングとレール最適化 |
 | GPU ジョブを配置する | 同じ 8 GPU でも、1 ノードに収まるか跨ぐかで 19ms と 350ms に分かれる |
+| PyTorch で学習を回す | 公式チュートリアルの学習コードを 1 行ずつ追う。各行が CPU・GPU・ストレージのどこで動くか、再開に何を保存するか |
 
 ### キーボード操作（スライドモード）
 
@@ -191,7 +198,7 @@ video:
 `npm run build` が生成する `out/` ディレクトリが完成品です。
 
 - **Cloudflare Pages / Vercel** — ビルドコマンド `npm run build`、出力ディレクトリ `out`
-- **GitHub Pages** — `out/` を公開ブランチに置く。リポジトリ名のサブパスで公開する場合は `next.config.ts` に `basePath` の指定を追加する
+- **GitHub Pages** — `.github/workflows/pages.yml` がビルドして出す。リポジトリ名のサブパスに置かれるので、環境変数 `NEXT_PUBLIC_BASE_PATH=/<リポジトリ名>` でビルドする（ワークフローが設定済み）
 
 進捗データはブラウザにしか保存されないため、公開しても閲覧者同士や運営者に学習履歴が共有されることはありません。
 

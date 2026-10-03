@@ -1,5 +1,6 @@
 import type { Course } from "@/lib/content";
 import { C, T } from "./figures/primitives";
+import { withBase } from "@/lib/base-path";
 
 const BOX_W = 204;
 const BOX_H = 62;
@@ -109,7 +110,7 @@ export function CourseMap({ courses, lessonCounts }: { courses: Course[]; lesson
         })}
 
         {[...placed.values()].map(({ course, lessons, x, y }) => (
-          <a key={course.id} href={`/courses/${course.id}/`} data-accent={course.accent}>
+          <a key={course.id} href={withBase(`/courses/${course.id}/`)} data-accent={course.accent}>
             <rect x={x} y={y} width={BOX_W} height={BOX_H} rx={10} fill={C.accentSoft} stroke={C.accent} strokeWidth={1.5} />
             <T x={x + BOX_W / 2} y={y + 24} size={14} weight={700} fill={C.fg} anchor="middle" middle>
               {course.title}

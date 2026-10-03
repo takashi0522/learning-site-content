@@ -4,6 +4,7 @@ import Link from "next/link";
 import type { Course } from "@/lib/content";
 import { useCourseProgress, useProgress } from "@/lib/progress";
 import { ProgressBar } from "./progress-bar";
+import { withBase } from "@/lib/base-path";
 
 export type CourseCardLesson = {
   /** lessonKey (`courseId/slug`)。既読の判定に使う */
@@ -31,7 +32,7 @@ export function CourseCard({ course, lessons, minutes }: CourseSummary) {
       {/* 装飾。-z-10 で本文の下、カード背景の上に入る (isolate で外へ抜けないようにしている) */}
       <div
         className="card-art absolute inset-0 -z-10"
-        style={{ backgroundImage: `url(/course-art/${course.id}.jpg)` }}
+        style={{ backgroundImage: `url(${withBase(`/course-art/${course.id}.jpg`)})` }}
         aria-hidden="true"
       />
       <div className="flex items-start justify-between gap-3">

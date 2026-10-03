@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { SearchEntry } from "@/lib/search-index";
+import { withBase } from "@/lib/base-path";
 
 const MAX_RESULTS = 30;
 /** 1 つのレッスンから出す節の上限。長いレッスンが結果を占領しないようにする */
@@ -88,7 +89,7 @@ export function SiteSearch() {
     inputRef.current?.select();
     if (index || loading.current) return;
     loading.current = true;
-    fetch("/search-index.json")
+    fetch(withBase("/search-index.json"))
       .then((res) => (res.ok ? res.json() : Promise.reject(res.status)))
       .then((data: SearchEntry[]) => setIndex(data))
       .catch(() => setFailed(true))
@@ -124,7 +125,7 @@ export function SiteSearch() {
 
   function go(href: string) {
     dialogRef.current?.close();
-    window.location.href = href;
+    window.location.href = withBase(href);
   }
 
   return (
@@ -180,7 +181,7 @@ export function SiteSearch() {
             {results.map((hit, i) => (
               <a
                 key={hit.entry.href + i}
-                href={hit.entry.href}
+                href={withBase(hit.entry.href)}
                 role="option"
                 aria-selected={i === active}
                 data-accent={hit.entry.accent}
