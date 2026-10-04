@@ -30,7 +30,9 @@ export type Course = {
     | "auth"
     | "buildout"
     | "gpunet"
-    | "mlwork";
+    | "mlwork"
+    | "storage"
+    | "genai";
   level: string;
   status: CourseStatus;
   /** コースページ冒頭の「このコースで学べること」。各レッスンの到達目標を 3〜4 項目にまとめたもの */
