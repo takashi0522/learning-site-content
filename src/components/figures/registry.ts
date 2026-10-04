@@ -24,6 +24,7 @@ import {
   SpineLeaf,
   TorEorMor,
 } from "./facility";
+import { AgentLoop, ApiStateless, ContextWindowContents, IndirectInjection, McpParticipants, RagPipeline, ToolUseRoundTrip } from "./genai";
 import { CudaStack, GpuContainerStack, GpuInterconnectPaths } from "./gpu";
 import { DcqcnLoop, EcmpVsAdaptive, PfcPause } from "./gpunet";
 import { NumaTopology, PcieNuma, PowerLossProtection } from "./hardware";
@@ -120,6 +121,13 @@ export const FIGURES = {
   "ceph-layers": CephLayers,
   "ceph-placement": CephPlacement,
   "protection-layers": ProtectionLayers,
+  "context-window-contents": ContextWindowContents,
+  "api-stateless": ApiStateless,
+  "rag-pipeline": RagPipeline,
+  "tool-use-round-trip": ToolUseRoundTrip,
+  "mcp-participants": McpParticipants,
+  "agent-loop": AgentLoop,
+  "indirect-injection": IndirectInjection,
 } satisfies Record<string, ComponentType>;
 
 export type FigureName = keyof typeof FIGURES;

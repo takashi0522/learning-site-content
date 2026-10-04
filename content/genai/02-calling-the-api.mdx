@@ -1,0 +1,170 @@
+---
+title: API で呼ぶ — 要求・応答・トークンの請求
+description: 生成 AI を自分のツールや業務に組み込むときは、API で呼びます。1 回の要求と応答の形、API が会話を覚えていないこと、料金が入力と出力のトークンで決まること、出力の形を JSON で縛る方法を、Claude の API のドキュメントで見ます。
+order: 2
+minutes: 18
+tags: ["Messages API", "stateless", "usage", "pricing", "prompt-caching", "structured-outputs"]
+objectives:
+  - API の要求と応答の主な項目（model・max_tokens・messages・stop_reason・usage）を説明できる
+  - API が状態を持たず、会話の履歴をアプリケーションが送り直す仕組みを説明できる
+  - 入力・出力・キャッシュのトークンから、1 回の要求の料金を見積もれる
+  - 出力の形を JSON スキーマで縛る理由を説明できる
+references:
+  - label: "Claude Docs — Using the Messages API"
+    url: "https://platform.claude.com/docs/en/build-with-claude/working-with-messages"
+  - label: "Claude Docs — Pricing（2026 年 10 月時点）"
+    url: "https://platform.claude.com/docs/en/about-claude/pricing"
+  - label: "Claude Docs — Structured outputs"
+    url: "https://platform.claude.com/docs/en/build-with-claude/structured-outputs"
+  - label: "Claude Docs — Models overview"
+    url: "https://platform.claude.com/docs/en/about-claude/models/overview"
+---
+
+## 1 回の要求と応答
+
+Claude のドキュメントにある、いちばん小さな要求の例です。
+
+```bash
+curl https://api.anthropic.com/v1/messages \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "claude-opus-5-5",
+    "max_tokens": 1024,
+    "messages": [
+      {"role": "user", "content": "Hello, Claude"}
+    ]
+  }'
+```
+
+| 項目 | 意味 |
+| --- | --- |
+| `model` | 使うモデル。上の例は Claude Opus 5.5 |
+| `max_tokens` | 今回の出力の上限（トークン） |
+| `messages` | 会話。`user`（利用者）と `assistant`（モデル）の発言を並べる |
+
+API キーは `x-api-key` ヘッダで送ります。キーは料金の請求先そのものなので、パスワードと同じく秘密として扱い、コードやリポジトリに書き込みません。
+
+---
+
+<h2 className="slide-cont">1 回の要求と応答（続き）</h2>
+
+応答はこうなります（ドキュメントの例）。
+
+```json
+{
+  "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+  "type": "message",
+  "role": "assistant",
+  "content": [{ "type": "text", "text": "Hello!" }],
+  "model": "claude-opus-5-5",
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 12, "output_tokens": 6 }
+}
+```
+
+見るところは 2 つです。
+
+- **`stop_reason`**: なぜ止まったか。`end_turn` は話し終えた、`max_tokens` は上限で打ち切られた（ドキュメントの別の例に出てくる）。打ち切られた出力は、途中で切れている
+- **`usage`**: この要求で使った入力と出力のトークン数。**料金はこの数で決まる**
+
+---
+
+## API は会話を覚えていない
+
+ドキュメントは、Messages API は**状態を持たない（stateless）**ので、**いつも会話の履歴をすべて送る**と書いています。
+
+<Figure name="api-stateless" caption="2 回目の質問をするには、1 回目の質問と応答も一緒に送る" source="Claude Docs — Using the Messages API を元に作図" />
+
+チャットの画面で「さっきの話の続き」が通じるのは、画面の裏でアプリケーションが履歴を毎回送り直しているからです。ここから、基盤の側で考えることが 2 つ出てきます。
+
+- **会話の履歴を保存する場所**は、アプリケーションの側に要る（データベースなど）
+- 会話が長くなるほど、**1 回あたりの入力のトークンが増え**、料金もレイテンシも増える（レッスン 1 のコンテキストウィンドウ）
+
+ドキュメントによると、履歴の中の `assistant` の発言は、実際に Claude が返したものである必要はありません。アプリケーションが作った例を入れることもできます。
+
+---
+
+## 料金はトークンで決まる
+
+Claude の料金は、**100 万トークン（MTok）あたりの単価**で、入力と出力で別に決まっています。2026 年 10 月時点の料金ページから、現行のモデルのうち 3 つを抜き出します（最上位の Claude Fable 5.1 は入力 $10・出力 $50）。
+
+| モデル | 入力 | 出力 |
+| --- | --- | --- |
+| Claude Opus 5.5 | $4 / MTok | $20 / MTok |
+| Claude Sonnet 5.5 | $2 / MTok | $10 / MTok |
+| Claude Haiku 4.5 | $1 / MTok | $5 / MTok |
+
+どのモデルも（Fable 5.1 も）、**出力の単価は入力の 5 倍**です。たとえば Sonnet 5.5 に 1 万トークンを入力して 1 千トークンの答えを得ると、入力が 0.02 ドル、出力が 0.01 ドルで、計 0.03 ドルです。
+
+料金ページは、Claude 4.6 以降のモデルでは、100 万トークンのコンテキスト全体を**同じ単価**で使える（90 万トークンの要求も 9 千トークンの要求も、トークンあたりの単価は同じ）と書いています。単価は同じでも、トークンの数だけ料金は増えます。
+
+---
+
+<h2 className="slide-cont">料金はトークンで決まる（続き）</h2>
+
+同じ内容を何度も送るときに効く割引が、料金ページに 2 つ載っています。
+
+| 仕組み | 料金ページの説明 |
+| --- | --- |
+| **プロンプトキャッシュ** | 同じ先頭部分を再利用すると、読み出しは入力の単価の 0.1 倍（Opus 5.5 だけ 0.05 倍、Fable 5.1 は 0.025 倍）。書き込みは 5 分のキャッシュで 1.25 倍、1 時間で 2 倍。5 分のキャッシュなら 1 回読めば元が取れる |
+| **Batch API** | すぐに答えが要らない大量の要求を非同期で処理すると、入力も出力も **50% 引き** |
+
+長いシステムプロンプトや、毎回同じ資料を先頭に付ける使い方では、キャッシュが大きく効きます。夜間にまとめて分類する、といった仕事は Batch の候補です。
+
+---
+
+## 出力の形を縛る — Structured outputs
+
+アプリケーションに組み込むと、モデルの出力をプログラムで読みたくなります。ドキュメントは、スキーマで縛らないと、**壊れた JSON、必須の項目の欠落、型の不一致**が起きうると書いています。
+
+**Structured outputs** は、JSON スキーマを `output_config.format` で渡し、応答がそのスキーマに合うように生成を制約します（constrained decoding）。ドキュメントは、これでスキーマに合う応答が保証され、`JSON.parse()` のエラーも、スキーマ違反による呼び直しも要らなくなるとしています。ただし同じページは、モデルが応答を拒否した場合（`stop_reason` が `refusal`）は、拒否の文言が優先されてスキーマに合わないことがあるとも書いています。`max_tokens` で打ち切られた場合も、`stop_reason` を確かめます。
+
+<Callout type="note" title="古い書き方が使えないモデルがある">
+
+ドキュメントによると、Claude 4.6 以降のモデルでは、応答の書き出しをこちらで決める「prefill」は使えず（400 エラー）、Structured outputs かシステムプロンプトでの指示に置き換えます。Claude 4.7 以降のモデルでは、`temperature`・`top_p`・`top_k` を既定以外の値にすると 400 エラーになります。ネットで見つかる古いサンプルコードは、そのままでは動かないことがあります。
+
+</Callout>
+
+---
+
+## まとめ
+
+- 要求は `model`・`max_tokens`・`messages`。応答の **`stop_reason`** で止まった理由を、**`usage`** で使ったトークンを見る
+- API は**状態を持たない**。会話の履歴はアプリケーションが持ち、毎回すべて送り直す。会話が長いほど入力が増える
+- 料金は **100 万トークンあたりの単価 × トークン数**。出力の単価は入力の 5 倍（現行のモデル、2026 年 10 月時点）
+- 同じ先頭部分の再利用は**プロンプトキャッシュ**、急がない大量処理は **Batch API**（50% 引き）
+- プログラムで読む出力は **Structured outputs** で JSON スキーマに縛る
+- API キーは請求先そのもの。秘密として扱う
+
+---
+
+<Quiz
+  id="q1"
+  question="チャットボットを作っています。1 回目の要求で「サーバーの名前は web-01 です」と伝え、2 回目の要求では「さっきのサーバーの OS を調べる手順は？」だけを送りました。ところが、モデルはサーバーの名前を知らないと答えました。理由として正しいものはどれですか。"
+  options={[
+    "モデルの記憶容量が足りなかったため。より大きなモデルを使えば覚えている",
+    "Messages API は状態を持たないため。2 回目の要求にも、1 回目の質問と応答を含む会話の履歴を送る必要がある",
+    "temperature が高すぎたため",
+    "1 回目の要求の max_tokens が小さすぎたため"
+  ]}
+  answer={1}
+  explanation="Claude のドキュメントによると、Messages API は状態を持たないので、いつも会話の履歴をすべて送ります。チャットの画面で続きの話が通じるのは、アプリケーションが毎回履歴を送り直しているからです。2 回目の要求に 1 回目の質問と応答を含めれば、モデルはその内容を参照できます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="毎回同じ 5 万トークンの社内手順書を先頭に付けて、短い質問に答えさせる社内ツールがあります。料金を下げたいとき、Claude の料金ページの説明に照らして最も効く手はどれですか。"
+  options={[
+    "出力の max_tokens を小さくする。料金は出力だけで決まるため",
+    "先頭の手順書をプロンプトキャッシュに載せる。読み出しは入力の単価の 0.1 倍（Opus 5.5 は 0.05 倍）で、5 分のキャッシュなら 1 回読めば書き込みの割増を取り返せる",
+    "temperature を 0 にする",
+    "コンテキストウィンドウの大きいモデルに替える。大きいほど単価が下がる"
+  ]}
+  answer={1}
+  explanation="料金ページによると、プロンプトキャッシュの読み出しは入力の単価の 0.1 倍（Claude Opus 5.5 は 0.05 倍）で、5 分のキャッシュの書き込みは 1.25 倍です。同じ先頭部分を毎回送る使い方では、2 回目以降の手順書の分が大きく安くなり、5 分のキャッシュなら 1 回読めば元が取れます。料金は入力と出力の両方で決まり、ウィンドウの大きさで単価は下がりません。"
+/>
