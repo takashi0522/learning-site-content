@@ -39,6 +39,7 @@ COURSES = {
     "mlwork": "repeating loop of curved arrows, spiral iterations, rising steps",
     "storage": "tall shelves of identical rectangular cartridges in a quiet archive hall, orderly grid",
     "genai": "branching threads of text-like strokes unfolding from a single point, chain of small nodes",
+    "platform": "orderly stack of identical server trays with a lattice of thin connecting lines, layered foundation",
 }
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_raw", "course")

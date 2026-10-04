@@ -29,6 +29,7 @@ import { CudaStack, GpuContainerStack, GpuInterconnectPaths } from "./gpu";
 import { DcqcnLoop, EcmpVsAdaptive, PfcPause } from "./gpunet";
 import { NumaTopology, PcieNuma, PowerLossProtection } from "./hardware";
 import { CephLayers, CephPlacement, FileVsObject, LustreFileLayout, NfsClientCaches, NfsCloseToOpen, PflComponents, ProtectionLayers, StoragePerfAxes } from "./storage";
+import { DeviceAssignment, GpuSharingModes, K8sControlFlow, NetbootFlow, RequestsLimits, ServiceRouting } from "./platform";
 import { ContainerParts, DemandPaging, FdToInode, SyscallBoundary } from "./linux";
 import {
   CheckpointContents,
@@ -128,6 +129,12 @@ export const FIGURES = {
   "mcp-participants": McpParticipants,
   "agent-loop": AgentLoop,
   "indirect-injection": IndirectInjection,
+  "k8s-control-flow": K8sControlFlow,
+  "service-routing": ServiceRouting,
+  "requests-limits": RequestsLimits,
+  "netboot-flow": NetbootFlow,
+  "device-assignment": DeviceAssignment,
+  "gpu-sharing-modes": GpuSharingModes,
 } satisfies Record<string, ComponentType>;
 
 export type FigureName = keyof typeof FIGURES;

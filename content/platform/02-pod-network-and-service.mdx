@@ -1,0 +1,135 @@
+---
+title: Pod のネットワークと Service
+description: Kubernetes のネットワークは、Pod ごとに IP を持たせ、どの Pod とも NAT なしで通信できることを前提にしています。その前提を誰が実現しているのか（CNI プラグイン・kube-proxy）、入れ替わる Pod に動かない名前と IP を与える Service、そしてベアメタルで外から入るときに足りないものを見ます。
+order: 2
+minutes: 20
+tags: ["Kubernetes", "CNI", "Service", "ClusterIP", "kube-proxy", "CoreDNS", "NetworkPolicy"]
+objectives:
+  - Kubernetes のネットワークモデルが Pod に何を約束しているかを説明できる
+  - そのモデルを実現する部品（CRI・CNI プラグイン・サービスのプロキシ）の分担を説明できる
+  - Service・ClusterIP・EndpointSlice・DNS の関係を説明できる
+  - Service の種類の違いと、ベアメタルで LoadBalancer を使うときに要るものを説明できる
+references:
+  - label: "Kubernetes Documentation — Services, Load Balancing, and Networking（The Kubernetes network model）"
+    url: "https://kubernetes.io/docs/concepts/services-networking/"
+  - label: "Kubernetes Documentation — Network Plugins"
+    url: "https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/"
+  - label: "Kubernetes Documentation — Service"
+    url: "https://kubernetes.io/docs/concepts/services-networking/service/"
+---
+
+## Pod には、それぞれ IP がある
+
+ドキュメントによると、Kubernetes のネットワークモデルは次のような約束からできています。
+
+- クラスタの中の **Pod は、それぞれクラスタ全体で一意の IP アドレス**を持つ
+- Pod の中のコンテナは 1 つのネットワーク namespace を共有し、**`localhost` で互いに通信できる**
+- **すべての Pod は、同じノードでも別のノードでも、プロキシやアドレス変換（NAT）なしに直接通信できる**（意図的に分けた場合を除く）
+- ノードの上のエージェント（kubelet など）は、そのノードのすべての Pod と通信できる
+
+ドキュメントは、古いコンテナの仕組みでは、別のホストのコンテナとつなぐためにコンテナのポートをホストのポートに割り当てる必要があったが、Kubernetes では不要で、**Pod を仮想マシンや物理ホストのように扱える**、と書いています。
+
+---
+
+## その約束を、誰が実現しているか
+
+ドキュメントは、このモデルのうち **Kubernetes 自身が実装しているのは一部だけ**で、残りは Kubernetes が API を決め、**外部の部品**が実現する、と書いています。
+
+| 役割 | 担当（ドキュメント） |
+| --- | --- |
+| Pod のネットワーク namespace を作る | コンテナランタイム（CRI を実装するソフトウェア） |
+| Pod のネットワークそのもの | **Pod ネットワークの実装**。Linux では多くが CNI を使うので **CNI プラグイン**と呼ばれる |
+| Service の通信の転送 | 既定は **kube-proxy**。CNI の実装によっては、自前のプロキシで置き換える |
+| NetworkPolicy（Pod 間の通信の制御） | ふつう Pod ネットワークの実装が受け持つ |
+
+Network Plugins のページによると、CNI プラグインは CNI の仕様 v0.4.0 以降に対応している必要があり、v1.0.0 への対応が推奨されています。Kubernetes 1.24 からは、CNI の管理は kubelet の役割から外れ、コンテナランタイムが CNI のプラグインを読み込むようになりました。
+
+<Callout type="pitfall" title="NetworkPolicy を書いたのに、効かない">
+
+ドキュメントによると、単純な Pod ネットワークの実装には NetworkPolicy を実装しないものがあり、管理者が NetworkPolicy なしで構成することもあります。その場合、**API は存在するのに、何の効果もありません**。ポリシーを作ってもエラーにはならないので、通信を絞ったつもりで素通しになっていることに気づきにくい。CNI プラグインを選ぶときに、NetworkPolicy への対応を確かめます。
+
+</Callout>
+
+---
+
+## Service — 入れ替わる Pod に、動かない名前と IP を
+
+Pod は使い捨てです（レッスン 1）。Service のドキュメントも、ある時点で動いている Pod の集まりは、少しあとには別の集まりになりうると書いています。ドキュメントは、**Service** を、Pod の集まりをネットワークに公開するための抽象だと説明しています。たとえば 3 つの複製で動く処理のバックエンドなら、フロントエンドはどの Pod を使うかを気にせず、Pod が入れ替わっても知る必要がありません。
+
+<Figure name="service-routing" caption="名前（DNS）→ 動かない IP（ClusterIP）→ そのときの Pod（EndpointSlice）" source="Kubernetes Documentation — Service を元に作図" />
+
+- Service の対象の Pod は、ふつう**ラベルの selector** で決まる
+- Service を作ると、既定では**クラスタ内の IP（cluster IP）**が割り当てられる
+- Service のコントローラは、selector に合う Pod を探し続け、**EndpointSlice**（今の Pod の一覧）を更新する
+- サービスのプロキシ（kube-proxy など）は Service と EndpointSlice を見張り、**OS の機能でパケットを横取り・書き換えて**、Pod に届ける
+
+---
+
+<h2 className="slide-cont">Service（続き）</h2>
+
+### 名前で探す — DNS
+
+ドキュメントは、クラスタには **DNS のサービスをほぼ必ず用意すべき**だと書いています。CoreDNS のようなクラスタ対応の DNS サーバーは、新しい Service を見張って DNS のレコードを作ります。
+
+- namespace `my-ns` の Service `my-service` は、同じ namespace の Pod からは `my-service`、ほかの namespace からは `my-service.my-ns` で引ける
+- 返るのは Service の cluster IP
+
+### Pod を直接引きたいとき — headless
+
+`.spec.clusterIP` を `None` にすると **headless Service** になります。ドキュメントによると、cluster IP は割り当てられず、kube-proxy も扱わず、負荷分散もしません。代わりに **DNS が個々の Pod の IP を返し**、クライアントは好きな Pod に直接つなぎます。
+
+分散学習のように、**各プロセスが特定の相手と直接つながる**必要がある使い方（「GPU の使われ方」コース レッスン 2）では、ロードバランサを挟む通常の Service より、こちらの形が合う場面があります（このコースの見立て）。
+
+---
+
+## Service の種類と、ベアメタルで足りないもの
+
+| `type` | ドキュメントの説明 |
+| --- | --- |
+| `ClusterIP`（既定） | クラスタ内の IP で公開する。クラスタの中からだけ届く |
+| `NodePort` | 各ノードの IP の決まったポート（既定の範囲は **30000〜32767**。`--service-node-port-range` で変えられる）で公開する。どのノードでも同じ番号 |
+| `LoadBalancer` | 外部のロードバランサで公開する。**Kubernetes 自体はロードバランサの部品を持たない**ので、自分で用意するか、クラウドと連携させる |
+| `ExternalName` | クラスタの DNS が、指定した外部のホスト名の `CNAME` を返す。転送はしない |
+
+ドキュメントによると、外部のロードバランサに対応したクラウドでは `LoadBalancer` を作るとロードバランサが用意されます。Kubernetes 自体はその部品を持たないので、**クラウドとの連携が無いオンプレのベアメタルでは、自分で用意する必要があります**（このコースの整理）。ロードバランサの実装を別に入れるか、`NodePort` や、Gateway API（Ingress の後継）の実装で入口を作ります。ドキュメントも、Gateway API の実装には「ベアメタル」の環境に向けたものがある、と書いています。
+
+---
+
+## まとめ
+
+- Pod は**それぞれ IP を持ち**、すべての Pod と **NAT なしで直接**通信できる。Pod の中のコンテナは `localhost` でつながる
+- Kubernetes が決めるのは API まで。Pod のネットワークは **CNI プラグイン**、Service の転送は **kube-proxy**（または CNI の自前のプロキシ）が実現する
+- **NetworkPolicy は CNI が実装していないと、作っても効果がない**
+- **Service** は、入れ替わる Pod に動かない **cluster IP と DNS 名**を与える。今の Pod の一覧は **EndpointSlice**
+- **headless** は DNS が Pod の IP を直接返す。相手を選んで直接つなぐ使い方に合う
+- `LoadBalancer` の実体は Kubernetes に無い。**ベアメタルでは別に用意する**
+
+---
+
+<Quiz
+  id="q1"
+  question="オンプレのクラスタで、namespace 間の通信を禁止する NetworkPolicy を作りました。kubectl はエラーなく受け付けましたが、別の namespace の Pod から相変わらず通信できます。最も考えられる原因はどれですか。"
+  options={[
+    "NetworkPolicy は作ってから 24 時間たたないと有効にならない",
+    "NetworkPolicy はふつう Pod ネットワークの実装（CNI プラグイン）が実現する。使っている実装が対応していない、または対応なしで構成されていると、API は存在しても効果がない",
+    "kube-scheduler が NetworkPolicy を処理していない",
+    "NetworkPolicy は同じ namespace の中でしか使えない"
+  ]}
+  answer={1}
+  explanation="Kubernetes のドキュメントによると、NetworkPolicy は一般に Pod ネットワークの実装が受け持ち、単純な実装には NetworkPolicy を実装しないものがあります。管理者が対応なしで構成することもあり、その場合 API は存在しても効果がありません。作成時にエラーにならないので、CNI プラグインの対応を確かめる必要があります。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="オンプレのベアメタルのクラスタで type: LoadBalancer の Service を作りましたが、外部の IP がいつまでも割り当てられません。ドキュメントに照らして、理由として正しいものはどれですか。"
+  options={[
+    "LoadBalancer は ClusterIP より新しい機能なので、v1.37 では使えない",
+    "Kubernetes 自体はロードバランサの部品を持たず、自分で用意するかクラウドと連携させる必要がある。ベアメタルでは、ロードバランサの実装を別に入れるか、NodePort や Gateway API の実装で入口を作る",
+    "CoreDNS が止まっているため",
+    "Service の selector に合う Pod が無いため、IP が割り当てられない"
+  ]}
+  answer={1}
+  explanation="Service のドキュメントは、LoadBalancer は外部のロードバランサで Service を公開するもので、Kubernetes はロードバランサの部品を直接は提供せず、自分で用意するかクラウドと連携させる必要があると書いています。クラウドでは連携によって自動で割り当てられますが、ベアメタルではそのままでは割り当てる仕組みがありません。"
+/>

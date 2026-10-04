@@ -134,6 +134,10 @@
   --accent: oklch(50% 0.13 285);
   --accent-soft: oklch(94% 0.04 285);
 }
+[data-accent="platform"] {
+  --accent: oklch(52% 0.15 350);
+  --accent-soft: oklch(94% 0.04 350);
+}
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) [data-accent="linux"] {
@@ -206,6 +210,11 @@
     --accent-soft: oklch(30% 0.05 285);
     --accent-fg: oklch(17% 0.02 265);
   }
+  :root:not([data-theme="light"]) [data-accent="platform"] {
+    --accent: oklch(78% 0.13 350);
+    --accent-soft: oklch(30% 0.05 350);
+    --accent-fg: oklch(17% 0.02 265);
+  }
 }
 
 :root[data-theme="dark"] [data-accent="linux"] {
@@ -276,6 +285,11 @@
 :root[data-theme="dark"] [data-accent="genai"] {
   --accent: oklch(78% 0.12 285);
   --accent-soft: oklch(30% 0.05 285);
+  --accent-fg: oklch(17% 0.02 265);
+}
+:root[data-theme="dark"] [data-accent="platform"] {
+  --accent: oklch(78% 0.13 350);
+  --accent-soft: oklch(30% 0.05 350);
   --accent-fg: oklch(17% 0.02 265);
 }
 

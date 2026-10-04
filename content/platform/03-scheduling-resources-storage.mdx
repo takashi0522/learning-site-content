@@ -1,0 +1,177 @@
+---
+title: スケジューリング・リソース・ストレージ
+description: Pod はどのノードに置かれ、どれだけの CPU とメモリを使えるのか。スケジューラが見ているもの、requests と limits の違い、GPU のような拡張リソースの数え方、そして Pod より長生きするデータを持つ永続ボリュームの仕組みを見ます。
+order: 3
+minutes: 22
+tags: ["Kubernetes", "kube-scheduler", "requests", "limits", "extended-resources", "PersistentVolume", "StorageClass"]
+objectives:
+  - スケジューラがノードを選ぶ 2 段階（絞り込みと採点）と、requests の役割を説明できる
+  - requests と limits の違いと、CPU とメモリで上限の効き方が違うことを説明できる
+  - GPU のような拡張リソースが、どう数えられ割り当てられるかを説明できる
+  - PersistentVolume・PersistentVolumeClaim・StorageClass と、回収ポリシーの既定を説明できる
+references:
+  - label: "Kubernetes Documentation — Kubernetes Scheduler（2026 年 10 月時点、v1.37 系）"
+    url: "https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/"
+  - label: "Kubernetes Documentation — Resource Management for Pods and Containers"
+    url: "https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
+  - label: "Kubernetes Documentation — Persistent Volumes"
+    url: "https://kubernetes.io/docs/concepts/storage/persistent-volumes/"
+---
+
+## スケジューラは、どのノードを選ぶか
+
+ドキュメントによると、スケジューラは、**まだノードが決まっていない Pod** を見つけるたびに、その Pod に最も適したノードを探す役を負います。選び方は 2 段階です。
+
+1. **絞り込み（filtering）**: Pod の要求を満たせるノード（feasible なノード）だけを残す。たとえば、Pod の要求するリソースが空いているかを確かめる
+2. **採点（scoring）**: 残ったノードに点数を付け、**最も点の高いノード**を選ぶ。決めた結果を API サーバーに伝える（binding）
+
+どのノードも要求を満たせなければ、**Pod は置ける場所が見つかるまで割り当てられないまま**になります。判断の材料には、リソースの要求のほか、ハードウェアやポリシーの制約、affinity（どのノードや Pod の近くに置くか）などが含まれる、とドキュメントは書いています。
+
+---
+
+## requests と limits
+
+コンテナには、CPU とメモリの **requests**（要求量）と **limits**（上限）を書けます。2 つは、効くタイミングが違います。
+
+<Figure name="requests-limits" caption="スケジュールは requests の合計で決まり、実行中の上限は limits で効く" source="Kubernetes Documentation — Resource Management for Pods and Containers を元に作図" />
+
+ドキュメントによると、スケジューラは、ノードごとに**置かれた Pod の requests の合計が、ノードの容量を超えない**ようにします。**実際の使用量がとても少なくても、この確認に通らなければ置きません**。後で使用量が増えたとき（毎日のピークなど）にノードの資源が足りなくなるのを防ぐためです。
+
+---
+
+<h2 className="slide-cont">requests と limits（続き）</h2>
+
+実行中の上限の効き方は、CPU とメモリで違います（ドキュメント）。
+
+| | CPU | メモリ |
+| --- | --- | --- |
+| requests を超えて使えるか | ノードに空きがあれば使える | ノードに空きがあれば使える |
+| limits の効き方 | **絞られる**（カーネルが CPU の時間を制限する。ドキュメントは長い時間 limits を超えられるかは場合による、とも書いている）。CPU の使いすぎを理由に止められはしない | **止められうる**（limits を超えて確保しようとすると、カーネルの OOM がプロセスを止めることがある）。止めるのはカーネルがメモリの逼迫を検知したとき |
+| その他 | requests は、混み合ったときの CPU 時間の重みにもなる（ふつう） | メモリが全体に不足すると、requests を超えて使っているコンテナの Pod は追い出されやすい |
+
+limits だけを書いて requests を書かないと、Kubernetes は limits の値を requests として使います。
+
+<Callout type="pitfall" title="メモリ上の emptyDir は、メモリとして数えられる">
+
+ドキュメントによると、メモリに置く `emptyDir`（`tmpfs`）は、コンテナの**メモリの使用量**として数えられ、メモリの limits が掛かります。大きさの上限を書かず、メモリの limits も書かないと、**ノードのメモリを使い切れてしまい**、OOM を招きうる、と注意しています。学習のデータローダが共有メモリ（`/dev/shm`）を使う話は、AI 基盤コース レッスン 5 で扱いました。
+
+</Callout>
+
+---
+
+## 置けないときの読み方
+
+Pod が置けないと、スケジューラはそのたびにイベントを残します。ドキュメントの例です。
+
+```text
+Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+  Warning  FailedScheduling  23s   default-scheduler  0/42 nodes available: insufficient cpu
+```
+
+42 台のどのノードにも、CPU の requests を満たす空きが無い、という意味です。ドキュメントが挙げる確かめ方は、ノードを足す・不要な Pod を消す・**Pod がどのノードより大きくないか**を確かめる・ノードの taint（特定の Pod 以外を寄せつけない印）を確かめる、です。
+
+ノードの容量と割り当て済みの量は、`kubectl describe nodes` で見ます（ドキュメントの例を抜粋）。
+
+```text
+Capacity:
+ cpu:                               2
+ memory:                            7679792Ki
+Allocatable:
+ cpu:                               1800m
+ memory:                            7474992Ki
+Allocated resources:
+  CPU Requests    CPU Limits    Memory Requests    Memory Limits
+  680m (34%)      400m (20%)    920Mi (11%)        1070Mi (13%)
+```
+
+`Capacity`（物理的な量）と `Allocatable`（Pod に割り当てられる量）は違います。`cpu` の `1800m` は 1.8 コアです。
+
+---
+
+## GPU は「拡張リソース」として数える
+
+CPU とメモリのほかに、Kubernetes の組み込みではない資源を扱う仕組みが**拡張リソース**です。GPU（たとえば `nvidia.com/gpu`）は、この形で扱われます（AI 基盤コース レッスン 5 の device plugin）。ドキュメントによると、拡張リソースには次の性質があります。
+
+- **整数でしか数えない**。`0.5` や `1500m`（1.5）は不正な値
+- **重ねて割り当てない（オーバーコミットしない）**。requests と limits の両方を書くなら、同じ値にする
+- スケジューラが勘定し、同時に割り当てる量が空きを超えないようにする
+
+拡張リソースは整数で、重ねて割り当てないので、`nvidia.com/gpu: 1` を要求した Pod には、その資源が 1 単位まるごと割り当てられます。1 枚の GPU を分けて使う方法（MIG など）は、GPU コース レッスン 4 とこのコースのレッスン 6 で扱います。
+
+---
+
+## Pod より長生きするデータ — 永続ボリューム
+
+Pod は使い捨てなので、Pod の中に書いたデータは Pod とともに消えます。ドキュメントは、ストレージの扱いを 2 つの API に分けています。
+
+| オブジェクト | 意味（ドキュメント） |
+| --- | --- |
+| **PersistentVolume（PV）** | クラスタの中のストレージの一片。管理者が用意するか、StorageClass で**動的に**作られる。**使う Pod とは独立した寿命**を持つ。NFS・iSCSI などの実装の詳細を持つ |
+| **PersistentVolumeClaim（PVC）** | 利用者による**ストレージの要求**。Pod がノードの資源を使うように、PVC は PV を使う。大きさとアクセスモードを指定する |
+| **StorageClass** | 性能などの違う種類のストレージを、実装を見せずに用意するための「クラス」 |
+
+アクセスモードは 4 つです。
+
+| モード | 意味 |
+| --- | --- |
+| `ReadWriteOnce`（RWO） | **1 つのノード**から読み書きできる（同じノードの複数の Pod からは使える） |
+| `ReadOnlyMany`（ROX） | 多数のノードから読み取りだけ |
+| `ReadWriteMany`（RWX） | **多数のノードから読み書き** |
+| `ReadWriteOncePod`（RWOP） | クラスタ全体で **1 つの Pod** だけが読み書き（CSI のボリュームのみ。v1.29 で stable） |
+
+複数のノードの学習ジョブが同じデータを読み書きするなら RWX が要り、それはファイルストレージ（NFS など）で実現するのがふつうです（AI 基盤コース レッスン 7、ファイルストレージコース）。
+
+---
+
+<h2 className="slide-cont">永続ボリューム（続き）</h2>
+
+<Callout type="pitfall" title="PVC を消すと、データも消える（既定）">
+
+PVC を消したあと PV をどうするかは、**回収ポリシー**で決まります。ドキュメントによると、`Retain` なら PV とデータは残り、管理者が手で片付けます。`Delete` なら、**PV と、外部のストレージにある実体の両方が削除されます**。
+
+そして、**動的に作られた PV は StorageClass の回収ポリシーを引き継ぎ、その既定は `Delete`** です。ドキュメントは、管理者が利用者の期待に合わせて StorageClass を設定すべきだと書いています。チェックポイントのような消えては困るデータを置くクラスには、`Retain` を検討します。
+
+</Callout>
+
+---
+
+## まとめ
+
+- スケジューラは、**絞り込み → 採点**でノードを選ぶ。満たせるノードが無ければ、Pod は割り当てられないまま
+- スケジュールは **requests の合計**で決まる。実際の使用量が少なくても、requests が入らなければ置かない
+- **limits** は実行中に効く。CPU は**絞られ**、メモリは **OOM で止められうる**。メモリの `emptyDir` はメモリとして数える
+- 置けない理由は `FailedScheduling` のイベントで、容量は `kubectl describe nodes` の `Allocatable` で見る
+- GPU は**拡張リソース**。**整数で数え、重ねて割り当てない**
+- データは **PV / PVC / StorageClass** で持つ。複数ノードから読み書きするなら **RWX**。動的な PV の回収ポリシーの既定は **`Delete`**
+
+---
+
+<Quiz
+  id="q1"
+  question="GPU ノードの実際の CPU 使用率は 20% 程度なのに、新しい学習の Pod が Pending のまま、FailedScheduling（insufficient cpu）のイベントが出ています。ドキュメントに照らして、最も考えられる理由はどれですか。"
+  options={[
+    "スケジューラは実際の使用率を見ているので、計測の誤りである",
+    "スケジューラは、置かれた Pod の requests の合計がノードの容量を超えないかで判断する。実際の使用量が少なくても、既存の Pod の requests が大きく、新しい Pod の requests が入らない",
+    "CPU の limits を超えたので、Pod が止められた",
+    "GPU の拡張リソースが小数で指定されている"
+  ]}
+  answer={1}
+  explanation="Kubernetes のドキュメントによると、スケジューラはノードごとに、スケジュールされたコンテナの requests の合計が容量を超えないようにします。実際の CPU やメモリの使用量がとても低くても、この確認に通らなければ Pod を置きません。kubectl describe nodes で Allocatable と、割り当て済みの requests を確かめます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="StorageClass から動的に作った PVC にチェックポイントを置いていました。ジョブを片付けるつもりで PVC を削除したところ、ストレージの実体のデータも消えました。ドキュメントに照らして、この挙動の説明として正しいものはどれですか。"
+  options={[
+    "PVC を消しても、データは必ず残る。ストレージの故障を疑う",
+    "動的に作られた PV は StorageClass の回収ポリシーを引き継ぎ、その既定は Delete。Delete では PV と外部のストレージの実体の両方が削除される。消えては困るデータには Retain のクラスを使う",
+    "PVC を消すと、Recycle で中身が消去されるのが既定である",
+    "RWO のボリュームだけが、PVC の削除で消える"
+  ]}
+  answer={1}
+  explanation="Persistent Volumes のドキュメントによると、Delete の回収ポリシーでは、Kubernetes の PersistentVolume と、外部のインフラにある実体の両方が削除されます。動的に作られたボリュームは StorageClass の回収ポリシーを引き継ぎ、その既定は Delete です。管理者は利用者の期待に合わせて StorageClass を設定するよう求められています。Retain なら PV とデータは残り、管理者が手で片付けます。"
+/>

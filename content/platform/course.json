@@ -1,0 +1,16 @@
+{
+  "title": "基盤の土台 — Kubernetes・プロビジョニング・仮想化",
+  "subtitle": "Platform Foundations",
+  "description": "GPU を載せたサーバーを、利用者が使える計算資源にするまでの土台。Kubernetes の仕組み（構成・ネットワーク・スケジューリング・ストレージ）、ベアメタルの OS をネットワークから入れるプロビジョニング、仮想化と GPU の分け方を扱います。",
+  "order": 15,
+  "accent": "platform",
+  "level": "基礎 → 実務",
+  "status": "ready",
+  "goals": [
+    "Kubernetes が「望む状態」に近づけるループで動いていることを、部品の役割から説明できる",
+    "Pod のネットワークと Service、リソースの要求と上限、永続ボリュームの仕組みを説明できる",
+    "ベアメタルのサーバーに、ネットワークから OS を入れて初期設定するまでの流れを説明できる",
+    "仮想化での GPU の渡し方（パススルー・vGPU・MIG）の違いを説明できる"
+  ],
+  "prerequisites": ["linux", "network"]
+}

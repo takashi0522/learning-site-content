@@ -1,0 +1,171 @@
+---
+title: Kubernetes の構成 — 望む状態に近づけるループ
+description: Kubernetes は、利用者が書いた「望む状態」に、実際の状態を近づけ続ける仕組みです。コントロールプレーンとノードの部品の役割、コントローラのループ、Pod という単位、そして Deployment を例に、望む状態がどう Pod になるかを見ます。
+order: 1
+minutes: 20
+tags: ["Kubernetes", "control-plane", "kubelet", "controller", "Pod", "Deployment"]
+objectives:
+  - コントロールプレーンとノードの部品の役割を説明できる
+  - コントローラが「望む状態」と「現在の状態」を近づけるループであることを説明できる
+  - Pod が何をまとめた単位で、なぜ直接は作らないのかを説明できる
+  - Deployment・ReplicaSet・Pod の関係を、kubectl の出力から読める
+references:
+  - label: "Kubernetes Documentation — Kubernetes Components（2026 年 10 月時点、v1.37 系）"
+    url: "https://kubernetes.io/docs/concepts/overview/components/"
+  - label: "Kubernetes Documentation — Controllers"
+    url: "https://kubernetes.io/docs/concepts/architecture/controller/"
+  - label: "Kubernetes Documentation — Pods"
+    url: "https://kubernetes.io/docs/concepts/workloads/pods/"
+  - label: "Kubernetes Documentation — Pod Lifecycle"
+    url: "https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/"
+  - label: "Kubernetes Documentation — Deployments"
+    url: "https://kubernetes.io/docs/concepts/workloads/controllers/deployment/"
+---
+
+## このコースの立ち位置
+
+AI 基盤コース レッスン 5 では、Kubernetes の上で GPU をどう扱うか（device plugin や GPU Operator）を見ました。そこでは Kubernetes 自体の仕組みは知っている前提でした。このコースは、その**足場**を埋めます。前半で Kubernetes、後半でベアメタルのプロビジョニングと仮想化を扱います。
+
+Kubernetes のドキュメントは版ごとに管理されていて、2026 年 10 月時点の最新は v1.37 系です。
+
+---
+
+## 部品の役割
+
+ドキュメントによると、Kubernetes のクラスタは**コントロールプレーン**と、1 台以上の**ワーカーノード**でできています。
+
+<Figure name="k8s-control-flow" caption="利用者が書いた望む状態は、API サーバーを経て、各部品のループで Pod になる" source="Kubernetes Documentation — Kubernetes Components を元に作図" />
+
+---
+
+<h2 className="slide-cont">部品の役割（続き）</h2>
+
+| 部品 | 場所 | 役割（ドキュメント） |
+| --- | --- | --- |
+| `kube-apiserver` | コントロールプレーン | Kubernetes の HTTP API を提供する中心のサーバー |
+| `etcd` | コントロールプレーン | API サーバーのすべてのデータを持つ、一貫性と高可用性のあるキーバリューストア |
+| `kube-scheduler` | コントロールプレーン | まだノードに割り当てられていない Pod を探し、適したノードに割り当てる |
+| `kube-controller-manager` | コントロールプレーン | コントローラを動かし、API のふるまいを実現する |
+| `kubelet` | 各ノード | Pod とそのコンテナが動いていることを保証する |
+| コンテナランタイム | 各ノード | コンテナを動かすソフトウェア |
+| `kube-proxy`（任意） | 各ノード | Service を実現するネットワークの規則を保つ（レッスン 2） |
+
+基盤から見ると、**etcd はクラスタの状態そのもの**です。バックアップと冗長の対象として、データベースと同じ扱いが要ります。
+
+---
+
+## コントローラ — 望む状態に近づけ続けるループ
+
+ドキュメントは、コントローラを**部屋のサーモスタット**にたとえています。設定した温度が「望む状態」、実際の室温が「現在の状態」で、サーモスタットは機器をつけたり消したりして、現在の状態を望む状態に近づけます。
+
+Kubernetes のオブジェクトは、望む状態を表す `spec` という欄を持ちます。コントローラは担当する種類のオブジェクトを見張り、現在の状態を `spec` に近づけます。ドキュメントによると、多くの場合コントローラは自分で操作するのではなく、**API サーバーにメッセージを送り**、その結果をほかの部品が実行します。
+
+ドキュメントの Job の例では、Job コントローラは自分では Pod もコンテナも動かさず、**API サーバーに Pod を作るよう伝える**だけです。スケジューラがその Pod をノードに割り当て、割り当てられた Pod はそのノードの kubelet にとっての望む状態になります。
+
+つまり Kubernetes では、**「やれ」という命令を出すのではなく、「こうあるべき」を書いておく**と、ループがそこへ近づけ続けます。何かが壊れても、ループが差を見つけて直しに行きます。
+
+---
+
+## Pod — 動かす単位
+
+ドキュメントによると、**Pod** は Kubernetes で作って管理できる最小の単位で、1 つ以上のコンテナを、**ストレージとネットワークを共有させて**まとめたものです。Pod の共有の文脈は、Linux の namespace や cgroup といった、コンテナを隔離するのと同じ仕組みでできています（Linux コース レッスン 6）。
+
+最も多い使い方は、**1 つの Pod に 1 つのコンテナ**です。ドキュメントは、Pod は**比較的短命で、使い捨ての**ものとして設計されていて、1 つだけ動かす場合でも、ふつうは Pod を直接作らず、**Deployment や Job といったワークロードのリソース**から作る、と書いています。Pod は、終わるか、消されるか、資源不足で追い出されるか、ノードが故障するまで、そのノードに留まります。
+
+Pod の `status` の `phase` は、次の 5 つです。
+
+| phase | 意味（ドキュメント） |
+| --- | --- |
+| `Pending` | 受け付けられたが、まだ動く準備ができていない。スケジュール待ちと、イメージのダウンロード中を含む |
+| `Running` | ノードに割り当てられ、コンテナがすべて作られた。少なくとも 1 つが動いている |
+| `Succeeded` / `Failed` | すべてのコンテナが終わった（成功 / 失敗） |
+| `Unknown` | 状態を得られない。ふつうはノードとの通信の問題 |
+
+`kubectl` の `STATUS` 欄に出る `CrashLoopBackOff` や `Terminating` は、表示のための値で、`phase` とは別物です（ドキュメントの注記）。
+
+---
+
+## Deployment で追う — 望む状態が Pod になるまで
+
+ドキュメントの例では、`nginx` を 3 つ動かす Deployment を作ります。
+
+```bash
+kubectl apply -f https://k8s.io/examples/controllers/nginx-deployment.yaml
+kubectl get deployments
+```
+
+```text
+NAME               READY   UP-TO-DATE   AVAILABLE   AGE
+nginx-deployment   3/3     3            3           18s
+```
+
+`READY` は「利用者に使える状態の数 / 望む数」です。Deployment は **ReplicaSet** を作り、ReplicaSet が Pod を作ります。
+
+```bash
+kubectl get rs
+```
+
+```text
+NAME                          DESIRED   CURRENT   READY   AGE
+nginx-deployment-75675f5897   3         3         3       18s
+```
+
+`DESIRED` が望む状態（3）、`CURRENT` が今動いている数です。この 2 つの差を埋めるのが、コントローラのループです。
+
+---
+
+## 失敗した更新は、途中で止まる
+
+ドキュメントには、存在しないイメージに更新してしまった例が載っています。
+
+```text
+NAME                                READY     STATUS             RESTARTS   AGE
+nginx-deployment-1564180365-70iae   1/1       Running            0          25s
+nginx-deployment-1564180365-jbqqo   1/1       Running            0          25s
+nginx-deployment-1564180365-hysrc   1/1       Running            0          25s
+nginx-deployment-3066724191-08mng   0/1       ImagePullBackOff   0          6s
+```
+
+新しい ReplicaSet の Pod が 1 つ、イメージを取得できずに止まっています（`ImagePullBackOff`）。ドキュメントによると、Deployment のコントローラは、この**悪い更新を自動で止め**、新しい ReplicaSet を増やすのをやめます。どこまで進めるかは更新の設定（`maxUnavailable`、既定は 25%）で決まります。古い 3 つの Pod は動いたままなので、サービスは止まっていません。
+
+基盤から見ると、`ImagePullBackOff` は**ノードからイメージのレジストリに届いていない**か、イメージの名前が誤っているかの合図です。GPU のノードが閉じたネットワークにあるなら、レジストリの置き場所とミラーは設計の対象になります。
+
+---
+
+## まとめ
+
+- クラスタは**コントロールプレーン**（apiserver・etcd・scheduler・controller-manager）と**ワーカーノード**（kubelet・コンテナランタイム・kube-proxy）でできている
+- コントローラは **API サーバーに伝え**、ほかの部品がその変化に反応して動く。etcd はクラスタの状態そのもの
+- **コントローラ**は、`spec`（望む状態）に現在の状態を近づけ続けるループ。命令ではなく「こうあるべき」を書く
+- **Pod** は、ネットワークとストレージを共有するコンテナの組で、短命な使い捨て。ふつうは Deployment などから作る
+- Deployment → ReplicaSet → Pod。`DESIRED` と `CURRENT` の差を埋めるのがループ。悪い更新は途中で止まる
+
+---
+
+<Quiz
+  id="q1"
+  question="Deployment で動かしている Pod を、あるノードで kubectl delete pod で 1 つ消しました。しばらくすると、別の名前の Pod が 1 つ増えていました。この動きの説明として正しいものはどれですか。"
+  options={[
+    "削除に失敗し、同じ Pod が名前を変えて残った",
+    "ReplicaSet のコントローラが、望む数（DESIRED）と現在の数（CURRENT）の差を見つけ、API サーバーに新しい Pod を作らせた。スケジューラがノードを決め、そのノードの kubelet が動かした",
+    "kubelet が、消された Pod を自分の判断で同じノードに作り直した",
+    "etcd が自動で Pod を複製した"
+  ]}
+  answer={1}
+  explanation="Kubernetes のコントローラは、望む状態（spec）に現在の状態を近づけ続けるループです。Pod が 1 つ消えると、ReplicaSet の望む数と現在の数に差ができ、コントローラは API サーバーに新しい Pod を作るよう伝えます。ドキュメントの Job の例と同じく、コントローラ自身は Pod を動かさず、スケジューラがノードに割り当て、そのノードの kubelet が動かします。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="kubectl get pods で、Pod の STATUS が CrashLoopBackOff と表示されています。Kubernetes のドキュメントに照らして、正しい理解はどれですか。"
+  options={[
+    "CrashLoopBackOff は Pod の phase の 1 つで、Pending と Running の間の段階である",
+    "CrashLoopBackOff は kubectl が直感のために表示する値で、Pod の phase（Pending・Running・Succeeded・Failed・Unknown）とは別物。起動の失敗を繰り返していることを示す",
+    "Pod がノードとの通信を失ったことを示す",
+    "イメージをダウンロード中であることを示す"
+  ]}
+  answer={1}
+  explanation="Pod のライフサイクルのドキュメントによると、phase は Pending・Running・Succeeded・Failed・Unknown の 5 つだけです。Pod が起動に失敗し続けると、kubectl の Status 欄に CrashLoopBackOff と出ることがありますが、これは利用者の直感のための表示で、Kubernetes のデータモデルである phase とは混同しないよう注記されています。"
+/>

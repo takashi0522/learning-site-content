@@ -1,0 +1,149 @@
+---
+title: 仮想化と GPU — パススルー・vGPU・MIG
+description: 仮想マシンに GPU を渡す方法は、まるごと渡すパススルーと、1 枚を複数の仮想マシンで分ける vGPU に分かれ、分け方には時間で分けるものとハードウェアの区画で分ける MIG があります。それぞれの隔離の強さと、性能の配分のしかたを NVIDIA のドキュメントで見ます。
+order: 6
+minutes: 20
+tags: ["GPU", "passthrough", "vGPU", "MIG", "time-slicing", "scheduler"]
+objectives:
+  - GPU のパススルーと vGPU の違いを説明できる
+  - vGPU の時分割のスケジューラ（best effort・equal share・fixed share）の違いを説明できる
+  - MIG の GPU スライス・GPU インスタンス・プロファイル名の読み方を説明できる
+  - Kubernetes の time-slicing が何を共有し、何を隔離しないかを説明できる
+references:
+  - label: "NVIDIA Virtual GPU Software User Guide — Introduction（vGPU 20 系、2026 年 10 月時点の latest）"
+    url: "https://docs.nvidia.com/vgpu/latest/grid-vgpu-user-guide/grid-vgpu-introduction.html"
+  - label: "NVIDIA Virtual GPU Software User Guide — Changing Scheduling Behavior for Time-Sliced vGPUs"
+    url: "https://docs.nvidia.com/vgpu/latest/grid-vgpu-user-guide/changing-vgpu-scheduling-policy.html"
+  - label: "NVIDIA Virtual GPU Software Documentation（リリースの系列）"
+    url: "https://docs.nvidia.com/vgpu/index.html"
+  - label: "NVIDIA Multi-Instance GPU User Guide — Introduction / Concepts / Supported MIG Profiles"
+    url: "https://docs.nvidia.com/datacenter/tesla/mig-user-guide/"
+  - label: "NVIDIA GPU Operator — Time-Slicing GPUs in Kubernetes"
+    url: "https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html"
+---
+
+## GPU を仮想マシンに渡す 2 つの道
+
+レッスン 5 で見た直接の割り当ては、GPU にもそのまま使えます。NVIDIA の vGPU のドキュメントは、仮想マシンでの GPU の使い方を次のように分けています。
+
+| 方式 | ドキュメントの説明 |
+| --- | --- |
+| **GPU パススルー** | 物理 GPU **全体**を 1 つの VM に直接割り当てる。GPU は、その VM の中の NVIDIA ドライバだけが使い、**VM の間では共有しない** |
+| **NVIDIA vGPU** | **複数の VM が、1 枚の物理 GPU に同時に直接アクセス**できる。仮想化していない OS と同じ NVIDIA のドライバを使う |
+
+<Figure name="gpu-sharing-modes" caption="渡し方と分け方の 4 つ。分ける単位と隔離の強さが違う" source="NVIDIA の vGPU・MIG・GPU Operator のドキュメントを元に作図" />
+
+学習のように GPU を使い切る仕事なら、パススルーで 1 台の VM に GPU をまるごと渡すのが素直です。推論や開発のように 1 枚を使い切らない仕事を何人もで動かすときに、分ける方式が意味を持ちます。
+
+なお、vGPU のソフトウェアは系列（リリースブランチ）ごとに保守の期限があります。2026 年 10 月時点の文書では、vGPU 20（R595 系、本番用）と vGPU 19（R580 系、長期サポート）が保守の対象です。
+
+---
+
+## vGPU の時分割 — 3 つのスケジューラ
+
+vGPU で 1 枚の GPU を複数の VM で分けるとき、ドキュメントによると、GPU は**各 VM の仕事を順番に**実行します。ある VM の仕事が GPU で動ける時間の長さが**タイムスライス**で、それを使い切ると止められ、次の VM の仕事に移ります。順番の決め方には 3 つのスケジューラがあります。
+
+| スケジューラ | 配分（ドキュメント） |
+| --- | --- |
+| **best effort**（既定） | 性能の釣り合いをとろうとしつつ、**ほかの vGPU が使っていない分も使える**。重い処理の VM が、軽い処理の VM の性能に悪影響を与えることがある |
+| **equal share** | 動いている vGPU で**均等に**分ける。vGPU が増減すると、1 つあたりの取り分も変わる |
+| **fixed share** | 各 vGPU に**固定の取り分**を与える。ほかの vGPU が増減しても、性能は変わらない |
+
+ドキュメントの例（Ampere 世代の A10）では、1 枚に最大 3 つまで置ける種類（A10-8Q）の vGPU は、fixed share で同じ大きさの vGPU を並べる場合（equal-size mode）、**3 分の 1（33%）**の処理時間を受け取ります。大きさの違う vGPU を混ぜる場合（mixed-size mode）は、割り当てたメモリの割合で取り分が決まります。
+
+---
+
+<h2 className="slide-cont">vGPU の時分割（続き）</h2>
+
+ドキュメントは、タイムスライスの長さは**レイテンシとスループットの兼ね合い**だと書いています。
+
+- 一定の間隔で出力が要る仕事（60 FPS のグラフィックスなど）は、**短いタイムスライス**が向く
+- できるだけ早く終わらせたい仕事（**CUDA のアプリケーションなど**）は、VM の切り替えを減らす**長いタイムスライス**が向く
+
+<Callout type="field" title="「同じ GPU を分けた」ときの性能の読み方">
+
+best effort では、隣の VM が空いていれば速く、混んでいれば遅くなります。性能の予測を利用者に約束したいなら、fixed share のように取り分を固定するか、次のスライドの MIG のように**区画そのものを分ける**方式を選びます。どの方式を選んだかで、「昨日より遅い」という問い合わせの意味が変わります。
+
+</Callout>
+
+---
+
+## MIG — ハードウェアの区画に分ける
+
+**MIG**（Multi-Instance GPU）は、NVIDIA Ampere 世代以降の GPU を、**最大 7 つの独立した GPU インスタンス**に安全に分ける機能です（MIG のドキュメント）。ドキュメントによると、各インスタンスのプロセッサは、**L2 キャッシュのバンク・メモリコントローラ・DRAM のアドレスバスまで別々の経路**を持つので、ほかの仕事がキャッシュを荒らしたりメモリの帯域を使い切ったりしても、**予測できるスループットとレイテンシ**で動きます。
+
+区画は**スライス**の組み合わせで作ります（ドキュメントの用語）。
+
+| 用語 | 意味 |
+| --- | --- |
+| メモリスライス | GPU のメモリ資源（容量と帯域）のおよそ **8 分の 1** |
+| SM スライス | MIG モードの SM のおよそ **7 分の 1** |
+| GPU インスタンス（GI） | スライスと、コピーエンジンなどのエンジンを組み合わせたもの。メモリの QoS を持つ |
+| コンピュートインスタンス（CI） | GI の SM をさらに分けたもの。メモリとエンジンは GI の中で共有する |
+
+---
+
+<h2 className="slide-cont">MIG（続き）</h2>
+
+プロファイルの名前は、たとえば `1g.23gb` なら **SM スライス 1 つ（1g）とメモリ約 23 GB** の区画を表します（ドキュメントの例からの読み方）。B200（180 GB）の表から抜き出します。
+
+| プロファイル | メモリの割合 | SM の割合 | 置ける数 |
+| --- | --- | --- | --- |
+| `1g.23gb` | 1/8 | 1/7 | 7 |
+| `1g.45gb` | 2/8 | 1/7 | 4 |
+| `2g.45gb` | 2/8 | 2/7 | 3 |
+| `3g.90gb` | 4/8 | 3/7 | 2 |
+
+MIG は、ベアメタル（コンテナを含む）でも、パススルーした VM の中でも、**vGPU と組み合わせても**使えます。vGPU のドキュメントは、**MIG の区画を vGPU に割り当てる**（MIG-backed vGPU）構成を説明しています。1 つの区画の中に時分割の vGPU を置く構成では、スケジューラを**区画ごとに独立して**設定できます（ただし、ハイパーバイザによっては GPU 全体に一括でしか設定できないなど、組み合わせで制限がある）。コンテナで MIG を使う話は、GPU コース レッスン 4 で扱いました。
+
+---
+
+## Kubernetes の time-slicing — 何を分けないか
+
+Kubernetes では、GPU Operator の設定で 1 枚の GPU を**複数の複製（replica）**として見せ、別々の Pod に配れます（time-slicing）。レッスン 3 で見た拡張リソースの「重ねて割り当てない」を、**意図して重ねる（オーバーサブスクライブする）**仕組みです。ドキュメントは、次の点をはっきり書いています。
+
+- **MIG と違って、複製の間にメモリの隔離も障害の隔離も無い**
+- time-slicing の GPU を**複数**要求しても、**計算能力がそれに比例して割り当てられる保証は無い**。共有の GPU に入れてもらえる、というだけ
+- 各 Pod は、GPU の上で**いくつでもプロセスを動かせる**。GPU は、すべての Pod のすべてのプロセスに、時間を均等に配る
+
+ドキュメントは、time-slicing は MIG の隔離と引き換えに、**より多くの利用者で 1 枚を分けられる**こと、そして **MIG に対応しない古い世代の GPU でも共有できる**ことを利点に挙げています。MIG と time-slicing を組み合わせて、MIG の区画を時分割で分けることもできます。
+
+---
+
+## まとめ
+
+- **パススルー**は GPU 全体を 1 つの VM に渡し、共有しない。**vGPU** は 1 枚に複数の VM が同時に直接アクセスする
+- vGPU の時分割は **best effort（既定）・equal share・fixed share**。best effort は空きを使えるが、隣の影響を受けうる。fixed share は取り分が変わらない
+- タイムスライスは、短いと応答が良く、長いと**CUDA のような仕事のスループット**が良い
+- **MIG** は最大 7 つの区画に分け、キャッシュやメモリの経路まで分けるので、性能が予測できる。`1g.23gb` は SM スライス 1 つ・メモリ約 23 GB
+- **Kubernetes の time-slicing** は、メモリと障害の**隔離が無く**、複数要求しても計算能力の比例配分は保証されない
+
+---
+
+<Quiz
+  id="q1"
+  question="vGPU で 1 枚の GPU を 3 つの VM に分けています。既定のスケジューラのまま運用していたところ、ある VM の利用者から「ほかの VM が混んでいる時間帯だけ遅くなる」と相談されました。vGPU のドキュメントに照らして、最も適切な説明と対策はどれですか。"
+  options={[
+    "vGPU は各 VM に常に 3 分の 1 を割り当てるので、遅くなるのは VM の中の問題である",
+    "既定の best effort は、ほかの vGPU が使っていない分も使えるため、隣が空いていれば速く、混んでいれば遅くなる。取り分を固定したいなら fixed share にするか、MIG の区画で分ける",
+    "スケジューラは GPU の世代で固定されていて、変えられない",
+    "タイムスライスを最短にすれば、混雑の影響はなくなる"
+  ]}
+  answer={1}
+  explanation="vGPU のドキュメントによると、既定の best effort スケジューラは、ほかの vGPU が使っていない処理時間を使えるようにし、状況によっては重い処理の VM が他の VM の性能に悪影響を与えることがあります。fixed share スケジューラは各 vGPU に固定の取り分を与えるので、ほかの vGPU が増減しても性能は変わりません。MIG はハードウェアの区画で分けるので、予測できるスループットとレイテンシが得られます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Kubernetes で、1 枚の GPU を time-slicing で 4 つの複製に見せ、推論の Pod を 4 つ動かしています。そのうち 1 つの Pod が GPU のメモリを使い切ったとき、NVIDIA GPU Operator のドキュメントに照らして起こりうることはどれですか。"
+  options={[
+    "time-slicing は複製ごとにメモリを 4 分の 1 ずつ隔離しているので、ほかの Pod には影響しない",
+    "time-slicing には、MIG と違って複製の間のメモリの隔離も障害の隔離も無いので、ほかの Pod も影響を受けうる。隔離が要るなら MIG を使う",
+    "その Pod だけが別の GPU に自動で移される",
+    "Kubernetes のスケジューラが、その Pod のメモリを limits で止める"
+  ]}
+  answer={1}
+  explanation="GPU Operator のドキュメントは、time-slicing では MIG と違って複製の間にメモリや障害の隔離が無いと明記しています。time-slicing は MIG の隔離と引き換えに、より多くの利用者で GPU を分けられるようにする仕組みです。メモリと障害をハードウェアの層で隔離したいなら、MIG の区画を使います。"
+/>
