@@ -1,0 +1,207 @@
+---
+title: Ceph — 1 つの仕組みでブロック・ファイル・オブジェクト
+description: Ceph は、汎用のサーバーとディスクを束ねて、ブロック・ファイル・オブジェクトの 3 つを提供する分散ストレージです。置き場所を表で引かずに計算で決める CRUSH、プライマリを通る書き込み、レプリケーションとイレイジャーコーディング、そして状態の読み方を見ます。
+order: 5
+minutes: 22
+tags: ["Ceph", "RADOS", "CRUSH", "placement-group", "erasure-coding", "RBD", "CephFS", "RGW"]
+objectives:
+  - Ceph の 3 つの使い方（RBD・CephFS・RGW）が、同じ RADOS の上に乗っていることを説明できる
+  - CRUSH と PG によって、中央の表を引かずに置き場所が決まる仕組みを説明できる
+  - レプリケーション（size と min_size）とイレイジャーコーディング（K と M）の違いを説明できる
+  - ceph -s の出力から、クラスタの状態と劣化を読める
+references:
+  - label: "Ceph Documentation（Squid）— Intro to Ceph"
+    url: "https://docs.ceph.com/en/squid/start/"
+  - label: "Ceph Documentation（Squid）— Architecture"
+    url: "https://docs.ceph.com/en/squid/architecture/"
+  - label: "Ceph Documentation（latest）— Erasure code"
+    url: "https://docs.ceph.com/en/latest/rados/operations/erasure-code/"
+  - label: "Ceph Documentation（latest）— Monitoring a Cluster"
+    url: "https://docs.ceph.com/en/latest/rados/operations/monitoring/"
+  - label: "Ceph Documentation（latest）— Health checks"
+    url: "https://docs.ceph.com/en/latest/rados/operations/health-checks/"
+  - label: "Ceph Documentation — Ceph Releases"
+    url: "https://docs.ceph.com/en/latest/releases/"
+---
+
+## 1 つの仕組みの上に、3 つの使い方
+
+ここまでのレッスンは、NFS や Lustre のように「ファイル」を提供する仕組みと、S3 のように「オブジェクト」を提供する仕組みを別々に見てきました。**Ceph** は、汎用のサーバーとディスクを束ねて、**ブロック・ファイル・オブジェクトの 3 つをまとめて提供する**分散ストレージです。
+
+<Figure name="ceph-layers" caption="RBD・CephFS・RGW は、どれも同じ RADOS の上に乗っている" source="Ceph Documentation（Squid）の Intro と Architecture を元に作図" />
+
+土台は **RADOS** という分散オブジェクトストアです。その上に次の 3 つが乗ります。
+
+| 使い方 | 名前 | ドキュメントの説明 |
+| --- | --- | --- |
+| ブロック | **RBD** | サイズ変更・シン・プロビジョニング・スナップショット・クローンができるブロックデバイス。仮想マシンのディスクによく使われる |
+| ファイル | **CephFS** | POSIX に準拠したファイルシステム。カーネルでも FUSE でもマウントできる。メタデータは MDS が持つ |
+| オブジェクト | **RGW** | S3 と OpenStack Swift に互換の REST API |
+
+レッスン 3 の Ceph Object Gateway は、この RGW です。版は、2026 年 10 月時点で保守されている Tentacle（20.2）と Squid（19.2。保守終了の見込みは 2026 年 10 月末）があります。このレッスンでは、構成と仕組みは Squid の、イレイジャーコーディング・監視・ヘルスチェックは latest（開発版）のドキュメントを参照しています。
+
+---
+
+<h2 className="slide-cont">1 つの仕組みの上に（続き）</h2>
+
+ドキュメントによると、Ceph のクラスタは次のデーモンでできています。
+
+| デーモン | 役割 | 冗長のために通常要る数 |
+| --- | --- | --- |
+| **MON**（Monitor） | クラスタの地図（OSD や CRUSH などの map）を持つ。認証も受け持つ | 3 台 |
+| **MGR**（Manager） | 使用量や性能の指標を集め、ダッシュボードや REST API を出す | 2 台 |
+| **OSD** | データを保存し、複製・回復・再配置を行う（ドキュメントは、OSD を Object Storage Device とも呼ぶ） | 3 台 |
+| **MDS** | CephFS のメタデータ。CephFS を使うときだけ | — |
+
+MON は多数決（Paxos）で地図の内容をそろえます。ドキュメントは、3 台なら 2 台、5 台なら 3 台の合意が要る例を挙げています。MON が 1 台だけだと、それが止まったときにクライアントは読み書きできなくなります。
+
+---
+
+## 置き場所は「計算」で決める — CRUSH
+
+Lustre（レッスン 2）では、ファイルの中身がどこにあるかを MDT に**聞きに行きました**。Ceph は聞きに行きません。ドキュメントによると、クライアントも OSD も **CRUSH というアルゴリズムで置き場所を計算**し、**中央の表を引かない**ので、そこがボトルネックにならない、としています。
+
+<Figure name="ceph-placement" caption="名前から PG、PG から OSD へ。クライアントはプライマリに直接書く" source="Ceph Documentation（Squid）の Architecture を元に作図。OSD の番号はドキュメントの例" />
+
+ドキュメントの手順を追うと、次のようになります。
+
+1. クライアントは MON から**クラスタの地図**を受け取る（地図があっても、オブジェクトの場所はまだ分からない）
+2. オブジェクトの名前をハッシュし、プールの **PG**（placement group）の数で割った余りで PG の番号を決める。プールの番号を前に付ける（例: `4.58`）
+3. CRUSH で、その PG を受け持つ OSD の組を計算する。先頭が**プライマリ**
+
+PG は、オブジェクトと OSD のあいだに置かれた**間接の層**です。OSD を足すと地図が変わり、計算の結果も変わるので、PG の一部が新しい OSD へ移ります（**リバランス**）。ドキュメントは、このとき多くの PG は元の場所に留まると書いています。
+
+---
+
+## 書き込みはプライマリを通る
+
+ドキュメントによると、書き込みは次の順で進みます。
+
+1. クライアントは、PG の**プライマリの OSD に**書く。クライアントから書き込みを受けるのはプライマリだけ
+2. プライマリは、自分の CRUSH の地図から残りの OSD を求め、そこへ複製する
+3. 複製が保存されたのを確かめてから、クライアントに「保存した」と返す
+
+複製の手間を OSD 同士が受け持つので、クライアントのネットワークは 1 本分の書き込みで済みます。そのぶん、**OSD 同士のネットワーク**には複製の量が流れます。
+
+| 設定 | 意味（ドキュメント） |
+| --- | --- |
+| `size` | オブジェクトのコピーの数 |
+| `min_size` | 劣化した状態でも読み書きを続けるのに要るコピーの数 |
+
+ドキュメントは、データの安全のための最低限は 2 コピー（`size = 2`）だが、**3 コピー（`size = 3`、`min_size = 2`）を勧める**、2 コピーのデータは十分に長い時間のうちには失われる、と警告しています。
+
+プライマリの OSD が故障すると、組の 2 番目が新しいプライマリになります。
+
+---
+
+## イレイジャーコーディング — 容量の効率を取る
+
+3 コピーは、1 TB を守るのに 3 TB を使います。**イレイジャーコーディング（EC）**は、オブジェクトを **K 個のデータの断片と M 個の符号の断片**に分けて、別々の OSD に置きます。**M 個までの OSD を失っても**データを失いません。
+
+| | 3 コピー | EC（K=2, M=2） |
+| --- | --- | --- |
+| 失ってよい OSD の数 | 2 | 2 |
+| 1 TB を置くのに要る容量 | 3 TB | **2 TB** |
+
+これはドキュメントの比較で、EC の既定のプロファイル（`k=2 m=2`）は、`size = 3` のレプリケーションと同じだけの故障に耐え、要る容量は 2 TB で済む、としています。
+
+注意点が 2 つあります。
+
+- **プロファイルは、プールを作ったあとで変えられない**。変えるには、新しいプールを作ってオブジェクトを全部移す
+- 既定では、EC のプールは**オブジェクトを丸ごと書く操作**（RGW など）にしか使えない。RBD や CephFS で使うには、プールで `allow_ec_overwrites` を有効にし、メタデータはレプリケーションのプールに置く
+
+---
+
+## 状態を見る — ceph -s
+
+ドキュメントに載っている、小さなクラスタの `ceph -s`（`ceph status`）の出力です。
+
+```text
+  cluster:
+    id:     477e46f1-ae41-4e43-9c8f-72c918ab0a20
+    health: HEALTH_OK
+
+  services:
+    mon: 3 daemons, quorum a,b,c
+    mgr: x(active)
+    mds: cephfs_a-1/1/1 up  {0=a=up:active}, 2 up:standby
+    osd: 3 osds: 3 up, 3 in
+
+  data:
+    pools:   2 pools, 16 pgs
+    objects: 21 objects, 2.19K
+    usage:   546 GB used, 384 GB / 931 GB avail
+    pgs:     16 active+clean
+```
+
+見るところは次のとおりです。
+
+- **`health`**: `HEALTH_OK` / `HEALTH_WARN` / `HEALTH_ERR`
+- **`mon`**: 何台が多数決（quorum）に入っているか
+- **`osd`**: `up`（動いている）と `in`（データの置き場所に入っている）の数
+- **`pgs`**: `active+clean` 以外の状態の PG があれば、何かが進行中か劣化している
+
+---
+
+<h2 className="slide-cont">状態を見る（続き）</h2>
+
+OSD が 1 つ止まると、`health` は次のように変わります（ドキュメントの例）。
+
+```text
+health: HEALTH_WARN
+        1 osds down
+        Degraded data redundancy: 21/63 objects degraded (33.333%), 16 pgs unclean, 16 pgs degraded
+```
+
+21/63（33.333%）は、3 コピーなら 1 つを失った割合に当たります（ドキュメントは size を書いていないので、ここは推定）。これを**劣化（degraded）**と呼びます。データは失われていませんが、冗長が減った状態です。OSD が戻ると、ログに `Cluster is now healthy` が出ます。
+
+ほかに、ドキュメントの Health checks と Monitoring から、基盤の運用で効くものを挙げます。
+
+| 警告 | 意味 |
+| --- | --- |
+| `OSD_NEARFULL` / `OSD_BACKFILLFULL` | OSD が満杯に近づいている。backfillfull を超えると、その OSD へのリバランスができなくなる |
+| `OSD_FULL` | OSD が full の閾値を超え、**クラスタが書き込みを受け付けない** |
+| `Slow OSD heartbeats` | OSD 同士の応答確認が既定で 1 秒を超えた。複数の組で起きていれば、スイッチや NIC、物理層の障害を疑う |
+
+Lustre の OST と同じく、**1 つの OSD が満杯になるだけで書き込みが止まりうる**点に注意します。
+
+---
+
+## まとめ
+
+- Ceph は **RADOS** の上に、**RBD（ブロック）・CephFS（ファイル）・RGW（オブジェクト）**を乗せる
+- MON は 3 台、MGR は 2 台、OSD は 3 台以上が冗長の目安。MON は多数決で地図をそろえる
+- 置き場所は **CRUSH で計算**する。名前 → PG → OSD の組。中央の表を引かない
+- 書き込みは**プライマリの OSD**が受け、ほかの OSD へ複製してから応答する。OSD 同士のネットワークに複製が流れる
+- 推奨は **3 コピー（size 3 / min_size 2）**。**EC** は容量の効率が良いが、プロファイルは後から変えられない
+- `ceph -s` で health・quorum・OSD の up/in・PG の状態を見る。1 つの OSD が full になると書き込みが止まりうる
+
+---
+
+<Quiz
+  id="q1"
+  question="3 コピー（size 3）の Ceph で、OSD が 1 つ止まりました。ceph -s に HEALTH_WARN と 1 osds down、objects degraded と出ています。この状態の説明として正しいものはどれですか。"
+  options={[
+    "データの 1/3 が失われた。バックアップから戻す必要がある",
+    "一部のオブジェクトでコピーが 1 つ読めなくなり、冗長が減った状態。データは残りのコピーにあり、止まった OSD がプライマリだった PG では組の 2 番目がプライマリを引き継ぐ",
+    "クラスタ全体が読み取り専用になった",
+    "MON の多数決が崩れたので、クライアントは読み書きできない"
+  ]}
+  answer={1}
+  explanation="Ceph のドキュメントの例では、OSD が 1 つ止まると HEALTH_WARN になり、Degraded data redundancy として劣化したオブジェクトの割合が表示されます。3 コピーのうち 1 つが読めなくなっただけなので、データは残りのコピーにあります。プライマリの OSD が止まった場合は、組の 2 番目が新しいプライマリになります。OSD が戻れば、ログに Cluster is now healthy が出ます。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="容量を節約するため、k=2 m=1 のイレイジャーコーディングでプールを作り、運用を始めました。あとから耐えられる故障の数を増やすため、m=2 に変えたくなりました。どうすればよいですか。"
+  options={[
+    "ceph osd pool set で m の値を 2 に変える",
+    "プロファイルはプールを作ったあとで変えられないので、m=2 のプロファイルで新しいプールを作り、オブジェクトを移す",
+    "OSD を増やせば、自動で m が増える",
+    "min_size を 2 にすれば、m=2 と同じ効果になる"
+  ]}
+  answer={1}
+  explanation="Ceph のドキュメントによると、イレイジャーコーディングのプロファイルはプールを作ったあとで変更できません。違うプロファイルが要るなら、新しいプールを作り、元のプールのオブジェクトを全部移す必要があります。ドキュメントがプロファイルの選択は重要だと書いているのはこのためです。"
+/>

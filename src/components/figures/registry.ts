@@ -27,7 +27,7 @@ import {
 import { CudaStack, GpuContainerStack, GpuInterconnectPaths } from "./gpu";
 import { DcqcnLoop, EcmpVsAdaptive, PfcPause } from "./gpunet";
 import { NumaTopology, PcieNuma, PowerLossProtection } from "./hardware";
-import { NfsClientCaches, NfsCloseToOpen } from "./storage";
+import { CephLayers, CephPlacement, FileVsObject, LustreFileLayout, NfsClientCaches, NfsCloseToOpen, PflComponents, ProtectionLayers, StoragePerfAxes } from "./storage";
 import { ContainerParts, DemandPaging, FdToInode, SyscallBoundary } from "./linux";
 import {
   CheckpointContents,
@@ -113,6 +113,13 @@ export const FIGURES = {
   "ecmp-vs-adaptive": EcmpVsAdaptive,
   "nfs-client-caches": NfsClientCaches,
   "nfs-close-to-open": NfsCloseToOpen,
+  "lustre-file-layout": LustreFileLayout,
+  "pfl-components": PflComponents,
+  "file-vs-object": FileVsObject,
+  "storage-perf-axes": StoragePerfAxes,
+  "ceph-layers": CephLayers,
+  "ceph-placement": CephPlacement,
+  "protection-layers": ProtectionLayers,
 } satisfies Record<string, ComponentType>;
 
 export type FigureName = keyof typeof FIGURES;
