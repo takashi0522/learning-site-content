@@ -2,11 +2,52 @@ import type { Course } from "@/lib/content";
 import { C, T } from "./figures/primitives";
 import { withBase } from "@/lib/base-path";
 
-const BOX_W = 204;
-const BOX_H = 62;
+const BOX_W = 216;
+const BOX_PAD_X = 10;
+const TITLE_SIZE = 14;
+const SUB_SIZE = 12;
+const TITLE_LH = 18;
+const SUB_LH = 16;
 const COL_GAP = 56;
 const ROW_GAP = 26;
 const PAD = 24;
+
+/**
+ * 文字幅の見積もり。SSR なので実測できない。和文は 1em、欧文は広めに 0.62em で見て、
+ * 足りなくなる側に倒す (はみ出すより早めに折り返すほうがよい)。
+ */
+function textWidth(text: string, size: number): number {
+  let w = 0;
+  for (const ch of text) w += (ch === " " ? 0.32 : ch.charCodeAt(0) < 0x2000 ? 0.62 : 1) * size;
+  return w;
+}
+
+/** 「・」と空白の直後で切れる単位に分け、幅に収まるよう貪欲に詰める */
+function wrap(text: string, size: number, max: number): string[] {
+  const tokens = text.match(/[^・ ]+[・ ]?|[・ ]/g) ?? [text];
+  const lines: string[] = [];
+  let line = "";
+  for (const tok of tokens) {
+    if (line && textWidth((line + tok).trimEnd(), size) > max) {
+      lines.push(line.trimEnd());
+      line = tok.trimStart();
+    } else {
+      line += tok;
+    }
+  }
+  if (line.trim()) lines.push(line.trimEnd());
+  return lines;
+}
+
+/** 「主題 — 副題」は副題を小さい字で 2 行目以降に回す */
+function boxLines(title: string) {
+  const max = BOX_W - BOX_PAD_X * 2;
+  const [main, ...rest] = title.split(" — ");
+  return {
+    title: wrap(main, TITLE_SIZE, max),
+    sub: rest.length ? wrap(rest.join(" — "), SUB_SIZE, max) : [],
+  };
+}
 
 type Placed = { course: Course; lessons: number; x: number; y: number };
 
@@ -55,6 +96,14 @@ export function CourseMap({ courses, lessonCounts }: { courses: Course[]; lesson
     }
     col.forEach((c, i) => rank.set(c.id, i - (col.length - 1) / 2));
   });
+
+  // 箱の高さは全コースで揃える (一番行数の多いコースに合わせる)
+  const lines = new Map(courses.map((c) => [c.id, boxLines(c.title)]));
+  const BOX_H =
+    14 +
+    Math.max(...[...lines.values()].map((l) => l.title.length * TITLE_LH + l.sub.length * SUB_LH)) +
+    SUB_LH +
+    12;
 
   const rows = Math.max(...columns.map((col) => col.length));
   const height = PAD * 2 + rows * BOX_H + (rows - 1) * ROW_GAP;
@@ -109,17 +158,34 @@ export function CourseMap({ courses, lessonCounts }: { courses: Course[]; lesson
           );
         })}
 
-        {[...placed.values()].map(({ course, lessons, x, y }) => (
-          <a key={course.id} href={withBase(`/courses/${course.id}/`)} data-accent={course.accent}>
-            <rect x={x} y={y} width={BOX_W} height={BOX_H} rx={10} fill={C.accentSoft} stroke={C.accent} strokeWidth={1.5} />
-            <T x={x + BOX_W / 2} y={y + 24} size={14} weight={700} fill={C.fg} anchor="middle" middle>
-              {course.title}
-            </T>
-            <T x={x + BOX_W / 2} y={y + 45} size={12} anchor="middle" middle>
-              {`${lessons} レッスン・${course.level}`}
-            </T>
-          </a>
-        ))}
+        {[...placed.values()].map(({ course, lessons, x, y }) => {
+          const { title, sub } = lines.get(course.id)!;
+          const cx = x + BOX_W / 2;
+          // 文字の塊を箱の縦中央に置く
+          const block = title.length * TITLE_LH + sub.length * SUB_LH + SUB_LH + 4;
+          const top = y + (BOX_H - block) / 2;
+          const subTop = top + title.length * TITLE_LH;
+          const countY = subTop + sub.length * SUB_LH + SUB_LH + 1;
+          return (
+            <a key={course.id} href={withBase(`/courses/${course.id}/`)} data-accent={course.accent}>
+              <title>{course.title}</title>
+              <rect x={x} y={y} width={BOX_W} height={BOX_H} rx={10} fill={C.accentSoft} stroke={C.accent} strokeWidth={1.5} />
+              {title.map((line, i) => (
+                <T key={`t${i}`} x={cx} y={top + (i + 1) * TITLE_LH - 4} size={TITLE_SIZE} weight={700} fill={C.fg} anchor="middle">
+                  {line}
+                </T>
+              ))}
+              {sub.map((line, i) => (
+                <T key={`s${i}`} x={cx} y={subTop + (i + 1) * SUB_LH - 3} size={SUB_SIZE} fill={C.fg} anchor="middle">
+                  {line}
+                </T>
+              ))}
+              <T x={cx} y={countY} size={SUB_SIZE} anchor="middle">
+                {`${lessons} レッスン・${course.level}`}
+              </T>
+            </a>
+          );
+        })}
       </svg>
     </div>
   );
