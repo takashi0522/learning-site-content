@@ -1,4 +1,4 @@
-import { Box, C, T } from "./primitives";
+import { Arrow, Box, C, Step, T } from "./primitives";
 
 const RAILS = [0, 1, 2, 3];
 const NODES = [
@@ -87,6 +87,35 @@ export function RailOptimized() {
       </T>
       <T x={400} y={310} size={12} weight={600} fill={C.accent} anchor="middle">
         色を付けた線がレール 1 — どのノードの GPU 1 も、同じリーフ 1 へ向かう
+      </T>
+    </svg>
+  );
+}
+
+/**
+ * 液冷ラックが届いてから運用に渡すまで。各段で記録を残し、署名して次へ渡す。
+ */
+export function LiquidCommissioning() {
+  const steps = [
+    { label: "受け入れ", sub: "輸送の傷・漏れ・表示" },
+    { label: "ガスで加圧", sub: "圧力の減りを記録" },
+    { label: "洗浄・充填", sub: "エア抜きしながら" },
+    { label: "据え付け", sub: "配管 → ネット → 電源" },
+    { label: "立ち上げ", sub: "低流量 → 最大負荷" },
+    { label: "警報の試験", sub: "故障を模して鳴らす" },
+  ];
+  return (
+    <svg viewBox="0 0 800 250" role="img" aria-label="液冷ラックの受け入れから運用への引き渡しまで">
+      {steps.map((s, i) => (
+        <g key={s.label}>
+          <Step x={20 + i * 130 + 10} y={44} n={i + 1} />
+          <Box x={20 + i * 130} y={56} w={116} h={64} label={s.label} sub={s.sub} size={13} tone={i === 5 ? "ok" : "plain"} />
+          {i < steps.length - 1 ? <Arrow from={[138 + i * 130, 88]} to={[148 + i * 130, 88]} color={C.subtle} /> : null}
+        </g>
+      ))}
+      <Box x={20} y={150} w={760} h={40} label="各段の結果を記録し、署名して次の担当へ渡す（運用チームへの引き渡しが最後）" size={12.5} tone="accent" />
+      <T x={400} y={226} size={12} anchor="middle">
+        設定値・流量・圧力・温度は、運用チームがあとで参照するために記録する
       </T>
     </svg>
   );

@@ -9,7 +9,7 @@ import {
   TrainingStep,
 } from "./ai";
 import { CaHierarchy, OidcCodePkce } from "./auth";
-import { RailOptimized } from "./buildout";
+import { LiquidCommissioning, RailOptimized } from "./buildout";
 import {
   AbPowerFeed,
   BlankPanel,
@@ -135,6 +135,7 @@ export const FIGURES = {
   "netboot-flow": NetbootFlow,
   "device-assignment": DeviceAssignment,
   "gpu-sharing-modes": GpuSharingModes,
+  "liquid-commissioning": LiquidCommissioning,
 } satisfies Record<string, ComponentType>;
 
 export type FigureName = keyof typeof FIGURES;
