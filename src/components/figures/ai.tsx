@@ -404,3 +404,37 @@ export function NfsVsParallelFs() {
     </svg>
   );
 }
+
+/**
+ * GPU の監視の流れ。DCGM が集め、exporter が Prometheus 形式で出し、規則が判定し、Alertmanager がまとめて知らせる。
+ */
+export function GpuMonitoringPipeline() {
+  return (
+    <svg viewBox="0 0 800 300" role="img" aria-label="GPU クラスタの監視の流れ">
+      <Band x={16} y={24} w={300} h={190} label="各 GPU ノード" />
+      <Box x={36} y={60} w={120} h={46} label="GPU" sub="ノードの全枚数" size={13} />
+      <Box x={176} y={60} w={120} h={46} label="DCGM" sub="health・policy" size={13} tone="accent" />
+      <Box x={106} y={136} w={190} h={52} label="dcgm-exporter" sub="default-counters.csv で選ぶ" size={12.5} mono />
+      <Arrow from={[158, 83]} to={[174, 83]} color={C.subtle} />
+      <Arrow from={[236, 108]} to={[236, 134]} color={C.subtle} />
+
+      <Box x={360} y={110} w={150} h={60} label="Prometheus" sub="収集・保存・規則" size={13.5} tone="accent" />
+      <Arrow from={[298, 160]} to={[358, 145]} color={C.accent} width={2} />
+      <T x={435} y={196} size={12} anchor="middle">
+        9400 番の /metrics を読む
+      </T>
+
+      <Box x={560} y={60} w={210} h={52} label="Alertmanager" sub="まとめる・抑える・送り先" size={13} />
+      <Box x={560} y={150} w={210} h={52} label="ダッシュボード" sub="傾向を見る" size={13} tone="ghost" />
+      <Arrow from={[512, 130]} to={[558, 90]} color={C.ng} width={2} />
+      <Arrow from={[512, 150]} to={[558, 176]} color={C.subtle} />
+      <T x={536} y={100} size={12} fill={C.ng} weight={600} anchor="end">
+        発火
+      </T>
+
+      <T x={400} y={254} size={12.5} fill={C.fg} anchor="middle">
+        ファブリック（スイッチ・HCA）、ノード（OS・ディスク）、ジョブ（ステップ時間）は別の収集元から足す
+      </T>
+    </svg>
+  );
+}

@@ -1,0 +1,301 @@
+---
+title: GPU クラスタの監視を組み立てる — DCGM・Xid・アラート
+description: GPU の指標を集めるだけでは、壊れかけた GPU に気づけません。dcgm-exporter から Prometheus へ集める流れ、既定では集めない指標、Xid の値の罠、劣化の兆しを示す指標、Xid の推奨対処、DCGM の健全性チェック、そしてアラートの設計を、NVIDIA と Prometheus のドキュメントで組み立てます。
+order: 8
+minutes: 24
+tags: ["DCGM", "dcgm-exporter", "Prometheus", "Alertmanager", "Xid", "row-remapping", "monitoring"]
+objectives:
+  - dcgm-exporter から Prometheus へ指標を集める流れと、既定では集めない指標を説明できる
+  - DCGM_FI_DEV_XID_ERRORS が「回数」ではないことと、その扱い方を説明できる
+  - PCIe・NVLink・メモリの行の再割り当てなど、劣化の兆しを示す指標を説明できる
+  - Xid の推奨対処と DCGM の健全性チェックを使って、アラートとその後の対応を設計できる
+references:
+  - label: "NVIDIA DCGM Exporter — etc/default-counters.csv（既定で集める指標）"
+    url: "https://github.com/NVIDIA/dcgm-exporter/blob/main/etc/default-counters.csv"
+  - label: "NVIDIA DCGM Documentation — Configure Prometheus for DCGM Exporter"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/learn/getting-started-for-system-administrators/configure-prometheus-for-dcgm-exporter.html"
+  - label: "NVIDIA DCGM Documentation — Feature Overview（Policy、Health and Diagnostics）"
+    url: "https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html"
+  - label: "NVIDIA — Analyzing Xid Errors with the Xid Catalog"
+    url: "https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html"
+  - label: "NVIDIA GPU Memory Error Management — Row Remapping / RMA Policy"
+    url: "https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/row-remapping.html"
+  - label: "Prometheus — Alerting rules"
+    url: "https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/"
+  - label: "Prometheus — Alertmanager"
+    url: "https://prometheus.io/docs/alerting/latest/alertmanager/"
+---
+
+## このレッスンの立ち位置
+
+GPU コース レッスン 2 では、DCGM で最低限見る指標を、GPU 基盤の導入コース レッスン 6 では、層ごとに何を見るか、そして **Xid はアラートにする**ことを見ました。このレッスンは、その先です。**集める仕組みを組み、何を見張り、鳴ったら何をするか**までを、一次情報で組み立てます。
+
+DCGM と dcgm-exporter は版によって指標の名前や既定が変わります。このレッスンは、2026 年 10 月時点の dcgm-exporter のリポジトリ（main）とドキュメントを見ています。
+
+---
+
+## 集める — dcgm-exporter から Prometheus へ
+
+<Figure name="gpu-monitoring-pipeline" caption="DCGM が集め、exporter が Prometheus の形で出し、規則が判定して Alertmanager が知らせる" source="NVIDIA DCGM と Prometheus のドキュメントを元に作図" />
+
+NVIDIA のドキュメントによると、dcgm-exporter は既定で **ポート 9400 の `/metrics`** で指標を出します。Prometheus には、各 GPU ノードを収集先として足します。
+
+---
+
+<h2 className="slide-cont">集める（続き）</h2>
+
+ドキュメントの設定例です。
+
+```yaml
+scrape_configs:
+  - job_name: dcgm-exporter
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    static_configs:
+      - targets:
+          - gpu-node-1:9400
+          - gpu-node-2:9400
+```
+
+ドキュメントは、**DCGM が値を更新する間隔、exporter が出す間隔、Prometheus が取りに来る間隔は別々**だと注意しています。取りに来る頻度を上げても DCGM がハードウェアに問い合わせ直すわけではないので、DCGM の更新より頻繁に取ると、**同じキャッシュの値を何度も読むことがあります**。`scrape_timeout` は `scrape_interval` より短くします。
+
+dcgm-exporter の README は、**exporter のリリースと対になった DCGM の版**で動かすよう書いています。版を上げるときは、README が案内する互換性のページを確かめます。
+
+---
+
+## 既定では集めていない指標がある
+
+dcgm-exporter がどの指標を出すかは、**`default-counters.csv`** で決まります。行の先頭に `#` がある指標は**コメントアウトされていて、既定では出ません**。2026 年 10 月時点の main のファイルから、監視で効くのに既定では無効なものを抜き出します。
+
+| 指標 | 意味（ファイルの説明） |
+| --- | --- |
+| `DCGM_FI_PROF_SM_ACTIVE` | SM に少なくとも 1 つの warp が割り当てられているサイクルの割合 |
+| `DCGM_FI_DEV_ECC_DBE_VOL_TOTAL` などの ECC | 訂正できた・できなかった ECC エラーの数 |
+| NVLink のエラー（`..._CRC_...`・`..._RECOVERY_...` など） | NVLink の CRC エラーや復旧の回数 |
+| `DCGM_FI_DEV_THERMAL_VIOLATION` / `POWER_VIOLATION` | 温度・電力の制約で絞られた時間（ns） |
+| `DCGM_EXP_XID_ERRORS_COUNT` / `_TOTAL` | 決めた時間の窓の中の Xid の数 / exporter 起動からの Xid の数 |
+| `DCGM_EXP_GPU_HEALTH_STATUS` | DCGM が報告する GPU の健全性 |
+
+GPU コース レッスン 2 で挙げた `SM_ACTIVE` や ECC も、**このファイルで有効にしないと出てきません**。監視を作るときは、まずこのファイルを自分の環境向けに書き換えます。
+
+---
+
+<h2 className="slide-cont">既定では集めていない指標がある（続き）</h2>
+
+<Callout type="pitfall" title="NVLink のエラーは、GPU の世代で名前が違う">
+
+`default-counters.csv` では、NVLink のエラーの指標が**世代ごとに別の名前**で並んでいます。Hopper より前の GPU 向け（`DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_TOTAL` など）、Hopper 向け（`DCGM_FI_DEV_NVLINK_CRC_ERROR_TOTAL` など）、Blackwell 以降の復旧の回数（`DCGM_FI_DEV_NVLINK_RECOVERY_FAILED_TOTAL` など）です。
+
+世代の違う GPU が混ざるクラスタや、世代を更新したときに、**古い名前のままのアラートが何も拾わなくなる**ことがあります。アラートの規則は、GPU の世代と一緒に見直します（このコースの整理）。
+
+</Callout>
+
+---
+
+## 罠: XID_ERRORS は「回数」ではない
+
+既定で出る `DCGM_FI_DEV_XID_ERRORS` について、`default-counters.csv` は **"Value of the last XID error encountered"**、つまり**最後に起きた Xid の番号**だと説明しています。型も counter ではなく **gauge** です。
+
+ここから、次のことが言えます（このコースの整理）。
+
+- 値が `79` なら、最後に起きたのが Xid 79 だということ。**何回起きたかは分からない**
+- 同じ Xid が続けて起きても、値は変わらない。値の**変化だけ**を見ていると、2 回目以降を見落とす
+- 「値が 0 より大きい」を条件にすると、昔の Xid がいつまでも残って鳴り続けることがある
+
+回数で扱いたいなら、exporter が足している **`DCGM_EXP_XID_ERRORS_COUNT`**（時間の窓の中の数）や **`DCGM_EXP_XID_ERRORS_TOTAL`**（exporter の起動からの数、counter）を有効にして使います。Xid の番号そのものは、ログ（カーネルのメッセージ）とあわせて記録します。
+
+---
+
+## 劣化の兆しを見る
+
+止まってからでは遅い故障には、兆しがあります。`default-counters.csv` と NVIDIA のメモリエラー管理のドキュメントから、兆しを示す指標を挙げます。
+
+| 対象 | 指標 | 見方 |
+| --- | --- | --- |
+| PCIe | `DCGM_FI_DEV_PCIE_REPLAY_COUNTER`（counter、既定で有効） | 再送の数。**増え方**を見る。DCGM の健全性チェックは、1 分あたり 8 回を超える再送を警告にした例を示している |
+| NVLink | 世代ごとの CRC・復旧のエラー（既定で無効） | 増えていれば、リンクやケーブルの劣化を疑う |
+| メモリ | `DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS` / `CORRECTABLE_REMAPPED_ROWS`（既定で有効） | 行の再割り当ての数 |
+| メモリ | `DCGM_FI_DEV_ROW_REMAP_FAILURE`（既定で有効） | **再割り当てに失敗したか**。RMA の判断に直結する |
+| 温度・電力 | `THERMAL_VIOLATION` / `POWER_VIOLATION`（既定で無効） | 制約で絞られた時間。冷却の不調（液冷なら流量の低下など）の兆し |
+
+---
+
+<h2 className="slide-cont">劣化の兆しを見る（続き）</h2>
+
+### メモリの行の再割り当て
+
+NVIDIA のドキュメントによると、Ampere 世代以降の GPU では、劣化したメモリの行を、DRAM の各バンクに用意された**予備の行に差し替える**（row remapping）ことで、メモリに穴を開けずに使い続けます。
+
+- 差し替えが効くには **GPU のリセットが必要**。差し替えは GPU の一生を通じて残る
+- フレームバッファで**最大 512 回**まで差し替えられる（従来のページ退避は 64 まで）
+
+RMA（交換）の判断について、ドキュメントは、**再割り当ての失敗のフラグが立ち、それを Field Diagnostic が確認したとき**に RMA の基準を満たす、としています。失敗のフラグが立つ条件として、すでに 8 行を再割り当てしたバンクでさらに訂正できないエラーが起きたとき、再割り当て済みの行でまた起きたとき、訂正できないエラーで合計 512 回の再割り当てに達したとき、を挙げています。Blackwell では、同じバンクの 3 回目の再割り当てのときに、予備があれば HBM のチャネルの修復が先に走る、とも書いています。
+
+つまり、`ROW_REMAP_FAILURE` が 1 になった GPU は、**交換を前提に診断へ回す**対象です。
+
+---
+
+## Xid の推奨対処を、先に決めておく
+
+NVIDIA の **Xid カタログ**は、Ampere 以降の GPU について、各 Xid に**すぐ取るべき対処**（Resolution Bucket）を付けています。
+
+| Xid | 意味 | すぐ取る対処 | カタログの説明の要点 |
+| --- | --- | --- | --- |
+| 13 | グラフィックスエンジンの例外 | `RESTART_APP` | ふつうはアプリケーションの範囲外アクセスなど。まれにハードウェアやソフトウェアの不具合 |
+| 31 | GPU メモリのページフォルト | `RESTART_APP` | ふつうはアプリケーションの不具合。ドライバやハードウェアのこともある |
+| 79 | GPU がバスから外れた | `RESTART_BM` | PCIe のリンクのハードウェア障害が多い。調査の対処は `CONTACT_SUPPORT` |
+| 94 | 封じ込められたメモリエラー | `RESTART_APP` | 影響は 1 つのアプリケーションに限られ、ほかは動き続けられる。都合の良いときに GPU をリセットする |
+| 95 | 封じ込められなかったメモリエラー | `RESET_GPU` | 複数のアプリケーションに影響し、再開の前に GPU のリセットが必要 |
+
+インフラの側から見て大事なのは、**Xid 13 や 31 のように、ふつうはアプリケーションの側の問題を示すもの**と、**79 や 95 のように GPU やノードの対処が要るもの**が混ざっていることです。すべての Xid で同じようにノードを落とすと、利用者のバグのたびにノードが減ります。
+
+---
+
+<h2 className="slide-cont">Xid の推奨対処（続き）</h2>
+
+カタログには **Xid 154** もあります。ほかの Xid と一緒に出て、**必要な復旧の対処をまとめて示す**ものです。カタログによると、メッセージは次のような形で、値は **None・Drain P2P・Drain and Reset・GPU Reset Required・Node Reboot Required** のどれかです。
+
+```text
+Xid 154 GPU recovery action changed from 0x0 (None) to 0x2 (Node Reboot Required)
+```
+
+個々の Xid の番号から対処を判断するより、**Xid 154 の値で自動の対処（ノードを空けてリセット、再起動など）を分ける**ほうが、扱いが一貫します（このコースの整理。Xid 154 が出るかは GPU とドライバの版によるので、カタログで確かめる）。
+
+---
+
+## DCGM 自身にも見張らせる
+
+DCGM のドキュメントは、健全性の確かめ方を 4 段階に分けています。
+
+| 種類 | 時間 | 中身（ドキュメント） |
+| --- | --- | --- |
+| バックグラウンド | 常時 | ジョブの実行中に**影響を与えずに**見張る。応答しない GPU、壊れたファームウェア、温度の逸脱などを捉える |
+| プロローグ | 数秒 | ジョブを流す前に、GPU が使える状態かを確かめる（負荷をかける） |
+| エピローグ | 数分 | ジョブが失敗したときや、GPU の健全性が疑わしいときに走らせる |
+| システム全体の検証 | 数十分 | ハードウェアの問題を本格的に調べるとき |
+
+ドキュメントは、これらは**オンラインの診断**で、完全なハードウェアの検証と RMA には、**別のツールによるオフラインの診断が必要**だとも書いています。
+
+---
+
+<h2 className="slide-cont">DCGM 自身にも見張らせる（続き）</h2>
+
+バックグラウンドの見張りは `dcgmi health` で設定します。`-s` に付ける文字で対象を選びます（`p` PCIe、`m` メモリ、`i` InfoROM、`t` 温度と電力、`n` NVLink、`d` ドライバ、`x` ConnectX、`a` すべて）。ドキュメントの例です。
+
+```text
+$ dcgmi health -g 1 -c
+Health Monitor Report
++----------------------------------------------------------------------------+
+| Group 1          | Overall Health: Warning                                 |
++==================+=========================================================+
+| GPU ID: 0        | Warning                                                 |
+|                  | PCIe system: Warning - Detected more than 8 PCIe        |
+|                  | replays per minute for GPU 0: 13                        |
++------------------+---------------------------------------------------------+
+```
+
+ドキュメントによると、**Warning** は「今の仕事は終われるが、あとで調べて手を打つべき問題」、**Error** は「重大な問題で、今の仕事はおそらく損なわれている。ふつうはジョブを止めて GPU を調べる必要がある」です。**Warning と Error でアラートの重さを分ける**と、この区別がそのまま運用に乗ります。
+
+DCGM には**ポリシー**の機能もあります。PCIe や NVLink のエラー、ECC、ページ退避の上限、電力や温度の逸脱、Xid といった条件に対して、通知やあらかじめ決めた動作を設定できます。
+
+---
+
+## アラートを設計する
+
+Prometheus の規則と Alertmanager には、GPU クラスタで効く機能がそろっています（Prometheus のドキュメント）。
+
+| 機能 | 何をするか | GPU クラスタでの使い道（このコースの整理） |
+| --- | --- | --- |
+| `for` | 条件が決めた時間続いてから発火させる。それまでは pending | 一瞬の温度の跳ねで鳴らさない |
+| `keep_firing_for` | 条件が消えても決めた時間は発火を続ける | ばたつき（鳴ったり消えたり）を抑える |
+| `labels` / `annotations` | 重さ（severity）や、対応手順（ランブック）への案内を付ける | Xid の対処や DCGM の Warning / Error で重さを分ける |
+| グループ化 | 似たアラートを 1 つの通知にまとめる | スイッチの障害で数百の GPU が一斉に鳴っても、1 つの通知にする |
+| 抑制（inhibition） | ある警告が出ているあいだ、ほかの通知を止める | ノードが落ちているときは、そのノードの GPU の警告を止める |
+| サイレンス | 決めた時間、通知を止める | 計画した保守のあいだ |
+
+---
+
+<h2 className="slide-cont">アラートを設計する（続き）</h2>
+
+ここまでの内容をまとめた規則の例です（このコースで書いたもの。`DCGM_EXP_XID_ERRORS_TOTAL` は `default-counters.csv` で有効にした前提）。
+
+```yaml
+groups:
+- name: gpu
+  rules:
+  - alert: GpuXidObserved
+    expr: increase(DCGM_EXP_XID_ERRORS_TOTAL[10m]) > 0
+    labels:
+      severity: warning
+    annotations:
+      summary: "Xid が出た。カーネルのログで番号と Xid 154 の対処を確かめる"
+  - alert: GpuRowRemapFailure
+    expr: DCGM_FI_DEV_ROW_REMAP_FAILURE == 1
+    labels:
+      severity: critical
+    annotations:
+      summary: "行の再割り当てに失敗。ノードを空け、Field Diagnostic へ"
+  - alert: GpuPcieReplaysRising
+    expr: increase(DCGM_FI_DEV_PCIE_REPLAY_COUNTER[10m]) > 0
+    for: 30m
+    labels:
+      severity: warning
+```
+
+GPU の**利用率**には、ふつうアラートを付けません。利用率が低いのは、障害ではなく、ジョブが少ないだけのこともあるからです。利用率は、ダッシュボードで傾向を見るためのものです（このコースの整理）。
+
+---
+
+## 鳴ったあと、何を自動にするか
+
+最後に、アラートのあとの動きを決めます。ここは一次情報の組み合わせから、このコースが整理したものです。
+
+| 種類 | 例 | 対応 |
+| --- | --- | --- |
+| アプリケーションの問題の可能性が高い | Xid 13・31 | 利用者に知らせる。ノードはふつう落とさない |
+| GPU の対処が要る | Xid 95、Xid 154 が GPU Reset Required | ジョブを止め、ノードを新しいジョブの割り当てから外して（Kubernetes なら cordon、Slurm なら drain）、GPU をリセットする |
+| ノードの対処が要る | Xid 79、Xid 154 が Node Reboot Required | ノードを外して再起動。続くならサポートへ |
+| 交換の判断 | `ROW_REMAP_FAILURE`、DCGM の Error が続く | ノードを外して Field Diagnostic。結果で RMA |
+
+分散学習では、1 枚の GPU の不調でジョブ全体が止まります（AI 基盤コース レッスン 6 の障害時の自動復旧）。**怪しい GPU を早く外し、ジョブを健全なノードで再開させる**ことが、監視の最終的な目的です。
+
+---
+
+## まとめ
+
+- dcgm-exporter は既定で **9400 番の `/metrics`**。DCGM の更新・exporter・Prometheus の取得の**間隔は別々**で、取得を頻繁にしても同じ値を読むことがある
+- 出す指標は **`default-counters.csv`** で決まる。`SM_ACTIVE`・ECC・NVLink のエラー・Xid の回数などは**既定で無効**。NVLink の指標は**世代で名前が違う**
+- **`DCGM_FI_DEV_XID_ERRORS` は最後の Xid の番号（gauge）**で、回数ではない。回数は `DCGM_EXP_XID_ERRORS_*` を有効にして使う
+- 劣化の兆しは、**PCIe の再送、NVLink のエラー、行の再割り当てとその失敗、温度・電力で絞られた時間**。再割り当ての失敗は RMA の判断に直結する
+- Xid カタログの**推奨対処**で、アプリケーションの問題と GPU・ノードの問題を分ける。**Xid 154** は必要な復旧の対処をまとめて示す
+- DCGM の健全性は **Warning / Error** で重さが違う。アラートは `for`・グループ化・抑制で、鳴らしすぎない
+
+---
+
+<Quiz
+  id="q1"
+  question="dcgm-exporter の既定の指標で、DCGM_FI_DEV_XID_ERRORS > 0 の間は鳴り続けるアラートを作りました。ある GPU で、1 週間前に 1 回だけ出た Xid のアラートが、今も鳴り続けています。default-counters.csv の説明に照らして、正しい理解と直し方はどれですか。"
+  options={[
+    "Xid が 1 週間ずっと起き続けている。GPU をすぐに交換する",
+    "DCGM_FI_DEV_XID_ERRORS は最後に起きた Xid の番号を表す gauge で、回数ではない。古い Xid の番号が残っているだけかもしれない。回数で判断するなら DCGM_EXP_XID_ERRORS_COUNT や _TOTAL を有効にし、増えたときだけ鳴らす",
+    "dcgm-exporter の不具合なので、再起動すれば直る",
+    "Prometheus の scrape_interval が長すぎる"
+  ]}
+  answer={1}
+  explanation="dcgm-exporter の default-counters.csv は、DCGM_FI_DEV_XID_ERRORS を「最後に遭遇した Xid の値」を表す gauge と説明しています。何回起きたかは分からず、値が 0 より大きいことを条件にすると、昔の Xid でも鳴り続けることがあります。同じファイルには、時間の窓の中の数（DCGM_EXP_XID_ERRORS_COUNT）と、exporter の起動からの数（DCGM_EXP_XID_ERRORS_TOTAL、counter）が、既定ではコメントアウトされた形で用意されています。"
+/>
+
+---
+
+<Quiz
+  id="q2"
+  question="Ampere 以降の GPU で、ある GPU の DCGM_FI_DEV_ROW_REMAP_FAILURE が 1 になりました。NVIDIA のメモリエラー管理のドキュメントに照らして、最も適切な対応はどれですか。"
+  options={[
+    "行の再割り当ては予備の行で自動的に直るので、何もしなくてよい",
+    "再割り当ての失敗のフラグは、Field Diagnostic で確認されれば RMA の基準を満たす。ノードを新しいジョブから外し、Field Diagnostic を実行して交換を判断する",
+    "GPU のリセットをすれば、失敗のフラグは消えて再び使える",
+    "ドライバを最新にすれば、再割り当ての上限が増える"
+  ]}
+  answer={1}
+  explanation="NVIDIA のドキュメントによると、Ampere 以降の GPU は、劣化したメモリの行を予備の行に差し替えて使い続けます（効かせるには GPU のリセットが必要）。ただし、同じバンクで差し替えが尽きたときなどに再割り当ての失敗のフラグが立ち、そのフラグが Field Diagnostic で確認されると RMA の基準を満たすとしています。失敗のフラグが立った GPU は、交換を前提に診断へ回します。"
+/>

@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import {
   AiStackLayers,
+  GpuMonitoringPipeline,
   IbCreditFlow,
   K8sDevicePlugin,
   NcclRingTree,
@@ -138,6 +139,7 @@ export const FIGURES = {
   "gpu-sharing-modes": GpuSharingModes,
   "liquid-commissioning": LiquidCommissioning,
   "immersion-types": ImmersionTypes,
+  "gpu-monitoring-pipeline": GpuMonitoringPipeline,
 } satisfies Record<string, ComponentType>;
 
 export type FigureName = keyof typeof FIGURES;

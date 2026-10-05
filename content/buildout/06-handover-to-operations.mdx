@@ -44,6 +44,8 @@ references:
 
 **DCGM Exporter** を各ノードで動かすと、GPU 単体の指標を Prometheus 形式で取れます。NVLink のエラーカウンタも取れますが、既定の設定では無効になっているので、使うなら有効にします。ファブリックのポートとジョブのステップ時間は、DCGM Exporter の範囲外です（スイッチやジョブ側で別に取ります）。
 
+監視の組み立て方（既定では集めない指標、Xid の扱い、アラートの設計）は、AI 基盤コース レッスン 8 で扱います。
+
 ```bash
 # Kubernetes なら GPU Operator が面倒を見る
 kubectl -n gpu-operator get pods | grep dcgm
