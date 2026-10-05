@@ -679,3 +679,52 @@ export function PluggableLpoCpo() {
     </svg>
   );
 }
+
+/**
+ * 液浸の 4 つの組み合わせ。熱の運び方（1 相 / 2 相）と、入れ物（筐体 / 槽）で分ける。
+ */
+export function ImmersionTypes() {
+  const cell = (x: number, y: number, title: string, l1: string, l2: string, tone: "plain" | "accent") => (
+    <g>
+      <rect x={x} y={y} width={300} height={104} rx={10} fill={tone === "accent" ? C.accentSoft : C.surface2} stroke={tone === "accent" ? C.accent : C.border} strokeWidth={1.5} />
+      <T x={x + 150} y={y + 30} size={13.5} fill={C.fg} weight={700} anchor="middle">
+        {title}
+      </T>
+      <T x={x + 150} y={y + 58} size={12} fill={C.fg} anchor="middle">
+        {l1}
+      </T>
+      <T x={x + 150} y={y + 80} size={12} fill={C.fg} anchor="middle">
+        {l2}
+      </T>
+    </g>
+  );
+  return (
+    <svg viewBox="0 0 800 330" role="img" aria-label="液浸の 1 相と 2 相、筐体型と槽型">
+      <T x={330} y={30} size={13} fill={C.fg} weight={700} anchor="middle">
+        筐体型（enclosed chassis）
+      </T>
+      <T x={640} y={30} size={13} fill={C.fg} weight={700} anchor="middle">
+        槽型（open bath）
+      </T>
+      <T x={92} y={100} size={13} fill={C.fg} weight={700} anchor="middle">
+        1 相
+      </T>
+      <T x={92} y={120} size={12} anchor="middle">
+        液のまま循環
+      </T>
+      <T x={92} y={214} size={13} fill={C.fg} weight={700} anchor="middle">
+        2 相
+      </T>
+      <T x={92} y={234} size={12} anchor="middle">
+        沸騰と凝縮
+      </T>
+      {cell(180, 46, "1 相 × 筐体", "ラックに縦に積むシャーシ", "水平に引き出して保守", "plain")}
+      {cell(490, 46, "1 相 × 槽", "大きな槽に機器を沈める", "上から引き上げて保守", "accent")}
+      {cell(180, 160, "2 相 × 筐体", "シャーシの中で沸騰・凝縮", "蒸気を逃がさない密閉が要る", "plain")}
+      {cell(490, 160, "2 相 × 槽", "蒸気を熱交換で液に戻す", "揮発した液の損失を抑える", "plain")}
+      <T x={400} y={300} size={12.5} fill={C.fg} anchor="middle">
+        液の主な種類: 合成炭化水素・エステル（天然・合成）・フッ素系。鉱物油は避ける（OCP）
+      </T>
+    </svg>
+  );
+}

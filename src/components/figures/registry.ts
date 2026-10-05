@@ -17,6 +17,7 @@ import {
   CopperReachByLane,
   EthernetNaming,
   HotColdAisle,
+  ImmersionTypes,
   LiquidCoolingLoops,
   LiquidToLiquidVsAir,
   PatchPanel,
@@ -136,6 +137,7 @@ export const FIGURES = {
   "device-assignment": DeviceAssignment,
   "gpu-sharing-modes": GpuSharingModes,
   "liquid-commissioning": LiquidCommissioning,
+  "immersion-types": ImmersionTypes,
 } satisfies Record<string, ComponentType>;
 
 export type FigureName = keyof typeof FIGURES;
